@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     search_api_key: str = Field(default="")
     subagent_max_rounds: int = Field(default=15)
 
+    compact_threshold: int = Field(default=50_000)
+    compact_micro_age: int = Field(default=3)
+    transcripts_dir: str = Field(default=".transcripts")
+
     def check_required(self) -> None:
         errors: list[str] = []
         if not self.anthropic_api_key:

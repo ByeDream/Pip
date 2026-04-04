@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import anthropic
 
+from pip_agent.compact import micro_compact
 from pip_agent.config import settings
 from pip_agent.profiler import Profiler
 from pip_agent.tools import (
@@ -66,6 +67,8 @@ def run_subagent(
     max_rounds = settings.subagent_max_rounds
 
     for _ in range(max_rounds):
+        micro_compact(messages)
+
         profiler.start("api")
         response = client.messages.create(
             model=settings.model,

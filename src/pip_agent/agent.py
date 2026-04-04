@@ -6,6 +6,12 @@ from pathlib import Path
 
 import anthropic
 
+from pip_agent.compact import (
+    COMPACT_SCHEMA,
+    auto_compact,
+    estimate_tokens,
+    micro_compact,
+)
 from pip_agent.config import settings
 from pip_agent.profiler import Profiler
 from pip_agent.skills import SkillRegistry
@@ -70,11 +76,18 @@ def agent_loop(
     tools: list[dict],
     system_prompt: str,
     skill_registry: SkillRegistry | None = None,
+    transcripts_dir: Path | None = None,
 ) -> None:
     messages.append({"role": "user", "content": user_input})
     rounds_since_todo = 0
+    last_input_tokens = 0
 
     while True:
+        micro_compact(messages)
+
+        if transcripts_dir is not None and estimate_tokens(messages) > settings.compact_threshold:
+            auto_compact(client, messages, system_prompt, transcripts_dir, profiler)
+
         profiler.start("api")
         response = client.messages.create(
             model=settings.model,
@@ -84,6 +97,7 @@ def agent_loop(
             messages=messages,
         )
         usage = response.usage
+        last_input_tokens = usage.input_tokens
         profiler.stop(
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
@@ -96,6 +110,7 @@ def agent_loop(
         if response.stop_reason == "tool_use":
             tool_results = []
             used_todo = False
+            compact_requested = False
             for block in assistant_content:
                 if settings.verbose and hasattr(block, "text"):
                     print()
@@ -104,7 +119,10 @@ def agent_loop(
                     if settings.verbose:
                         print()
                         print(f"> {_tool_summary(block.name, block.input)}")
-                    if block.name == "todo_write":
+                    if block.name == "compact":
+                        result = "Acknowledged. Context will be compacted."
+                        compact_requested = True
+                    elif block.name == "todo_write":
                         profiler.start("tool:todo_write")
                         try:
                             result = todo_manager.write(
@@ -146,6 +164,12 @@ def agent_loop(
                     {"type": "text", "text": "<reminder>Update your todos.</reminder>"}
                 )
             messages.append({"role": "user", "content": tool_results})
+
+            if compact_requested or last_input_tokens > settings.compact_threshold:
+                if transcripts_dir is not None:
+                    auto_compact(
+                        client, messages, system_prompt, transcripts_dir, profiler
+                    )
         else:
             break
 
@@ -169,7 +193,10 @@ def run() -> None:
     todo_manager = TodoManager()
     skill_registry = SkillRegistry(BUILTIN_SKILLS_DIR, USER_SKILLS_DIR)
 
+    transcripts_dir = WORKDIR / settings.transcripts_dir
+
     tools: list[dict] = list(ALL_TOOLS)
+    tools.append(COMPACT_SCHEMA)
     system_prompt = SYSTEM_PROMPT
     if skill_registry.available:
         tools.append(skill_registry.tool_schema())
@@ -198,6 +225,7 @@ def run() -> None:
             tools=tools,
             system_prompt=system_prompt,
             skill_registry=skill_registry,
+            transcripts_dir=transcripts_dir,
         )
 
         last = messages[-1]
