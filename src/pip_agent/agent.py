@@ -1,13 +1,20 @@
+from __future__ import annotations
+
 import os
 import sys
+from pathlib import Path
 
 import anthropic
 
 from pip_agent.config import settings
 from pip_agent.profiler import Profiler
+from pip_agent.skills import SkillRegistry
 from pip_agent.todo import TodoManager
 from pip_agent.subagent import run_subagent
 from pip_agent.tools import ALL_TOOLS, WORKDIR, execute_tool
+
+BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
+USER_SKILLS_DIR = WORKDIR / ".pip" / "skills"
 
 try:
     import readline  # noqa: F401 — enables input() history and line editing
@@ -39,6 +46,7 @@ _TOOL_KEY_PARAM: dict[str, str] = {
     "web_search": "query",
     "web_fetch": "url",
     "task": "prompt",
+    "load_skill": "name",
 }
 
 
@@ -58,6 +66,10 @@ def agent_loop(
     user_input: str,
     profiler: Profiler,
     todo_manager: TodoManager,
+    *,
+    tools: list[dict],
+    system_prompt: str,
+    skill_registry: SkillRegistry | None = None,
 ) -> None:
     messages.append({"role": "user", "content": user_input})
     rounds_since_todo = 0
@@ -67,8 +79,8 @@ def agent_loop(
         response = client.messages.create(
             model=settings.model,
             max_tokens=settings.max_tokens,
-            system=SYSTEM_PROMPT,
-            tools=ALL_TOOLS,
+            system=system_prompt,
+            tools=tools,
             messages=messages,
         )
         usage = response.usage
@@ -104,12 +116,17 @@ def agent_loop(
                         if settings.verbose:
                             print(result)
                         used_todo = True
+                    elif block.name == "load_skill" and skill_registry is not None:
+                        profiler.start("tool:load_skill")
+                        result = skill_registry.load(block.input["name"])
+                        profiler.stop()
                     elif block.name == "task":
                         profiler.start("tool:task")
                         result = run_subagent(
                             client,
                             block.input["prompt"],
                             profiler,
+                            skill_registry=skill_registry,
                         )
                         profiler.stop()
                     else:
@@ -150,6 +167,13 @@ def run() -> None:
     messages: list[dict] = []
     profiler = Profiler()
     todo_manager = TodoManager()
+    skill_registry = SkillRegistry(BUILTIN_SKILLS_DIR, USER_SKILLS_DIR)
+
+    tools: list[dict] = list(ALL_TOOLS)
+    system_prompt = SYSTEM_PROMPT
+    if skill_registry.available:
+        tools.append(skill_registry.tool_schema())
+        system_prompt += "\n\n" + skill_registry.catalog_prompt()
 
     print("Pip Agent (type 'exit' to quit)")
 
@@ -165,7 +189,16 @@ def run() -> None:
         if not user_input:
             continue
 
-        agent_loop(client, messages, user_input, profiler, todo_manager)
+        agent_loop(
+            client,
+            messages,
+            user_input,
+            profiler,
+            todo_manager,
+            tools=tools,
+            system_prompt=system_prompt,
+            skill_registry=skill_registry,
+        )
 
         last = messages[-1]
         if last["role"] == "assistant":

@@ -3,3 +3,4 @@ pydantic-settings>=2.8,<3
 pyreadline3>=3.5,<4
 tavily-python>=0.5
 ddgs>=7
+pyyaml>=6,<7

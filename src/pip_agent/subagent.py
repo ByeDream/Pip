@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import anthropic
 
 from pip_agent.config import settings
@@ -9,6 +11,9 @@ from pip_agent.tools import (
     WORKDIR,
     execute_tool,
 )
+
+if TYPE_CHECKING:
+    from pip_agent.skills import SkillRegistry
 
 SUBAGENT_TOOLS = [t for t in ALL_TOOLS if t["name"] not in ("task", "todo_write")]
 
@@ -29,6 +34,7 @@ _TOOL_KEY_PARAM: dict[str, str] = {
     "glob": "pattern",
     "web_search": "query",
     "web_fetch": "url",
+    "load_skill": "name",
 }
 
 
@@ -46,8 +52,16 @@ def run_subagent(
     client: anthropic.Anthropic,
     prompt: str,
     profiler: Profiler,
+    *,
+    skill_registry: SkillRegistry | None = None,
 ) -> str:
     """Run an isolated sub-agent and return its final text response."""
+    tools: list[dict] = list(SUBAGENT_TOOLS)
+    system_prompt = SUBAGENT_SYSTEM_PROMPT
+    if skill_registry is not None and skill_registry.available:
+        tools.append(skill_registry.tool_schema())
+        system_prompt += "\n\n" + skill_registry.catalog_prompt()
+
     messages: list[dict] = [{"role": "user", "content": prompt}]
     max_rounds = settings.subagent_max_rounds
 
@@ -56,8 +70,8 @@ def run_subagent(
         response = client.messages.create(
             model=settings.model,
             max_tokens=settings.max_tokens,
-            system=SUBAGENT_SYSTEM_PROMPT,
-            tools=SUBAGENT_TOOLS,
+            system=system_prompt,
+            tools=tools,
             messages=messages,
         )
         usage = response.usage
@@ -80,9 +94,14 @@ def run_subagent(
             if block.type == "tool_use":
                 if settings.verbose:
                     print(f"  [sub] > {_tool_summary(block.name, block.input)}")
-                profiler.start(f"tool:{block.name}")
-                result = execute_tool(block.name, block.input)
-                profiler.stop()
+                if block.name == "load_skill" and skill_registry is not None:
+                    profiler.start("tool:load_skill")
+                    result = skill_registry.load(block.input["name"])
+                    profiler.stop()
+                else:
+                    profiler.start(f"tool:{block.name}")
+                    result = execute_tool(block.name, block.input)
+                    profiler.stop()
                 if len(result) > MAX_TOOL_OUTPUT:
                     result = result[:MAX_TOOL_OUTPUT] + "\n\n[truncated]"
                 tool_results.append(
