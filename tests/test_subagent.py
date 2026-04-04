@@ -30,9 +30,10 @@ class TestSubagentTools:
         names = [t["name"] for t in SUBAGENT_TOOLS]
         assert "task" not in names
 
-    def test_todo_write_excluded(self):
+    def test_task_tools_excluded(self):
         names = [t["name"] for t in SUBAGENT_TOOLS]
-        assert "todo_write" not in names
+        for tool in ("task_create", "task_update", "task_list", "task_remove"):
+            assert tool not in names
 
     def test_core_tools_included(self):
         names = [t["name"] for t in SUBAGENT_TOOLS]

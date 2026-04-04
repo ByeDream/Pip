@@ -189,43 +189,138 @@ TASK_SCHEMA = {
     },
 }
 
-TODO_WRITE_SCHEMA = {
-    "name": "todo_write",
+TASK_CREATE_SCHEMA = {
+    "name": "task_create",
     "description": (
-        "Create or update a structured todo list to track your progress on the "
-        "current task. Each item has an id, content, and status. Use this tool "
-        "proactively for multi-step tasks to show the user what you are doing."
+        "Create stories or tasks. Omit 'story' to create stories (big goals); "
+        "provide 'story' to create tasks within that story. "
+        "Load the 'task-planning' skill for detailed guidance."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "todos": {
+            "story": {
+                "type": "string",
+                "description": "Story ID to add tasks to. Omit to create stories instead.",
+            },
+            "tasks": {
                 "type": "array",
-                "description": "Array of todo items to create or update.",
+                "description": "Array of new stories or tasks to create.",
                 "items": {
                     "type": "object",
                     "properties": {
                         "id": {
                             "type": "string",
-                            "description": "Unique identifier for the todo item.",
+                            "description": "Unique identifier (alphanumeric, dashes, underscores).",
                         },
-                        "content": {
+                        "title": {
                             "type": "string",
-                            "description": "Description of the todo item.",
+                            "description": "Short description.",
+                        },
+                        "blocked_by": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "IDs that must complete first (stories or tasks at same level).",
+                        },
+                    },
+                    "required": ["id", "title"],
+                },
+            },
+        },
+        "required": ["tasks"],
+    },
+}
+
+TASK_UPDATE_SCHEMA = {
+    "name": "task_update",
+    "description": (
+        "Update stories or tasks. Omit 'story' to update story metadata "
+        "(title/blocked_by only; status is auto-derived). "
+        "Provide 'story' to update tasks (status, title, blocked_by). "
+        "Completing all tasks in a story auto-deletes it."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "story": {
+                "type": "string",
+                "description": "Story ID containing the tasks. Omit to update stories.",
+            },
+            "tasks": {
+                "type": "array",
+                "description": "Array of updates.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "ID of the story or task to update.",
                         },
                         "status": {
                             "type": "string",
                             "enum": ["pending", "in_progress", "completed"],
-                            "description": "Current status of the item.",
+                            "description": "New status (tasks only; stories derive status automatically).",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "New title.",
+                        },
+                        "blocked_by": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "New list of blocking IDs.",
                         },
                     },
-                    "required": ["id", "content", "status"],
+                    "required": ["id"],
                 },
             },
         },
-        "required": ["todos"],
+        "required": ["tasks"],
     },
 }
+
+TASK_LIST_SCHEMA = {
+    "name": "task_list",
+    "description": (
+        "Show the task graph. Omit 'story' for a Kanban overview of all stories "
+        "and ready tasks. Provide 'story' for detailed task view of one story."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "story": {
+                "type": "string",
+                "description": "Story ID to inspect. Omit for global overview.",
+            },
+        },
+    },
+}
+
+TASK_REMOVE_SCHEMA = {
+    "name": "task_remove",
+    "description": (
+        "Remove stories or tasks. Omit 'story' to remove entire stories. "
+        "Provide 'story' to remove tasks within it. "
+        "Fails if other items depend on them."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "story": {
+                "type": "string",
+                "description": "Story ID containing the tasks. Omit to remove stories.",
+            },
+            "task_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "IDs of stories or tasks to remove.",
+            },
+        },
+        "required": ["task_ids"],
+    },
+}
+
+TASK_TOOL_NAMES = frozenset({"task_create", "task_update", "task_list", "task_remove"})
 
 # ---------------------------------------------------------------------------
 # Tool implementations
@@ -405,7 +500,10 @@ ALL_TOOLS = [
     WEB_SEARCH_SCHEMA,
     WEB_FETCH_SCHEMA,
     TASK_SCHEMA,
-    TODO_WRITE_SCHEMA,
+    TASK_CREATE_SCHEMA,
+    TASK_UPDATE_SCHEMA,
+    TASK_LIST_SCHEMA,
+    TASK_REMOVE_SCHEMA,
 ]
 
 

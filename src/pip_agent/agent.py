@@ -15,9 +15,9 @@ from pip_agent.compact import (
 from pip_agent.config import settings
 from pip_agent.profiler import Profiler
 from pip_agent.skills import SkillRegistry
-from pip_agent.todo import TodoManager
+from pip_agent.task_graph import PlanManager
 from pip_agent.subagent import run_subagent
-from pip_agent.tools import ALL_TOOLS, WORKDIR, execute_tool
+from pip_agent.tools import ALL_TOOLS, TASK_TOOL_NAMES, WORKDIR, execute_tool
 
 BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 USER_SKILLS_DIR = WORKDIR / ".pip" / "skills"
@@ -36,8 +36,8 @@ except ImportError:
 SYSTEM_PROMPT = (
     f"You are Pip, a personal assistant agent. "
     f"Your working directory is {WORKDIR}. "
-    f"Use the todo_write tool to plan multi-step tasks. "
-    f"Mark in_progress before starting, completed when done. "
+    f"Use task tools to plan goals. "
+    f"Load the 'task-planning' skill for guidance. "
     f"Prefer tools over prose."
 )
 
@@ -53,6 +53,9 @@ _TOOL_KEY_PARAM: dict[str, str] = {
     "web_fetch": "url",
     "task": "prompt",
     "load_skill": "name",
+    "task_create": "tasks",
+    "task_update": "tasks",
+    "task_remove": "task_ids",
 }
 
 
@@ -66,12 +69,25 @@ def _tool_summary(name: str, inputs: dict) -> str:
     return name
 
 
+def _handle_task_tool(name: str, inputs: dict, pm: PlanManager) -> str:
+    story = inputs.get("story")
+    if name == "task_create":
+        return pm.create(story, inputs.get("tasks", []))
+    if name == "task_update":
+        return pm.update(story, inputs.get("tasks", []))
+    if name == "task_list":
+        return pm.render(story)
+    if name == "task_remove":
+        return pm.remove(story, inputs.get("task_ids", []))
+    return f"Unknown task tool: {name}"
+
+
 def agent_loop(
     client: anthropic.Anthropic,
     messages: list[dict],
     user_input: str,
     profiler: Profiler,
-    todo_manager: TodoManager,
+    plan_manager: PlanManager,
     *,
     tools: list[dict],
     system_prompt: str,
@@ -109,7 +125,7 @@ def agent_loop(
 
         if response.stop_reason == "tool_use":
             tool_results = []
-            used_todo = False
+            used_task_tool = False
             compact_requested = False
             for block in assistant_content:
                 if settings.verbose and hasattr(block, "text"):
@@ -122,18 +138,18 @@ def agent_loop(
                     if block.name == "compact":
                         result = "Acknowledged. Context will be compacted."
                         compact_requested = True
-                    elif block.name == "todo_write":
-                        profiler.start("tool:todo_write")
+                    elif block.name in TASK_TOOL_NAMES:
+                        profiler.start(f"tool:{block.name}")
                         try:
-                            result = todo_manager.write(
-                                block.input.get("todos", [])
+                            result = _handle_task_tool(
+                                block.name, block.input, plan_manager
                             )
                         except ValueError as e:
                             result = f"[error] {e}"
                         profiler.stop()
                         if settings.verbose:
                             print(result)
-                        used_todo = True
+                        used_task_tool = True
                     elif block.name == "load_skill" and skill_registry is not None:
                         profiler.start("tool:load_skill")
                         result = skill_registry.load(block.input["name"])
@@ -158,10 +174,10 @@ def agent_loop(
                             "content": result,
                         }
                     )
-            rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-            if todo_manager.has_items() and rounds_since_todo >= NAG_THRESHOLD:
+            rounds_since_todo = 0 if used_task_tool else rounds_since_todo + 1
+            if plan_manager.has_tasks() and rounds_since_todo >= NAG_THRESHOLD:
                 tool_results.append(
-                    {"type": "text", "text": "<reminder>Update your todos.</reminder>"}
+                    {"type": "text", "text": "<reminder>Update your tasks.</reminder>"}
                 )
             messages.append({"role": "user", "content": tool_results})
 
@@ -190,7 +206,7 @@ def run() -> None:
     client = anthropic.Anthropic(**client_kwargs)
     messages: list[dict] = []
     profiler = Profiler()
-    todo_manager = TodoManager()
+    plan_manager = PlanManager(WORKDIR / settings.tasks_dir)
     skill_registry = SkillRegistry(BUILTIN_SKILLS_DIR, USER_SKILLS_DIR)
 
     transcripts_dir = WORKDIR / settings.transcripts_dir
@@ -198,6 +214,8 @@ def run() -> None:
     tools: list[dict] = list(ALL_TOOLS)
     tools.append(COMPACT_SCHEMA)
     system_prompt = SYSTEM_PROMPT
+    if plan_manager.has_tasks():
+        system_prompt += "\n\nCurrent task graph:\n" + plan_manager.render()
     if skill_registry.available:
         tools.append(skill_registry.tool_schema())
         system_prompt += "\n\n" + skill_registry.catalog_prompt()
@@ -221,7 +239,7 @@ def run() -> None:
             messages,
             user_input,
             profiler,
-            todo_manager,
+            plan_manager,
             tools=tools,
             system_prompt=system_prompt,
             skill_registry=skill_registry,

@@ -37,6 +37,10 @@ htmlcov/
 .coverage
 .coverage.*
 
+# Pip runtime data
+.tasks/
+.transcripts/
+
 # OS
 .DS_Store
 Thumbs.db
