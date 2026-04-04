@@ -1,3 +1,5 @@
+import sys
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -16,6 +18,17 @@ class Settings(BaseSettings):
     profiler_enabled: bool = Field(default=False)
 
     search_api_key: str = Field(default="")
+
+    def check_required(self) -> None:
+        errors: list[str] = []
+        if not self.anthropic_api_key:
+            errors.append("ANTHROPIC_API_KEY is not set")
+        if not self.anthropic_base_url:
+            errors.append("ANTHROPIC_BASE_URL is not set")
+        if errors:
+            for e in errors:
+                print(f"  [config error] {e}", file=sys.stderr)
+            sys.exit(1)
 
 
 settings = Settings()

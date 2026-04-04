@@ -77,9 +77,14 @@ def run() -> None:
     sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
     sys.stdin.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
 
+    settings.check_required()
+
     client_kwargs: dict = {"api_key": settings.anthropic_api_key}
     if settings.anthropic_base_url:
         client_kwargs["base_url"] = settings.anthropic_base_url
+        client_kwargs["default_headers"] = {
+            "Authorization": f"Bearer {settings.anthropic_api_key}",
+        }
         os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
     client = anthropic.Anthropic(**client_kwargs)
     messages: list[dict] = []
