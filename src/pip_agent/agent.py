@@ -5,6 +5,7 @@ import anthropic
 
 from pip_agent.config import settings
 from pip_agent.profiler import Profiler
+from pip_agent.todo import TodoManager
 from pip_agent.tools import ALL_TOOLS, WORKDIR, execute_tool
 
 try:
@@ -18,13 +19,13 @@ try:
 except ImportError:
     pass
 
-
 SYSTEM_PROMPT = (
     f"You are Pip, a personal assistant agent. "
     f"Your working directory is {WORKDIR}. "
-    f"You have tools: bash, read, write, edit, glob, web_search, web_fetch. "
     f"Use tools to solve tasks. Act, don't explain."
 )
+
+NAG_THRESHOLD = 3
 
 
 def agent_loop(
@@ -32,8 +33,10 @@ def agent_loop(
     messages: list[dict],
     user_input: str,
     profiler: Profiler,
+    todo_manager: TodoManager,
 ) -> None:
     messages.append({"role": "user", "content": user_input})
+    rounds_since_todo = 0
 
     while True:
         profiler.start("api")
@@ -56,11 +59,23 @@ def agent_loop(
 
         if response.stop_reason == "tool_use":
             tool_results = []
+            used_todo = False
             for block in assistant_content:
                 if block.type == "tool_use":
-                    profiler.start(f"tool:{block.name}")
-                    result = execute_tool(block.name, block.input)
-                    profiler.stop()
+                    if block.name == "todo_write":
+                        profiler.start("tool:todo_write")
+                        try:
+                            result = todo_manager.write(
+                                block.input.get("todos", [])
+                            )
+                        except ValueError as e:
+                            result = f"[error] {e}"
+                        profiler.stop()
+                        used_todo = True
+                    else:
+                        profiler.start(f"tool:{block.name}")
+                        result = execute_tool(block.name, block.input)
+                        profiler.stop()
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -68,6 +83,11 @@ def agent_loop(
                             "content": result,
                         }
                     )
+            rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+            if rounds_since_todo >= NAG_THRESHOLD:
+                tool_results.append(
+                    {"type": "text", "text": "<reminder>Update your todos.</reminder>"}
+                )
             messages.append({"role": "user", "content": tool_results})
         else:
             break
@@ -89,6 +109,7 @@ def run() -> None:
     client = anthropic.Anthropic(**client_kwargs)
     messages: list[dict] = []
     profiler = Profiler()
+    todo_manager = TodoManager()
 
     print("Pip Agent (type 'exit' to quit)")
 
@@ -104,13 +125,18 @@ def run() -> None:
         if not user_input:
             continue
 
-        agent_loop(client, messages, user_input, profiler)
+        agent_loop(client, messages, user_input, profiler, todo_manager)
 
         last = messages[-1]
         if last["role"] == "assistant":
             for block in last["content"]:
                 if hasattr(block, "text"):
                     print(block.text)
+
+        if todo_manager.has_items():
+            print("\n--- Todo ---")
+            print(todo_manager.render())
+            print("------------")
 
         profiler.flush()
         print()

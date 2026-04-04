@@ -168,6 +168,44 @@ WEB_FETCH_SCHEMA = {
     },
 }
 
+TODO_WRITE_SCHEMA = {
+    "name": "todo_write",
+    "description": (
+        "Create or update a structured todo list to track your progress on the "
+        "current task. Each item has an id, content, and status. Use this tool "
+        "proactively for multi-step tasks to show the user what you are doing."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "todos": {
+                "type": "array",
+                "description": "Array of todo items to create or update.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Unique identifier for the todo item.",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Description of the todo item.",
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "completed"],
+                            "description": "Current status of the item.",
+                        },
+                    },
+                    "required": ["id", "content", "status"],
+                },
+            },
+        },
+        "required": ["todos"],
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
@@ -343,6 +381,7 @@ ALL_TOOLS = [
     GLOB_SCHEMA,
     WEB_SEARCH_SCHEMA,
     WEB_FETCH_SCHEMA,
+    TODO_WRITE_SCHEMA,
 ]
 
 
