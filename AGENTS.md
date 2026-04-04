@@ -13,11 +13,19 @@ This is a public GitHub repository. All generated code, comments, commit message
 - API keys, tokens, passwords, or any credentials
 - Subjective motivations or personal context about the project
 
+## Design Philosophy
+
+Intelligence is trained, not coded. Do not attempt to create intelligent behavior through clever prompts, hints, status descriptions, or prescriptive tool-result messages. The model decides **what** to do, **how** to do it, and **when** to do it. Our job is limited to:
+
+- **Eyes**: surface information the model needs (files, state, errors) when it asks.
+- **Hands**: provide tools that execute the model's decisions faithfully.
+- **Then step aside**: no nudging, no coaching, no "smart" scaffolding.
+
+If you find yourself writing code that tells the model what it *should* do next, stop. That is the model's job.
+
 ## Tech Stack
 
 - Python 3.11+
-- Agent framework (TBD)
-- Runs on Windows as a local service
 
 ## Conventions
 
