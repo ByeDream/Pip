@@ -43,6 +43,13 @@ User skills go in `.pip/skills/` at the project root:
     SKILL.md
 ```
 
+### Overriding built-in skills
+
+If a user skill has the **same name** as a built-in skill, the user version
+takes precedence. This lets projects replace default workflows with their own.
+For example, a Perforce project can create `.pip/skills/code-review/SKILL.md`
+to override the built-in code-review with team-specific standards.
+
 ### SKILL.md format
 
 Every skill requires YAML frontmatter followed by a markdown body:
