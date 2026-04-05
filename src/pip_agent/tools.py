@@ -408,7 +408,16 @@ TEAM_STATUS_SCHEMA = {
     },
 }
 
-TEAM_TOOL_NAMES = frozenset({"team_spawn", "team_send", "team_status"})
+TEAM_READ_INBOX_SCHEMA = {
+    "name": "team_read_inbox",
+    "description": "Read and drain your inbox. Returns all pending teammate messages.",
+    "input_schema": {
+        "type": "object",
+        "properties": {},
+    },
+}
+
+TEAM_TOOL_NAMES = frozenset({"team_spawn", "team_send", "team_status", "team_read_inbox"})
 
 CHECK_BACKGROUND_SCHEMA = {
     "name": "check_background",
@@ -610,6 +619,7 @@ ALL_TOOLS = [
     TEAM_SPAWN_SCHEMA,
     TEAM_SEND_SCHEMA,
     TEAM_STATUS_SCHEMA,
+    TEAM_READ_INBOX_SCHEMA,
 ]
 
 

@@ -375,19 +375,23 @@ class TestTeamManagerSend:
         result = mgr.send("alice", "Follow-up")
         assert "Sent" in result
 
-    def test_send_to_unspawned_rejected(self, tmp_path):
+    def test_send_to_unspawned_queued(self, tmp_path):
         mgr = _make_mgr(tmp_path, "alice")
         result = mgr.send("alice", "hello")
-        assert "[error]" in result
-        assert "team_spawn" in result
+        # Sending to an offline (unspawned) teammate is now allowed —
+        # the message is queued and will be delivered on next activation.
+        assert "offline" in result
+        assert "[error]" not in result
 
-    def test_send_to_done_teammate_rejected(self, tmp_path):
+    def test_send_to_done_teammate_queued(self, tmp_path):
         mgr = _make_mgr(tmp_path, "alice")
         with patch.object(Teammate, "start"):
             mgr.spawn("alice", "Task")
         mgr._on_done("alice")
         result = mgr.send("alice", "follow-up")
-        assert "[error]" in result
+        # Sending to a finished teammate is now allowed — queued for next activation.
+        assert "offline" in result
+        assert "[error]" not in result
 
     def test_broadcast_only_to_working(self, tmp_path):
         user_dir = tmp_path / "user"

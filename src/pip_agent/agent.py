@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -52,7 +53,8 @@ SYSTEM_PROMPT = (
     f"Your working directory is {WORKDIR}. "
     f"Use task tools to plan goals. "
     f"Load the 'task-planning' skill for guidance. "
-    f"Prefer tools over prose."
+    f"Prefer tools over prose. "
+    f"Spawn teammates and communicate via inboxes."
 )
 
 NAG_THRESHOLD = 3
@@ -241,6 +243,9 @@ def agent_loop(
                                 block.input["content"],
                                 block.input.get("msg_type", "message"),
                             )
+                        elif block.name == "team_read_inbox":
+                            inbox = team_manager.read_inbox()
+                            result = json.dumps(inbox, indent=2) if inbox else "(no messages)"
                         else:
                             result = team_manager.status()
                         profiler.stop()
