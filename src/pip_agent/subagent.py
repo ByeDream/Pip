@@ -16,10 +16,11 @@ from pip_agent.tools import (
 if TYPE_CHECKING:
     from pip_agent.skills import SkillRegistry
 
-from pip_agent.tools import TASK_TOOL_NAMES
+from pip_agent.tools import TASK_TOOL_NAMES, TEAM_TOOL_NAMES
 
 SUBAGENT_TOOLS = [
-    t for t in ALL_TOOLS if t["name"] not in {"task"} | TASK_TOOL_NAMES
+    t for t in ALL_TOOLS
+    if t["name"] not in {"task"} | TASK_TOOL_NAMES | TEAM_TOOL_NAMES
 ]
 
 MAX_TOOL_OUTPUT = 50_000

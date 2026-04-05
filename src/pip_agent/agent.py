@@ -20,9 +20,11 @@ from pip_agent.profiler import Profiler
 from pip_agent.skills import SkillRegistry
 from pip_agent.task_graph import PlanManager
 from pip_agent.subagent import run_subagent
+from pip_agent.team import TeamManager
 from pip_agent.tools import (
     ALL_TOOLS,
     TASK_TOOL_NAMES,
+    TEAM_TOOL_NAMES,
     WORKDIR,
     execute_tool,
     run_bash,
@@ -30,6 +32,9 @@ from pip_agent.tools import (
 
 BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 USER_SKILLS_DIR = WORKDIR / ".pip" / "skills"
+
+BUILTIN_TEAM_DIR = Path(__file__).resolve().parent / "team"
+USER_TEAM_DIR = WORKDIR / ".pip" / "team"
 
 try:
     import readline  # noqa: F401 — enables input() history and line editing
@@ -66,6 +71,8 @@ _TOOL_KEY_PARAM: dict[str, str] = {
     "task_update": "tasks",
     "task_remove": "task_ids",
     "check_background": "task_id",
+    "team_spawn": "name",
+    "team_send": "to",
 }
 
 
@@ -104,6 +111,7 @@ def agent_loop(
     skill_registry: SkillRegistry | None = None,
     transcripts_dir: Path | None = None,
     bg_manager: BackgroundTaskManager | None = None,
+    team_manager: TeamManager | None = None,
 ) -> None:
     messages.append({"role": "user", "content": user_input})
     rounds_since_todo = 0
@@ -128,6 +136,21 @@ def agent_loop(
                             ),
                         })
                         profiler.record(f"bg:bash", n.elapsed_ms)
+
+        if team_manager is not None:
+            inbox = team_manager.read_inbox()
+            if inbox:
+                last_msg = messages[-1]
+                if last_msg["role"] == "user" and isinstance(last_msg["content"], list):
+                    for msg in inbox:
+                        last_msg["content"].append({
+                            "type": "text",
+                            "text": (
+                                f'<team-message from="{msg["from"]}"'
+                                f' msg_type="{msg.get("type", "message")}">'
+                                f'\n{msg["content"]}\n</team-message>'
+                            ),
+                        })
 
         if transcripts_dir is not None and estimate_tokens(messages) > settings.compact_threshold:
             auto_compact(client, messages, system_prompt, transcripts_dir, profiler)
@@ -205,6 +228,24 @@ def agent_loop(
                         profiler.start("tool:check_background")
                         result = bg_manager.check(block.input.get("task_id"))
                         profiler.stop()
+                    elif block.name in TEAM_TOOL_NAMES and team_manager is not None:
+                        profiler.start(f"tool:{block.name}")
+                        if block.name == "team_spawn":
+                            result = team_manager.spawn(
+                                block.input["name"],
+                                block.input["prompt"],
+                            )
+                        elif block.name == "team_send":
+                            result = team_manager.send(
+                                block.input["to"],
+                                block.input["content"],
+                                block.input.get("msg_type", "message"),
+                            )
+                        else:
+                            result = team_manager.status()
+                        profiler.stop()
+                        if settings.verbose:
+                            print(result)
                     else:
                         profiler.start(f"tool:{block.name}")
                         result = execute_tool(block.name, block.input)
@@ -253,6 +294,13 @@ def run() -> None:
     skill_registry = SkillRegistry(BUILTIN_SKILLS_DIR, USER_SKILLS_DIR)
 
     transcripts_dir = WORKDIR / settings.transcripts_dir
+    team_manager = TeamManager(
+        BUILTIN_TEAM_DIR,
+        USER_TEAM_DIR,
+        client,
+        profiler,
+        skill_registry=skill_registry,
+    )
 
     tools: list[dict] = list(ALL_TOOLS)
     tools.append(COMPACT_SCHEMA)
@@ -277,9 +325,11 @@ def run() -> None:
             user_input = input("> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
+            team_manager.deactivate_all()
             break
 
         if user_input.lower() == "exit":
+            team_manager.deactivate_all()
             break
         if not user_input:
             continue
@@ -295,6 +345,7 @@ def run() -> None:
             skill_registry=skill_registry,
             transcripts_dir=transcripts_dir,
             bg_manager=bg_manager,
+            team_manager=team_manager,
         )
 
         last = messages[-1]

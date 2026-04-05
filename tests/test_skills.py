@@ -294,6 +294,16 @@ class TestLoad:
         assert "user content" in result
         assert "built-in content" not in result
 
+    def test_load_picks_up_skill_created_after_init(
+        self, builtin_dir: Path, user_dir: Path
+    ) -> None:
+        reg = SkillRegistry(builtin_dir, user_dir)
+        assert "Unknown skill" in reg.load("late")
+
+        _write_skill(user_dir, "late", "Late skill", "late body")
+        result = reg.load("late")
+        assert "late body" in result
+
 
 # ---------------------------------------------------------------------------
 # Tool schema

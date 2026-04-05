@@ -19,6 +19,8 @@ class SkillRegistry:
     """Two-source skill registry: built-in + user, user wins on name collision."""
 
     def __init__(self, builtin_dir: Path, user_dir: Path) -> None:
+        self._builtin_dir = builtin_dir
+        self._user_dir = user_dir
         self._skills: dict[str, _SkillEntry] = {}
         self._scan_dir(builtin_dir)
         self._scan_dir(user_dir)
@@ -80,8 +82,15 @@ class SkillRegistry:
             lines.append(line)
         return "\n".join(lines)
 
+    def _rescan(self) -> None:
+        self._scan_dir(self._builtin_dir)
+        self._scan_dir(self._user_dir)
+
     def load(self, name: str) -> str:
         entry = self._skills.get(name)
+        if entry is None:
+            self._rescan()
+            entry = self._skills.get(name)
         if entry is None:
             available = ", ".join(sorted(self._skills))
             return f"Unknown skill: {name}. Available: {available}"

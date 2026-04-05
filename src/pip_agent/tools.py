@@ -343,6 +343,73 @@ TASK_REMOVE_SCHEMA = {
 
 TASK_TOOL_NAMES = frozenset({"task_create", "task_update", "task_list", "task_remove"})
 
+TEAM_SPAWN_SCHEMA = {
+    "name": "team_spawn",
+    "description": (
+        "Spawn a pre-defined teammate with an initial task. "
+        "The teammate starts working immediately. "
+        "Use team_status to see available teammates."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Teammate name (must exist in roster).",
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Initial task / instructions for the teammate.",
+            },
+        },
+        "required": ["name", "prompt"],
+    },
+}
+
+TEAM_SEND_SCHEMA = {
+    "name": "team_send",
+    "description": (
+        "Send a message to a working teammate (must be spawned first). "
+        "Use msg_type='broadcast' to send to all working teammates."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "to": {
+                "type": "string",
+                "description": "Recipient teammate name (ignored for broadcast).",
+            },
+            "content": {
+                "type": "string",
+                "description": "Message content.",
+            },
+            "msg_type": {
+                "type": "string",
+                "enum": [
+                    "broadcast",
+                    "deactivate_request",
+                    "deactivate_response",
+                    "message",
+                    "plan_approval_response",
+                ],
+                "description": "Message type. Default: message.",
+            },
+        },
+        "required": ["to", "content"],
+    },
+}
+
+TEAM_STATUS_SCHEMA = {
+    "name": "team_status",
+    "description": "Show the teammate roster with descriptions, models, and current status (available/working).",
+    "input_schema": {
+        "type": "object",
+        "properties": {},
+    },
+}
+
+TEAM_TOOL_NAMES = frozenset({"team_spawn", "team_send", "team_status"})
+
 CHECK_BACKGROUND_SCHEMA = {
     "name": "check_background",
     "description": "Check background task status. Omit task_id to list all tasks.",
@@ -540,6 +607,9 @@ ALL_TOOLS = [
     TASK_LIST_SCHEMA,
     TASK_REMOVE_SCHEMA,
     CHECK_BACKGROUND_SCHEMA,
+    TEAM_SPAWN_SCHEMA,
+    TEAM_SEND_SCHEMA,
+    TEAM_STATUS_SCHEMA,
 ]
 
 
