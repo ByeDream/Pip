@@ -261,7 +261,16 @@ def run() -> None:
         tools.append(skill_registry.tool_schema())
         system_prompt += "\n\n" + skill_registry.catalog_prompt()
 
-    print("Pip-Boy Agent (type 'exit' to quit)")
+    print(
+        "============================================\n"
+        "  ROBCO INDUSTRIES (TM) TERMLINK PROTOCOL\n"
+        "  PIP-BOY 3000 MARK IV\n"
+        "  Personal Assistant Module v0.1.0\n"
+        "============================================\n"
+        "  Welcome, Vault Dweller. Type 'exit' to\n"
+        "  power down.\n"
+        "============================================"
+    )
 
     while True:
         try:
