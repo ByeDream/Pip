@@ -126,7 +126,11 @@ def agent_loop(
             notifications = bg_manager.drain()
             if notifications:
                 last_msg = messages[-1]
-                if last_msg["role"] == "user" and isinstance(last_msg["content"], list):
+                if last_msg["role"] == "user":
+                    if isinstance(last_msg["content"], str):
+                        last_msg["content"] = [
+                            {"type": "text", "text": last_msg["content"]},
+                        ]
                     for n in notifications:
                         last_msg["content"].append({
                             "type": "text",
@@ -143,13 +147,24 @@ def agent_loop(
             inbox = team_manager.read_inbox()
             if inbox:
                 last_msg = messages[-1]
-                if last_msg["role"] == "user" and isinstance(last_msg["content"], list):
+                if last_msg["role"] == "user":
+                    if isinstance(last_msg["content"], str):
+                        last_msg["content"] = [
+                            {"type": "text", "text": last_msg["content"]},
+                        ]
                     for msg in inbox:
+                        attrs = (
+                            f'from="{msg["from"]}"'
+                            f' msg_type="{msg.get("type", "message")}"'
+                        )
+                        if "req_id" in msg:
+                            attrs += f' req_id="{msg["req_id"]}"'
+                        if "approve" in msg:
+                            attrs += f' approve="{msg["approve"]}"'
                         last_msg["content"].append({
                             "type": "text",
                             "text": (
-                                f'<team-message from="{msg["from"]}"'
-                                f' msg_type="{msg.get("type", "message")}">'
+                                f"<team-message {attrs}>"
                                 f'\n{msg["content"]}\n</team-message>'
                             ),
                         })
@@ -238,10 +253,15 @@ def agent_loop(
                                 block.input["prompt"],
                             )
                         elif block.name == "team_send":
+                            extra = {}
+                            for key in ("req_id", "approve"):
+                                if key in block.input:
+                                    extra[key] = block.input[key]
                             result = team_manager.send(
                                 block.input["to"],
                                 block.input["content"],
                                 block.input.get("msg_type", "message"),
+                                **extra,
                             )
                         elif block.name == "team_read_inbox":
                             inbox = team_manager.read_inbox()
@@ -342,7 +362,7 @@ def run() -> None:
             print(team_manager.status())
             continue
         if user_input == "/inbox":
-            inbox = team_manager.read_inbox()
+            inbox = team_manager.peek_inbox()
             print(json.dumps(inbox, indent=2) if inbox else "(no messages)")
             continue
 

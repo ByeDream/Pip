@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -21,9 +22,10 @@ if TYPE_CHECKING:
 VALID_MSG_TYPES = frozenset({
     "message",
     "broadcast",
-    "deactivate_request",
-    "deactivate_response",
-    "plan_approval_response",
+    "shutdown_request",
+    "shutdown_response",
+    "plan_request",
+    "plan_response",
 })
 
 DEFAULT_TOOLS = [
@@ -36,7 +38,8 @@ SEND_SCHEMA = {
     "name": "send",
     "description": (
         "Send a message to a teammate or to 'lead' (the main agent). "
-        "Use msg_type='broadcast' to send to all active teammates."
+        "Use msg_type='broadcast' to send to all active teammates. "
+        "For protocol responses, include req_id and approve."
     ),
     "input_schema": {
         "type": "object",
@@ -53,6 +56,14 @@ SEND_SCHEMA = {
                 "type": "string",
                 "enum": sorted(VALID_MSG_TYPES),
                 "description": "Message type. Default: message.",
+            },
+            "req_id": {
+                "type": "string",
+                "description": "Request ID (for protocol responses).",
+            },
+            "approve": {
+                "type": "boolean",
+                "description": "Approve or reject (for protocol responses).",
             },
         },
         "required": ["to", "content"],
@@ -131,18 +142,21 @@ class Bus:
         to_name: str,
         content: str,
         msg_type: str = "message",
+        **extra,
     ) -> str:
         if msg_type not in VALID_MSG_TYPES:
             return (
                 f"[error] Invalid msg_type '{msg_type}'. "
                 f"Valid: {sorted(VALID_MSG_TYPES)}"
             )
-        line = json.dumps({
+        msg = {
             "type": msg_type,
             "from": from_name,
             "content": content,
             "ts": time.time(),
-        })
+        }
+        msg.update(extra)
+        line = json.dumps(msg)
         with self._lock:
             self._dir.mkdir(parents=True, exist_ok=True)
             with open(
@@ -151,21 +165,84 @@ class Bus:
                 f.write(line + "\n")
         return f"Sent {msg_type} to {to_name}"
 
-    def read_inbox(self, name: str) -> list[dict]:
-        path = self._dir / f"{name}.jsonl"
-        with self._lock:
-            if not path.is_file() or path.stat().st_size == 0:
-                return []
-            lines = path.read_text(encoding="utf-8").strip().splitlines()
-            path.write_text("", encoding="utf-8")
+    def _parse_inbox(self, path: Path) -> list[dict]:
         messages: list[dict] = []
-        for line in lines:
+        for line in path.read_text(encoding="utf-8").strip().splitlines():
             if line.strip():
                 try:
                     messages.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
         return messages
+
+    def peek_inbox(self, name: str) -> list[dict]:
+        path = self._dir / f"{name}.jsonl"
+        with self._lock:
+            if not path.is_file() or path.stat().st_size == 0:
+                return []
+            return self._parse_inbox(path)
+
+    def read_inbox(self, name: str) -> list[dict]:
+        path = self._dir / f"{name}.jsonl"
+        with self._lock:
+            if not path.is_file() or path.stat().st_size == 0:
+                return []
+            messages = self._parse_inbox(path)
+            path.write_text("", encoding="utf-8")
+        return messages
+
+
+# ---------------------------------------------------------------------------
+# ProtocolTracker
+# ---------------------------------------------------------------------------
+
+
+class ProtocolTracker:
+    """Track request-response protocol state (shutdown, plan approval).
+
+    Shared FSM: [pending] --approve--> [approved]
+                [pending] --reject---> [rejected]
+    """
+
+    def __init__(self) -> None:
+        self._shutdown: dict[str, dict] = {}
+        self._plans: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def open_shutdown(self, target: str) -> str:
+        req_id = uuid.uuid4().hex[:8]
+        with self._lock:
+            self._shutdown[req_id] = {"target": target, "status": "pending"}
+        return req_id
+
+    def open_plan(self, from_name: str, plan: str) -> str:
+        req_id = uuid.uuid4().hex[:8]
+        with self._lock:
+            self._plans[req_id] = {
+                "from": from_name, "plan": plan, "status": "pending",
+            }
+        return req_id
+
+    def resolve(self, req_id: str, approve: bool) -> str:
+        new_status = "approved" if approve else "rejected"
+        with self._lock:
+            for store in (self._shutdown, self._plans):
+                if req_id in store:
+                    if store[req_id]["status"] != "pending":
+                        return (
+                            f"[error] Request {req_id} already "
+                            f"{store[req_id]['status']}"
+                        )
+                    store[req_id]["status"] = new_status
+                    return new_status
+        return f"[error] Unknown request_id '{req_id}'"
+
+    def get(self, req_id: str) -> dict | None:
+        with self._lock:
+            for store in (self._shutdown, self._plans):
+                if req_id in store:
+                    return dict(store[req_id])
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -177,10 +254,12 @@ def _format_team_message(msg: dict) -> str:
     from_name = msg.get("from", "unknown")
     msg_type = msg.get("type", "message")
     content = msg.get("content", "")
-    return (
-        f'<team-message from="{from_name}" msg_type="{msg_type}">'
-        f"\n{content}\n</team-message>"
-    )
+    attrs = f'from="{from_name}" msg_type="{msg_type}"'
+    if "req_id" in msg:
+        attrs += f' req_id="{msg["req_id"]}"'
+    if "approve" in msg:
+        attrs += f' approve="{msg["approve"]}"'
+    return f"<team-message {attrs}>\n{content}\n</team-message>"
 
 
 class Teammate:
@@ -198,6 +277,7 @@ class Teammate:
         bus: Bus,
         profiler: Profiler,
         *,
+        protocol: ProtocolTracker | None = None,
         skill_registry: SkillRegistry | None = None,
         active_names_fn: callable = lambda: [],
         done_fn: callable | None = None,
@@ -206,11 +286,13 @@ class Teammate:
         self._client = client
         self._bus = bus
         self._profiler = profiler
+        self._protocol = protocol
         self._skill_registry = skill_registry
         self._active_names_fn = active_names_fn
         self._done_fn = done_fn
         self._status = "working"
         self._shutdown = threading.Event()
+        self._approved_shutdown = False
 
     @property
     def status(self) -> str:
@@ -238,23 +320,7 @@ class Teammate:
             self._finish()
             return
 
-        work_msgs: list[dict] = []
-        deactivate_from: str | None = None
-        for msg in inbox:
-            if msg.get("type") == "deactivate_request":
-                deactivate_from = msg.get("from", self.LEAD)
-            else:
-                work_msgs.append(msg)
-
-        if work_msgs and deactivate_from is None:
-            self._process(work_msgs)
-
-        if deactivate_from is not None:
-            self._bus.send(
-                self.spec.name, deactivate_from,
-                "Deactivating.", "deactivate_response",
-            )
-
+        self._process(inbox)
         self._finish()
 
     def _finish(self) -> None:
@@ -276,7 +342,8 @@ class Teammate:
         system = self._system_prompt()
 
         for _ in range(self.spec.max_turns):
-            if self._inject_inbox(messages):
+            self._inject_inbox(messages)
+            if self._approved_shutdown:
                 break
 
             self._profiler.start(f"api:teammate:{self.spec.name}")
@@ -320,27 +387,16 @@ class Teammate:
                 })
             messages.append({"role": "user", "content": tool_results})
 
-    def _inject_inbox(self, messages: list[dict]) -> bool:
-        """Drain inbox and inject new messages into the last user turn.
-
-        Returns True if a deactivate_request was found.
-        """
+    def _inject_inbox(self, messages: list[dict]) -> None:
+        """Drain inbox and inject new messages into the last user turn."""
         new_inbox = self._bus.read_inbox(self.spec.name)
         if not new_inbox:
-            return False
-        deactivate = False
-        parts: list[str] = []
-        for msg in new_inbox:
-            if msg.get("type") == "deactivate_request":
-                deactivate = True
-                continue
-            parts.append(_format_team_message(msg))
-        if parts:
-            last = messages[-1]
-            if last["role"] == "user" and isinstance(last["content"], list):
-                for text in parts:
-                    last["content"].append({"type": "text", "text": text})
-        return deactivate
+            return
+        parts = [_format_team_message(msg) for msg in new_inbox]
+        last = messages[-1]
+        if last["role"] == "user" and isinstance(last["content"], list):
+            for text in parts:
+                last["content"].append({"type": "text", "text": text})
 
     # -- Tool dispatch ------------------------------------------------------
 
@@ -366,6 +422,10 @@ class Teammate:
         to = tool_input["to"]
         content = tool_input["content"]
         msg_type = tool_input.get("msg_type", "message")
+        extra: dict = {}
+        for key in ("req_id", "approve"):
+            if key in tool_input:
+                extra[key] = tool_input[key]
         if msg_type == "broadcast":
             count = 0
             for name in self._active_names_fn():
@@ -374,7 +434,19 @@ class Teammate:
                     count += 1
             self._bus.send(self.spec.name, self.LEAD, content, "broadcast")
             return f"Broadcast to {count} teammates + lead"
-        return self._bus.send(self.spec.name, to, content, msg_type)
+        if self._protocol is not None:
+            if msg_type == "plan_request":
+                extra["req_id"] = self._protocol.open_plan(
+                    self.spec.name, content,
+                )
+            elif msg_type == "shutdown_response":
+                req_id = extra.get("req_id")
+                approve = extra.get("approve", False)
+                if req_id:
+                    self._protocol.resolve(req_id, approve)
+                if approve:
+                    self._approved_shutdown = True
+        return self._bus.send(self.spec.name, to, content, msg_type, **extra)
 
     # -- Tool & prompt construction -----------------------------------------
 
@@ -425,6 +497,7 @@ class TeamManager:
         self._roster: dict[str, TeammateSpec] = {}
         self._active: dict[str, Teammate] = {}
         self._bus = Bus(user_dir / "inbox")
+        self._protocol = ProtocolTracker()
         self._builtin_dir = builtin_dir
         self._user_dir = user_dir
 
@@ -453,6 +526,7 @@ class TeamManager:
             self._client,
             self._bus,
             self._profiler,
+            protocol=self._protocol,
             skill_registry=self._skill_registry,
             active_names_fn=self._active_names,
             done_fn=self._on_done,
@@ -480,17 +554,29 @@ class TeamManager:
         self._bus.send(self.LEAD, name, prompt, "message")
         return f"Spawned '{name}' ({spec.model}, max {spec.max_turns} turns)."
 
-    def send(self, to: str, content: str, msg_type: str = "message") -> str:
+    def send(
+        self, to: str, content: str, msg_type: str = "message", **extra,
+    ) -> str:
         if msg_type == "broadcast":
             count = 0
             for name in list(self._active):
                 self._bus.send(self.LEAD, name, content, "broadcast")
                 count += 1
             return f"Broadcast to {count} teammates."
-        result = self._bus.send(self.LEAD, to, content, msg_type)
+        if msg_type == "shutdown_request":
+            extra["req_id"] = self._protocol.open_shutdown(to)
+        elif msg_type == "plan_response":
+            req_id = extra.get("req_id")
+            approve = extra.get("approve", False)
+            if req_id:
+                self._protocol.resolve(req_id, approve)
+        result = self._bus.send(self.LEAD, to, content, msg_type, **extra)
         if to not in self._active:
             return f"{result} (offline — will be read on next activation)"
         return result
+
+    def peek_inbox(self) -> list[dict]:
+        return self._bus.peek_inbox(self.LEAD)
 
     def read_inbox(self) -> list[dict]:
         return self._bus.read_inbox(self.LEAD)

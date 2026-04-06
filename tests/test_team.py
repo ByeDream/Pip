@@ -11,6 +11,7 @@ import pytest
 from pip_agent.profiler import Profiler
 from pip_agent.team import (
     Bus,
+    ProtocolTracker,
     TeamManager,
     Teammate,
     TeammateSpec,
@@ -546,22 +547,6 @@ class TestTeammateLLMLoop:
 
         assert client.messages.create.call_count == 2
 
-    @patch("pip_agent.team.settings")
-    def test_deactivate_request_triggers_response(self, mock_settings, tmp_path):
-        mock_settings.model = "m"
-        mock_settings.max_tokens = 1024
-        mock_settings.subagent_max_rounds = 10
-        mock_settings.verbose = False
-
-        t, client, bus = self._make_teammate(tmp_path)
-        bus.send("lead", "alice", "go", "deactivate_request")
-        t.start()
-        time.sleep(0.5)
-
-        lead_msgs = bus.read_inbox("lead")
-        assert any(m.get("type") == "deactivate_response" for m in lead_msgs)
-        assert t.status == "done"
-
     def test_tool_allowlist_enforced(self, tmp_path):
         t, client, bus = self._make_teammate(tmp_path)
         tools = t._build_tools()
@@ -676,3 +661,313 @@ class TestTeammateSend:
         lead_msgs = bus.read_inbox("lead")
         assert len(bob_msgs) == 1
         assert len(lead_msgs) == 1
+
+
+# ---------------------------------------------------------------------------
+# Bus — extra fields
+# ---------------------------------------------------------------------------
+
+
+class TestBusExtra:
+    def test_extra_fields_included_in_message(self, tmp_path):
+        bus = Bus(tmp_path / "inbox")
+        bus.send("lead", "alice", "wrap up", "shutdown_request", req_id="abc")
+        msgs = bus.read_inbox("alice")
+        assert len(msgs) == 1
+        assert msgs[0]["req_id"] == "abc"
+        assert msgs[0]["type"] == "shutdown_request"
+
+    def test_extra_approve_field(self, tmp_path):
+        bus = Bus(tmp_path / "inbox")
+        bus.send(
+            "alice", "lead", "ok", "shutdown_response",
+            req_id="abc", approve=True,
+        )
+        msgs = bus.read_inbox("lead")
+        assert len(msgs) == 1
+        assert msgs[0]["req_id"] == "abc"
+        assert msgs[0]["approve"] is True
+
+    def test_no_extra_fields_when_not_provided(self, tmp_path):
+        bus = Bus(tmp_path / "inbox")
+        bus.send("lead", "alice", "hello")
+        msgs = bus.read_inbox("alice")
+        assert "req_id" not in msgs[0]
+        assert "approve" not in msgs[0]
+
+
+# ---------------------------------------------------------------------------
+# ProtocolTracker
+# ---------------------------------------------------------------------------
+
+
+class TestProtocolTracker:
+    def test_open_shutdown_creates_pending(self):
+        pt = ProtocolTracker()
+        req_id = pt.open_shutdown("alice")
+        entry = pt.get(req_id)
+        assert entry is not None
+        assert entry["target"] == "alice"
+        assert entry["status"] == "pending"
+
+    def test_open_plan_creates_pending(self):
+        pt = ProtocolTracker()
+        req_id = pt.open_plan("alice", "Refactor auth module")
+        entry = pt.get(req_id)
+        assert entry is not None
+        assert entry["from"] == "alice"
+        assert entry["plan"] == "Refactor auth module"
+        assert entry["status"] == "pending"
+
+    def test_resolve_approve(self):
+        pt = ProtocolTracker()
+        req_id = pt.open_shutdown("alice")
+        result = pt.resolve(req_id, approve=True)
+        assert result == "approved"
+        assert pt.get(req_id)["status"] == "approved"
+
+    def test_resolve_reject(self):
+        pt = ProtocolTracker()
+        req_id = pt.open_plan("alice", "plan text")
+        result = pt.resolve(req_id, approve=False)
+        assert result == "rejected"
+        assert pt.get(req_id)["status"] == "rejected"
+
+    def test_double_resolve_returns_error(self):
+        pt = ProtocolTracker()
+        req_id = pt.open_shutdown("alice")
+        pt.resolve(req_id, approve=True)
+        result = pt.resolve(req_id, approve=False)
+        assert "[error]" in result
+        assert "already" in result
+        assert pt.get(req_id)["status"] == "approved"
+
+    def test_resolve_unknown_returns_error(self):
+        pt = ProtocolTracker()
+        result = pt.resolve("nonexistent", approve=True)
+        assert "[error]" in result
+        assert "Unknown" in result
+
+    def test_get_unknown_returns_none(self):
+        pt = ProtocolTracker()
+        assert pt.get("nonexistent") is None
+
+    def test_get_returns_copy(self):
+        pt = ProtocolTracker()
+        req_id = pt.open_shutdown("alice")
+        entry = pt.get(req_id)
+        entry["status"] = "tampered"
+        assert pt.get(req_id)["status"] == "pending"
+
+    def test_unique_req_ids(self):
+        pt = ProtocolTracker()
+        ids = {pt.open_shutdown("alice") for _ in range(50)}
+        assert len(ids) == 50
+
+    def test_thread_safety(self):
+        pt = ProtocolTracker()
+        errors: list[Exception] = []
+        ids: list[str] = []
+        lock = threading.Lock()
+
+        def opener(i: int) -> None:
+            try:
+                for _ in range(20):
+                    req_id = pt.open_shutdown(f"target-{i}")
+                    with lock:
+                        ids.append(req_id)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=opener, args=(i,)) for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+        assert len(ids) == 100
+        assert len(set(ids)) == 100
+
+
+# ---------------------------------------------------------------------------
+# Shutdown protocol
+# ---------------------------------------------------------------------------
+
+
+class TestShutdownProtocol:
+    def test_manager_send_creates_req_id(self, tmp_path):
+        mgr = _make_mgr(tmp_path, "alice")
+        with patch.object(Teammate, "start"):
+            mgr.spawn("alice", "Task")
+            mgr._bus.read_inbox("alice")
+        mgr.send("alice", "Please shut down", "shutdown_request")
+        msgs = mgr._bus.read_inbox("alice")
+        assert len(msgs) == 1
+        assert msgs[0]["type"] == "shutdown_request"
+        assert "req_id" in msgs[0]
+        req_id = msgs[0]["req_id"]
+        entry = mgr._protocol.get(req_id)
+        assert entry["target"] == "alice"
+        assert entry["status"] == "pending"
+
+    def test_teammate_approve_resolves_tracker(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        bus = Bus(tmp_path / "inbox")
+        pt = ProtocolTracker()
+        req_id = pt.open_shutdown("alice")
+        t = Teammate(
+            spec, MagicMock(), bus, Profiler(),
+            protocol=pt,
+            active_names_fn=lambda: ["alice"],
+        )
+        result = t._handle_send({
+            "to": "lead",
+            "content": "Shutting down.",
+            "msg_type": "shutdown_response",
+            "req_id": req_id,
+            "approve": True,
+        })
+        assert "Sent" in result
+        assert pt.get(req_id)["status"] == "approved"
+        assert t._approved_shutdown is True
+
+    def test_teammate_reject_resolves_tracker(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        bus = Bus(tmp_path / "inbox")
+        pt = ProtocolTracker()
+        req_id = pt.open_shutdown("alice")
+        t = Teammate(
+            spec, MagicMock(), bus, Profiler(),
+            protocol=pt,
+            active_names_fn=lambda: ["alice"],
+        )
+        t._handle_send({
+            "to": "lead",
+            "content": "Still working.",
+            "msg_type": "shutdown_response",
+            "req_id": req_id,
+            "approve": False,
+        })
+        assert pt.get(req_id)["status"] == "rejected"
+        assert t._approved_shutdown is False
+
+    def test_approved_shutdown_exits_loop(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        client = MagicMock()
+        bus = Bus(tmp_path / "inbox")
+        pt = ProtocolTracker()
+        req_id = pt.open_shutdown("alice")
+        t = Teammate(
+            spec, client, bus, Profiler(),
+            protocol=pt,
+            active_names_fn=lambda: ["alice"],
+        )
+        client.messages.create.side_effect = [
+            _make_response(
+                [_tool_use_block("send", {
+                    "to": "lead",
+                    "content": "ok",
+                    "msg_type": "shutdown_response",
+                    "req_id": req_id,
+                    "approve": True,
+                })],
+                stop_reason="tool_use",
+            ),
+        ]
+        bus.send(
+            "lead", "alice", "Please shut down",
+            "shutdown_request", req_id=req_id,
+        )
+        t.start()
+        time.sleep(1)
+        assert t.status == "done"
+        assert pt.get(req_id)["status"] == "approved"
+        assert client.messages.create.call_count == 1
+
+    def test_shutdown_response_on_bus(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        bus = Bus(tmp_path / "inbox")
+        pt = ProtocolTracker()
+        req_id = pt.open_shutdown("alice")
+        t = Teammate(
+            spec, MagicMock(), bus, Profiler(),
+            protocol=pt,
+            active_names_fn=lambda: ["alice"],
+        )
+        t._handle_send({
+            "to": "lead",
+            "content": "bye",
+            "msg_type": "shutdown_response",
+            "req_id": req_id,
+            "approve": True,
+        })
+        lead_msgs = bus.read_inbox("lead")
+        assert len(lead_msgs) == 1
+        assert lead_msgs[0]["type"] == "shutdown_response"
+        assert lead_msgs[0]["req_id"] == req_id
+        assert lead_msgs[0]["approve"] is True
+
+
+# ---------------------------------------------------------------------------
+# Plan approval protocol
+# ---------------------------------------------------------------------------
+
+
+class TestPlanApprovalProtocol:
+    def test_teammate_plan_request_creates_req_id(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        bus = Bus(tmp_path / "inbox")
+        pt = ProtocolTracker()
+        t = Teammate(
+            spec, MagicMock(), bus, Profiler(),
+            protocol=pt,
+            active_names_fn=lambda: ["alice"],
+        )
+        t._handle_send({
+            "to": "lead",
+            "content": "Refactor auth module",
+            "msg_type": "plan_request",
+        })
+        lead_msgs = bus.read_inbox("lead")
+        assert len(lead_msgs) == 1
+        assert lead_msgs[0]["type"] == "plan_request"
+        req_id = lead_msgs[0]["req_id"]
+        entry = pt.get(req_id)
+        assert entry["from"] == "alice"
+        assert entry["plan"] == "Refactor auth module"
+        assert entry["status"] == "pending"
+
+    def test_manager_approve_plan(self, tmp_path):
+        mgr = _make_mgr(tmp_path, "alice")
+        req_id = mgr._protocol.open_plan("alice", "Refactor auth")
+        with patch.object(Teammate, "start"):
+            mgr.spawn("alice", "Task")
+            mgr._bus.read_inbox("alice")
+        mgr.send(
+            "alice", "Approved, go ahead.",
+            "plan_response", req_id=req_id, approve=True,
+        )
+        assert mgr._protocol.get(req_id)["status"] == "approved"
+        msgs = mgr._bus.read_inbox("alice")
+        assert len(msgs) == 1
+        assert msgs[0]["type"] == "plan_response"
+        assert msgs[0]["req_id"] == req_id
+        assert msgs[0]["approve"] is True
+
+    def test_manager_reject_plan(self, tmp_path):
+        mgr = _make_mgr(tmp_path, "alice")
+        req_id = mgr._protocol.open_plan("alice", "Delete everything")
+        with patch.object(Teammate, "start"):
+            mgr.spawn("alice", "Task")
+            mgr._bus.read_inbox("alice")
+        mgr.send(
+            "alice", "Too risky.",
+            "plan_response", req_id=req_id, approve=False,
+        )
+        assert mgr._protocol.get(req_id)["status"] == "rejected"

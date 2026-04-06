@@ -370,7 +370,8 @@ TEAM_SEND_SCHEMA = {
     "name": "team_send",
     "description": (
         "Send a message to a working teammate (must be spawned first). "
-        "Use msg_type='broadcast' to send to all working teammates."
+        "Use msg_type='broadcast' to send to all working teammates. "
+        "For protocol messages, include req_id and/or approve."
     ),
     "input_schema": {
         "type": "object",
@@ -387,12 +388,20 @@ TEAM_SEND_SCHEMA = {
                 "type": "string",
                 "enum": [
                     "broadcast",
-                    "deactivate_request",
-                    "deactivate_response",
                     "message",
-                    "plan_approval_response",
+                    "plan_response",
+                    "shutdown_request",
+                    "shutdown_response",
                 ],
                 "description": "Message type. Default: message.",
+            },
+            "req_id": {
+                "type": "string",
+                "description": "Request ID (for protocol responses).",
+            },
+            "approve": {
+                "type": "boolean",
+                "description": "Approve or reject (for protocol responses).",
             },
         },
         "required": ["to", "content"],
