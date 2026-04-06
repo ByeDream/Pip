@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -383,6 +384,7 @@ class PlanManager:
     def __init__(self, root: Path) -> None:
         self._root = root
         self._root.mkdir(parents=True, exist_ok=True)
+        self._claim_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Story I/O
@@ -651,6 +653,45 @@ class PlanManager:
             d.is_dir() and (d / _META_FILE).is_file()
             for d in self._root.iterdir()
         ) if self._root.exists() else False
+
+    def claim_next(self, owner: str) -> dict | None:
+        """Atomically find and claim the next ready, unowned task.
+
+        Scans stories (skipping completed/blocked) and within each finds
+        the first task that is pending, unblocked, and unowned.
+        Returns ``{"story": ..., "id": ..., "title": ...}`` or ``None``.
+        """
+        with self._claim_lock:
+            if not self._root.exists():
+                return None
+            all_metas = self._load_all_metas()
+            if not all_metas:
+                return None
+
+            story_statuses: dict[str, TaskStatus] = {
+                sid: self._derive_status(sid) for sid in all_metas
+            }
+
+            for sid, meta in all_metas.items():
+                if story_statuses[sid] == "completed":
+                    continue
+                if _is_blocked_by_status(meta.blocked_by, story_statuses):
+                    continue
+
+                ng = self._task_graph(sid)
+                tasks = ng.load_all()
+                for t in tasks.values():
+                    if (
+                        t.status == "pending"
+                        and not t.blocked_by
+                        and not t.owner
+                    ):
+                        t.status = "in_progress"
+                        t.owner = owner
+                        ng.save(t)
+                        return {"story": sid, "id": t.id, "title": t.title}
+
+        return None
 
     # ------------------------------------------------------------------
     # Render

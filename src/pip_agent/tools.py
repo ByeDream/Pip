@@ -361,6 +361,10 @@ TEAM_SPAWN_SCHEMA = {
                 "type": "string",
                 "description": "Initial task / instructions for the teammate.",
             },
+            "max_turns": {
+                "type": "integer",
+                "description": "Max tool-use rounds for this session. Omit to use the teammate default.",
+            },
         },
         "required": ["name", "prompt"],
     },

@@ -251,6 +251,7 @@ def agent_loop(
                             result = team_manager.spawn(
                                 block.input["name"],
                                 block.input["prompt"],
+                                max_turns=block.input.get("max_turns"),
                             )
                         elif block.name == "team_send":
                             extra = {}
@@ -290,6 +291,9 @@ def agent_loop(
             messages.append({"role": "user", "content": tool_results})
 
             if compact_requested or last_input_tokens > settings.compact_threshold:
+                if settings.verbose:
+                    reason = "tool:compact" if compact_requested else f"input_tokens={last_input_tokens}"
+                    print(f"  [context] auto_compact triggered ({reason})")
                 if transcripts_dir is not None:
                     auto_compact(
                         client, messages, system_prompt, transcripts_dir, profiler
@@ -325,6 +329,7 @@ def run() -> None:
         client,
         profiler,
         skill_registry=skill_registry,
+        plan_manager=plan_manager,
     )
 
     tools: list[dict] = list(ALL_TOOLS)

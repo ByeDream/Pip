@@ -320,7 +320,7 @@ class TestTeamManagerSpawn:
             mgr.spawn("alice", "Task 1")
             result = mgr.spawn("alice", "Task 2")
         assert "[error]" in result
-        assert "already working" in result
+        assert "currently working" in result
 
     def test_spawn_unknown_rejected(self, tmp_path):
         mgr = _make_mgr(tmp_path, "alice")
@@ -359,7 +359,7 @@ class TestTeamManagerRescan:
         _write_md(user_dir, "alice", SAMPLE_MD)
         result = mgr.status()
         assert "alice" in result
-        assert "[available]" in result
+        assert "[offline]" in result
 
 
 # ---------------------------------------------------------------------------
@@ -416,15 +416,15 @@ class TestTeamManagerSend:
 
 
 # ---------------------------------------------------------------------------
-# TeamManager — status (two-state: available / working)
+# TeamManager — status (three-state: working / idle / offline)
 # ---------------------------------------------------------------------------
 
 
 class TestTeamManagerStatus:
-    def test_all_available_by_default(self, tmp_path):
+    def test_all_offline_by_default(self, tmp_path):
         mgr = _make_mgr(tmp_path, "alice")
         result = mgr.status()
-        assert "[available]" in result
+        assert "[offline]" in result
         assert "[working]" not in result
 
     def test_working_after_spawn(self, tmp_path):
@@ -434,13 +434,13 @@ class TestTeamManagerStatus:
         result = mgr.status()
         assert "[working]" in result
 
-    def test_available_after_done(self, tmp_path):
+    def test_offline_after_done(self, tmp_path):
         mgr = _make_mgr(tmp_path, "alice")
         with patch.object(Teammate, "start"):
             mgr.spawn("alice", "Task")
         mgr._on_done("alice")
         result = mgr.status()
-        assert "[available]" in result
+        assert "[offline]" in result
         assert "[working]" not in result
 
     def test_respawn_after_done(self, tmp_path):
@@ -473,7 +473,7 @@ class TestTeamManagerLifecycle:
         with patch.object(Teammate, "start"):
             mgr.spawn("alice", "Task")
         mgr.deactivate_all()
-        assert "[available]" in mgr.status()
+        assert "[offline]" in mgr.status()
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +529,7 @@ class TestTeammateLLMLoop:
 
         client.messages.create.side_effect = create_side_effect
         inbox = bus.read_inbox("alice")
-        t._process(inbox)
+        t._work([], inbox)
 
     def test_max_turns_respected(self, tmp_path):
         md = "---\nname: alice\ndescription: d\nmodel: m\nmax_turns: 2\ntools: [read]\n---\nbody"
@@ -543,7 +543,7 @@ class TestTeammateLLMLoop:
         )
 
         with patch("pip_agent.team.execute_tool", return_value="content"):
-            t._process([{"from": "lead", "type": "message", "content": "go"}])
+            t._work([], [{"from": "lead", "type": "message", "content": "go"}])
 
         assert client.messages.create.call_count == 2
 
@@ -556,12 +556,13 @@ class TestTeammateLLMLoop:
         assert "write" in tool_names
         assert "send" in tool_names
         assert "read_inbox" in tool_names
+        assert "idle" in tool_names
         assert "task" not in tool_names
         assert "team_spawn" not in tool_names
 
 
 # ---------------------------------------------------------------------------
-# Single-shot behavior
+# Single-shot → work-idle lifecycle
 # ---------------------------------------------------------------------------
 
 
@@ -578,38 +579,42 @@ class TestTeammateSingleShot:
             active_names_fn=lambda: ["alice"],
         ), client, bus
 
-    def test_thread_ends_after_processing(self, tmp_path):
+    @patch("pip_agent.team.IDLE_POLL_INTERVAL", 0.05)
+    @patch("pip_agent.team.IDLE_TIMEOUT", 0.2)
+    def test_thread_ends_after_idle_timeout(self, tmp_path):
         t, client, bus = self._make_teammate(tmp_path)
         client.messages.create.return_value = _make_response([_text_block("done")])
         bus.send("lead", "alice", "Do work")
         t.start()
         time.sleep(1)
-        assert t.status == "done"
+        assert t.status == "offline"
         assert client.messages.create.call_count == 1
 
-    def test_no_reprocess_after_thread_ends(self, tmp_path):
+    @patch("pip_agent.team.IDLE_POLL_INTERVAL", 0.05)
+    @patch("pip_agent.team.IDLE_TIMEOUT", 5)
+    def test_idle_picks_up_second_message(self, tmp_path):
         t, client, bus = self._make_teammate(tmp_path)
         client.messages.create.return_value = _make_response([_text_block("done")])
         bus.send("lead", "alice", "Do work")
         t.start()
-        time.sleep(1)
+        time.sleep(0.3)
+        assert t.status == "idle"
 
-        bus.send("lead", "alice", "Another task")
-        time.sleep(0.5)
+        bus.send("lead", "alice", "Second task")
+        time.sleep(0.3)
+        assert client.messages.create.call_count == 2
+        t.stop()
 
-        assert client.messages.create.call_count == 1
-        unprocessed = bus.read_inbox("alice")
-        assert len(unprocessed) == 1
-        assert unprocessed[0]["content"] == "Another task"
-
-    def test_shutdown_during_wait_sets_done(self, tmp_path):
+    def test_shutdown_during_wait_sets_offline(self, tmp_path):
         t, client, bus = self._make_teammate(tmp_path)
         t.start()
         time.sleep(0.3)
         t.stop()
         time.sleep(2.5)
-        assert t.status == "done"
+        assert t.status == "offline"
 
+    @patch("pip_agent.team.IDLE_POLL_INTERVAL", 0.05)
+    @patch("pip_agent.team.IDLE_TIMEOUT", 0.2)
     def test_done_fn_called_on_finish(self, tmp_path):
         path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
         spec = TeammateSpec.from_file(path)
@@ -884,7 +889,7 @@ class TestShutdownProtocol:
         )
         t.start()
         time.sleep(1)
-        assert t.status == "done"
+        assert t.status == "offline"
         assert pt.get(req_id)["status"] == "approved"
         assert client.messages.create.call_count == 1
 
@@ -971,3 +976,365 @@ class TestPlanApprovalProtocol:
             "plan_response", req_id=req_id, approve=False,
         )
         assert mgr._protocol.get(req_id)["status"] == "rejected"
+
+
+# ---------------------------------------------------------------------------
+# Idle tool
+# ---------------------------------------------------------------------------
+
+
+class TestIdleTool:
+    def test_idle_tool_exits_work_loop(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        client = MagicMock()
+        bus = Bus(tmp_path / "inbox")
+        t = Teammate(spec, client, bus, Profiler())
+
+        client.messages.create.side_effect = [
+            _make_response(
+                [_tool_use_block("idle", {})],
+                stop_reason="tool_use",
+            ),
+        ]
+        messages: list[dict] = []
+        t._work(messages, [{"from": "lead", "type": "message", "content": "go"}])
+        assert t._idle_requested is True
+        assert client.messages.create.call_count == 1
+
+    @patch("pip_agent.team.IDLE_POLL_INTERVAL", 0.05)
+    @patch("pip_agent.team.IDLE_TIMEOUT", 5)
+    def test_idle_tool_triggers_idle_cycle(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        client = MagicMock()
+        bus = Bus(tmp_path / "inbox")
+        t = Teammate(spec, client, bus, Profiler())
+
+        client.messages.create.return_value = _make_response(
+            [_tool_use_block("idle", {})],
+            stop_reason="tool_use",
+        )
+        bus.send("lead", "alice", "Do stuff")
+        t.start()
+        time.sleep(0.3)
+        assert t.status == "idle"
+        t.stop()
+
+
+# ---------------------------------------------------------------------------
+# claim_task tool
+# ---------------------------------------------------------------------------
+
+
+class TestClaimTaskTool:
+    def test_claim_task_tool_calls_plan_manager(self, tmp_path):
+        from pip_agent.task_graph import PlanManager
+
+        pm = PlanManager(tmp_path / "tasks")
+        pm.create(None, [{"id": "s1", "title": "S1"}])
+        pm.create("s1", [{"id": "t1", "title": "Task 1"}])
+
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        client = MagicMock()
+        bus = Bus(tmp_path / "inbox")
+        t = Teammate(
+            spec, client, bus, Profiler(), plan_manager=pm,
+        )
+
+        client.messages.create.side_effect = [
+            _make_response(
+                [_tool_use_block(
+                    "claim_task",
+                    {"story": "s1", "task_id": "t1"},
+                )],
+                stop_reason="tool_use",
+            ),
+            _make_response([_text_block("working on it")]),
+        ]
+        t._work([], [{"from": "lead", "type": "message", "content": "go"}])
+
+        task = pm._task_graph("s1").load_all()["t1"]
+        assert task.status == "in_progress"
+        assert task.owner == "alice"
+
+    def test_claim_task_tool_present_only_with_plan_manager(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        bus = Bus(tmp_path / "inbox")
+
+        t_without = Teammate(spec, MagicMock(), bus, Profiler())
+        names = {tool["name"] for tool in t_without._build_tools()}
+        assert "claim_task" not in names
+
+        t_with = Teammate(
+            spec, MagicMock(), bus, Profiler(), plan_manager=MagicMock(),
+        )
+        names = {tool["name"] for tool in t_with._build_tools()}
+        assert "claim_task" in names
+
+
+# ---------------------------------------------------------------------------
+# Autonomous task claiming in idle
+# ---------------------------------------------------------------------------
+
+
+class TestAutonomousClaim:
+    @patch("pip_agent.team.IDLE_POLL_INTERVAL", 0.05)
+    @patch("pip_agent.team.IDLE_TIMEOUT", 2)
+    def test_idle_claims_task_from_board(self, tmp_path):
+        from pip_agent.task_graph import PlanManager
+
+        pm = PlanManager(tmp_path / "tasks")
+        pm.create(None, [{"id": "s1", "title": "S1"}])
+        pm.create("s1", [{"id": "t1", "title": "Auto task"}])
+
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        client = MagicMock()
+        bus = Bus(tmp_path / "inbox")
+        t = Teammate(
+            spec, client, bus, Profiler(), plan_manager=pm,
+        )
+
+        call_count = [0]
+
+        def create_side_effect(**kwargs):
+            call_count[0] += 1
+            return _make_response([_text_block("done")])
+
+        client.messages.create.side_effect = create_side_effect
+
+        bus.send("lead", "alice", "Initial task")
+        t.start()
+        time.sleep(1)
+
+        task = pm._task_graph("s1").load_all()["t1"]
+        assert task.status == "in_progress"
+        assert task.owner == "alice"
+        assert call_count[0] >= 2
+
+    @patch("pip_agent.team.IDLE_POLL_INTERVAL", 0.05)
+    @patch("pip_agent.team.IDLE_TIMEOUT", 0.5)
+    def test_shutdown_request_in_idle_exits(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        client = MagicMock()
+        bus = Bus(tmp_path / "inbox")
+        t = Teammate(spec, client, bus, Profiler())
+
+        client.messages.create.return_value = _make_response([_text_block("ok")])
+        bus.send("lead", "alice", "Do work")
+        t.start()
+        time.sleep(0.3)
+        assert t.status == "idle"
+
+        bus.send("lead", "alice", "bye", "shutdown_request", req_id="r1")
+        time.sleep(0.3)
+        assert t.status == "offline"
+
+
+# ---------------------------------------------------------------------------
+# Identity re-injection
+# ---------------------------------------------------------------------------
+
+
+class TestIdentityReinjection:
+    def test_injects_when_messages_short(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        t = Teammate(spec, MagicMock(), Bus(tmp_path / "inbox"), Profiler())
+
+        messages: list[dict] = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        t._reinject_identity(messages)
+        assert len(messages) == 4
+        assert "<identity>" in messages[0]["content"]
+        assert messages[0]["role"] == "user"
+        assert messages[1]["role"] == "assistant"
+        assert spec.name in messages[1]["content"]
+
+    def test_skips_when_messages_long(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        t = Teammate(spec, MagicMock(), Bus(tmp_path / "inbox"), Profiler())
+
+        messages: list[dict] = [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"},
+            {"role": "assistant", "content": "d"},
+        ]
+        t._reinject_identity(messages)
+        assert len(messages) == 4
+
+
+# ---------------------------------------------------------------------------
+# Three-state status display
+# ---------------------------------------------------------------------------
+
+
+class TestThreeStateStatus:
+    @patch("pip_agent.team.IDLE_POLL_INTERVAL", 0.05)
+    @patch("pip_agent.team.IDLE_TIMEOUT", 2)
+    def test_status_transitions(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        client = MagicMock()
+        bus = Bus(tmp_path / "inbox")
+        t = Teammate(spec, client, bus, Profiler())
+
+        assert t.status == "working"
+
+        client.messages.create.return_value = _make_response([_text_block("ok")])
+        bus.send("lead", "alice", "Task")
+        t.start()
+        time.sleep(0.3)
+        assert t.status == "idle"
+
+        t.stop()
+        time.sleep(0.5)
+        assert t.status == "offline"
+
+
+# ---------------------------------------------------------------------------
+# max_turns override and notifications
+# ---------------------------------------------------------------------------
+
+
+class TestMaxTurnsOverride:
+    def test_override_takes_precedence(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        assert spec.max_turns == 5
+        bus = Bus(tmp_path / "inbox")
+        t = Teammate(spec, MagicMock(), bus, Profiler(), max_turns_override=99)
+        assert t._max_turns == 99
+
+    def test_no_override_uses_spec(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        bus = Bus(tmp_path / "inbox")
+        t = Teammate(spec, MagicMock(), bus, Profiler())
+        assert t._max_turns == 5
+
+    def test_max_turns_exhausted_notifies_lead(self, tmp_path):
+        md = "---\nname: alice\ndescription: d\nmodel: m\nmax_turns: 2\ntools: [read]\n---\nbody"
+        path = _write_md(tmp_path / "team", "alice", md)
+        spec = TeammateSpec.from_file(path)
+        client = MagicMock()
+        bus = Bus(tmp_path / "inbox")
+        t = Teammate(spec, client, bus, Profiler())
+
+        client.messages.create.return_value = _make_response(
+            [_tool_use_block("read", {"file_path": "x.txt"})],
+            stop_reason="tool_use",
+        )
+
+        with patch("pip_agent.team.execute_tool", return_value="content"):
+            t._work([], [{"from": "lead", "type": "message", "content": "go"}])
+
+        assert client.messages.create.call_count == 2
+        lead_msgs = bus.read_inbox("lead")
+        assert any("turns" in m["content"] for m in lead_msgs)
+
+
+class TestFinishNotification:
+    @patch("pip_agent.team.IDLE_POLL_INTERVAL", 0.05)
+    @patch("pip_agent.team.IDLE_TIMEOUT", 0.2)
+    def test_offline_sends_reason_to_lead(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        client = MagicMock()
+        bus = Bus(tmp_path / "inbox")
+        t = Teammate(spec, client, bus, Profiler())
+
+        client.messages.create.return_value = _make_response([_text_block("ok")])
+        bus.send("lead", "alice", "Task")
+        t.start()
+        time.sleep(1)
+        assert t.status == "offline"
+
+        lead_msgs = bus.read_inbox("lead")
+        offline_msgs = [m for m in lead_msgs if m.get("type") == "status"]
+        assert len(offline_msgs) >= 1
+        assert "idle timeout" in offline_msgs[-1]["content"]
+
+    @patch("pip_agent.team.IDLE_POLL_INTERVAL", 0.05)
+    @patch("pip_agent.team.IDLE_TIMEOUT", 0.2)
+    def test_max_turns_reason_in_finish(self, tmp_path):
+        md = "---\nname: alice\ndescription: d\nmodel: m\nmax_turns: 1\ntools: [read]\n---\nbody"
+        path = _write_md(tmp_path / "team", "alice", md)
+        spec = TeammateSpec.from_file(path)
+        client = MagicMock()
+        bus = Bus(tmp_path / "inbox")
+        t = Teammate(spec, client, bus, Profiler())
+
+        client.messages.create.return_value = _make_response(
+            [_tool_use_block("read", {"file_path": "x.txt"})],
+            stop_reason="tool_use",
+        )
+
+        bus.send("lead", "alice", "Task")
+        with patch("pip_agent.team.execute_tool", return_value="ok"):
+            t.start()
+            time.sleep(1)
+
+        assert t.status == "offline"
+        lead_msgs = bus.read_inbox("lead")
+        status_msgs = [m for m in lead_msgs if m.get("type") == "status"]
+        reasons = " ".join(m["content"] for m in status_msgs)
+        assert "turns" in reasons
+        assert "idle timeout" in reasons
+
+    def test_crash_reason_in_finish(self, tmp_path):
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        client = MagicMock()
+        bus = Bus(tmp_path / "inbox")
+        t = Teammate(spec, client, bus, Profiler())
+
+        def run_inner_boom():
+            raise RuntimeError("boom")
+
+        t._run_inner = run_inner_boom
+        bus.send("lead", "alice", "Task")
+        t.start()
+        time.sleep(0.5)
+
+        assert t.status == "offline"
+        lead_msgs = bus.read_inbox("lead")
+        status_msgs = [m for m in lead_msgs if m.get("type") == "status"]
+        reasons = " ".join(m["content"] for m in status_msgs)
+        assert "crashed" in reasons
+
+
+class TestSpawnMaxTurns:
+    def test_spawn_with_max_turns_override(self, tmp_path):
+        builtin_dir = tmp_path / "builtin"
+        user_dir = tmp_path / "user"
+        _write_md(builtin_dir, "alice", SAMPLE_MD)
+        client = MagicMock()
+        mgr = TeamManager(builtin_dir, user_dir, client, Profiler())
+
+        client.messages.create.return_value = _make_response([_text_block("ok")])
+        result = mgr.spawn("alice", "task", max_turns=99)
+        assert "max 99 turns" in result
+        assert mgr._active["alice"]._max_turns == 99
+        mgr.deactivate_all()
+
+    def test_spawn_without_override_uses_spec(self, tmp_path):
+        builtin_dir = tmp_path / "builtin"
+        user_dir = tmp_path / "user"
+        _write_md(builtin_dir, "alice", SAMPLE_MD)
+        client = MagicMock()
+        mgr = TeamManager(builtin_dir, user_dir, client, Profiler())
+
+        client.messages.create.return_value = _make_response([_text_block("ok")])
+        result = mgr.spawn("alice", "task")
+        assert "max 5 turns" in result
+        assert mgr._active["alice"]._max_turns == 5
+        mgr.deactivate_all()

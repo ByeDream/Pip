@@ -18,6 +18,7 @@ from pip_agent.tools import WORKDIR, execute_tool
 if TYPE_CHECKING:
     import anthropic
     from pip_agent.skills import SkillRegistry
+    from pip_agent.task_graph import PlanManager
 
 VALID_MSG_TYPES = frozenset({
     "message",
@@ -26,6 +27,7 @@ VALID_MSG_TYPES = frozenset({
     "shutdown_response",
     "plan_request",
     "plan_response",
+    "status",
 })
 
 DEFAULT_TOOLS = [
@@ -75,6 +77,37 @@ READ_INBOX_SCHEMA = {
     "description": "Read and drain your inbox. Returns all pending messages.",
     "input_schema": {"type": "object", "properties": {}},
 }
+
+IDLE_SCHEMA = {
+    "name": "idle",
+    "description": (
+        "Signal that current work is complete. "
+        "Enter idle mode to await new tasks or messages."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+CLAIM_TASK_SCHEMA = {
+    "name": "claim_task",
+    "description": "Claim a task from the task board by story and task ID.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "story": {
+                "type": "string",
+                "description": "Story ID containing the task.",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Task ID to claim.",
+            },
+        },
+        "required": ["story", "task_id"],
+    },
+}
+
+IDLE_POLL_INTERVAL = 5
+IDLE_TIMEOUT = 60
 
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -262,10 +295,58 @@ def _format_team_message(msg: dict) -> str:
     return f"<team-message {attrs}>\n{content}\n</team-message>"
 
 
-class Teammate:
-    """Single-conversation agent on a daemon thread.
+def _dump_messages(agent_name: str, messages: list[dict]) -> None:
+    """Print messages structure with tool_use/tool_result pairing for diagnostics."""
+    print(f"  [{agent_name}] === MESSAGE DUMP ({len(messages)} msgs) ===")
+    pending_tool_ids: set[str] = set()
+    for i, msg in enumerate(messages):
+        role = msg["role"]
+        content = msg.get("content")
+        if isinstance(content, str):
+            print(f"  [{agent_name}]   [{i}] {role}: text({len(content)} chars)")
+            continue
+        if not isinstance(content, list):
+            print(f"  [{agent_name}]   [{i}] {role}: {type(content).__name__}")
+            continue
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                btype = block.get("type", "?")
+                if btype == "tool_use":
+                    bid = block.get("id", "?")
+                    parts.append(f"tool_use:{block.get('name','?')}({bid[-8:]})")
+                    pending_tool_ids.add(bid)
+                elif btype == "tool_result":
+                    bid = block.get("tool_use_id", "?")
+                    parts.append(f"tool_result({bid[-8:]})")
+                    pending_tool_ids.discard(bid)
+                elif btype == "text":
+                    parts.append(f"text({len(block.get('text',''))}ch)")
+                else:
+                    parts.append(btype)
+            elif hasattr(block, "type"):
+                if block.type == "tool_use":
+                    parts.append(f"tool_use:{block.name}({block.id[-8:]})")
+                    pending_tool_ids.add(block.id)
+                elif hasattr(block, "text"):
+                    parts.append(f"text({len(block.text)}ch)")
+                else:
+                    parts.append(block.type)
+        print(f"  [{agent_name}]   [{i}] {role}: [{', '.join(parts)}]")
+        if pending_tool_ids and role == "user":
+            print(f"  [{agent_name}]   ^^^ ORPHAN tool_use IDs still pending: "
+                  f"{[tid[-8:] for tid in pending_tool_ids]}")
+    if pending_tool_ids:
+        print(f"  [{agent_name}]   FINAL ORPHANS: {[tid[-8:] for tid in pending_tool_ids]}")
+    print(f"  [{agent_name}] === END DUMP ===")
 
-    Thread waits for inbox messages, runs one LLM conversation, then exits.
+
+class Teammate:
+    """Autonomous agent on a daemon thread.
+
+    Lifecycle: WAIT → WORK ⇄ IDLE → OFFLINE.
+    After finishing work the agent enters an idle cycle that polls for
+    inbox messages and scans the task board for unclaimed tasks.
     """
 
     LEAD = "lead"
@@ -281,6 +362,8 @@ class Teammate:
         skill_registry: SkillRegistry | None = None,
         active_names_fn: callable = lambda: [],
         done_fn: callable | None = None,
+        plan_manager: PlanManager | None = None,
+        max_turns_override: int | None = None,
     ) -> None:
         self.spec = spec
         self._client = client
@@ -290,9 +373,13 @@ class Teammate:
         self._skill_registry = skill_registry
         self._active_names_fn = active_names_fn
         self._done_fn = done_fn
+        self._plan_manager = plan_manager
+        self._max_turns = max_turns_override or spec.max_turns
         self._status = "working"
         self._shutdown = threading.Event()
         self._approved_shutdown = False
+        self._idle_requested = False
+        self._offline_reason = "unknown"
 
     @property
     def status(self) -> str:
@@ -307,43 +394,84 @@ class Teammate:
     def stop(self) -> None:
         self._shutdown.set()
 
-    # -- Single-shot entry point --------------------------------------------
+    # -- Work-idle lifecycle ------------------------------------------------
 
     def _run(self) -> None:
-        """Wait for inbox messages, process one conversation, then exit."""
+        """Wait for inbox, then loop: WORK -> IDLE -> WORK -> ... -> OFFLINE."""
+        try:
+            self._run_inner()
+        except Exception as exc:
+            self._offline_reason = f"crashed: {exc}"
+            if settings.verbose:
+                import traceback
+                print(f"  [{self.spec.name}] CRASHED: {exc}")
+                traceback.print_exc()
+            self._finish()
+
+    def _run_inner(self) -> None:
         while not self._shutdown.is_set():
             inbox = self._bus.read_inbox(self.spec.name)
             if inbox:
                 break
             self._shutdown.wait(timeout=2)
         else:
+            self._offline_reason = "shutdown before start"
             self._finish()
             return
 
-        self._process(inbox)
+        messages: list[dict] = []
+        self._work(messages, inbox)
+
+        while not self._shutdown.is_set() and not self._approved_shutdown:
+            self._status = "idle"
+            work = self._idle_cycle()
+            if work is None:
+                break
+            self._reinject_identity(messages)
+            self._status = "working"
+            self._work(messages, work)
+
+        if self._approved_shutdown:
+            self._offline_reason = "shutdown approved"
         self._finish()
 
     def _finish(self) -> None:
-        self._status = "done"
+        self._status = "offline"
+        if settings.verbose:
+            print(f"  [{self.spec.name}] going offline ({self._offline_reason})")
+        self._bus.send(
+            self.spec.name, self.LEAD,
+            f"Going offline. Reason: {self._offline_reason}",
+            "status",
+        )
         if self._done_fn:
             self._done_fn(self.spec.name)
 
-    # -- LLM loop -----------------------------------------------------------
+    # -- WORK phase ---------------------------------------------------------
 
-    def _process(self, inbox_messages: list[dict]) -> None:
-        """Run one LLM conversation for a batch of inbox messages."""
-        initial_text = "\n".join(
-            _format_team_message(m) for m in inbox_messages
-        )
-        messages: list[dict] = [
-            {"role": "user", "content": [{"type": "text", "text": initial_text}]},
-        ]
+    def _work(
+        self, messages: list[dict], inbox_messages: list[dict],
+    ) -> None:
+        """Run one LLM work cycle for a batch of inbox messages."""
+        text = "\n".join(_format_team_message(m) for m in inbox_messages)
+        new_content = [{"type": "text", "text": text}]
+
+        if messages and messages[-1]["role"] == "user":
+            last = messages[-1]
+            if isinstance(last["content"], list):
+                last["content"].extend(new_content)
+            else:
+                messages.append({"role": "user", "content": new_content})
+        else:
+            messages.append({"role": "user", "content": new_content})
+
         tools = self._build_tools()
         system = self._system_prompt()
+        self._idle_requested = False
 
-        for _ in range(self.spec.max_turns):
+        for _ in range(self._max_turns):
             self._inject_inbox(messages)
-            if self._approved_shutdown:
+            if self._approved_shutdown or self._idle_requested:
                 break
 
             self._profiler.start(f"api:teammate:{self.spec.name}")
@@ -355,7 +483,10 @@ class Teammate:
                     tools=tools,
                     messages=messages,
                 )
-            except Exception:
+            except Exception as exc:
+                if settings.verbose:
+                    print(f"  [{self.spec.name}] API error: {exc}")
+                    _dump_messages(self.spec.name, messages)
                 break
             usage = response.usage
             self._profiler.stop(
@@ -367,6 +498,10 @@ class Teammate:
             messages.append({"role": "assistant", "content": response.content})
 
             if response.stop_reason != "tool_use":
+                if settings.verbose:
+                    for block in response.content:
+                        if hasattr(block, "text"):
+                            print(f"  [{self.spec.name}] {block.text}")
                 break
 
             tool_results: list[dict] = []
@@ -377,7 +512,12 @@ class Teammate:
                     continue
                 if settings.verbose:
                     print(f"  [{self.spec.name}] > {block.name}")
-                result = self._exec_tool(block.name, block.input)
+                try:
+                    result = self._exec_tool(block.name, block.input)
+                except Exception as exc:
+                    result = f"[tool error] {exc}"
+                    if settings.verbose:
+                        print(f"  [{self.spec.name}] tool {block.name} crashed: {exc}")
                 if len(result) > MAX_TOOL_OUTPUT:
                     result = result[:MAX_TOOL_OUTPUT] + "\n\n[truncated]"
                 tool_results.append({
@@ -386,6 +526,81 @@ class Teammate:
                     "content": result,
                 })
             messages.append({"role": "user", "content": tool_results})
+
+            if self._idle_requested:
+                break
+        else:
+            self._offline_reason = "max_turns exhausted"
+            if settings.verbose:
+                print(f"  [{self.spec.name}] max_turns ({self._max_turns}) exhausted")
+            self._bus.send(
+                self.spec.name, self.LEAD,
+                f"I've used all {self._max_turns} turns and need more. "
+                f"Re-spawn me to continue.",
+                "status",
+            )
+
+    # -- IDLE phase ---------------------------------------------------------
+
+    def _idle_cycle(self) -> list[dict] | None:
+        """Poll inbox and task board. Returns work items or None on timeout."""
+        if settings.verbose:
+            print(f"  [{self.spec.name}] entering idle (timeout={IDLE_TIMEOUT}s)")
+        deadline = time.time() + IDLE_TIMEOUT
+        while time.time() < deadline and not self._shutdown.is_set():
+            inbox = self._bus.read_inbox(self.spec.name)
+            if inbox:
+                for msg in inbox:
+                    if msg.get("type") == "shutdown_request":
+                        return None
+                if settings.verbose:
+                    print(f"  [{self.spec.name}] idle: inbox received, resuming work")
+                return inbox
+
+            task_msgs = self._scan_and_claim()
+            if task_msgs is not None:
+                return task_msgs
+
+            self._shutdown.wait(timeout=IDLE_POLL_INTERVAL)
+        self._offline_reason = "idle timeout"
+        if settings.verbose:
+            print(f"  [{self.spec.name}] idle timeout, going offline")
+        return None
+
+    def _scan_and_claim(self) -> list[dict] | None:
+        """Scan the task board and claim the next ready, unowned task."""
+        if self._plan_manager is None:
+            return None
+        claimed = self._plan_manager.claim_next(self.spec.name)
+        if claimed is None:
+            return None
+        if settings.verbose:
+            print(f"  [{self.spec.name}] idle: claimed task "
+                  f"{claimed['id']} from board")
+        return [{
+            "type": "message",
+            "from": "task_board",
+            "content": (
+                f'<auto-claimed story="{claimed["story"]}"'
+                f' task="{claimed["id"]}">'
+                f'\n{claimed["title"]}\n</auto-claimed>'
+            ),
+        }]
+
+    def _reinject_identity(self, messages: list[dict]) -> None:
+        """Insert identity message-pair when context is thin."""
+        if len(messages) > 3:
+            return
+        identity = (
+            f"<identity>You are '{self.spec.name}'. "
+            f"{self.spec.system_body}</identity>"
+        )
+        messages.insert(
+            0, {"role": "user", "content": identity},
+        )
+        messages.insert(
+            1, {"role": "assistant", "content": f"I am {self.spec.name}. Continuing."},
+        )
 
     def _inject_inbox(self, messages: list[dict]) -> None:
         """Drain inbox and inject new messages into the last user turn."""
@@ -397,10 +612,32 @@ class Teammate:
         if last["role"] == "user" and isinstance(last["content"], list):
             for text in parts:
                 last["content"].append({"type": "text", "text": text})
+        elif settings.verbose:
+            print(
+                f"  [{self.spec.name}] inbox DROPPED {len(parts)} msg(s), "
+                f"last role={last['role']}, "
+                f"content type={type(last.get('content')).__name__}"
+            )
 
     # -- Tool dispatch ------------------------------------------------------
 
     def _exec_tool(self, name: str, tool_input: dict) -> str:
+        if name == "idle":
+            self._idle_requested = True
+            return "Entering idle mode."
+        if name == "claim_task" and self._plan_manager is not None:
+            self._profiler.start("tool:claim_task")
+            story = tool_input["story"]
+            task_id = tool_input["task_id"]
+            try:
+                result = self._plan_manager.update(
+                    story,
+                    [{"id": task_id, "status": "in_progress", "owner": self.spec.name}],
+                )
+            except ValueError as e:
+                result = f"[error] {e}"
+            self._profiler.stop()
+            return str(result)
         if name == "send":
             return self._handle_send(tool_input)
         if name == "read_inbox":
@@ -457,6 +694,9 @@ class Teammate:
         tools = [t for t in ALL_TOOLS if t["name"] in allowed]
         tools.append(SEND_SCHEMA)
         tools.append(READ_INBOX_SCHEMA)
+        tools.append(IDLE_SCHEMA)
+        if self._plan_manager is not None:
+            tools.append(CLAIM_TASK_SCHEMA)
         if self._skill_registry is not None and self._skill_registry.available:
             tools.append(self._skill_registry.tool_schema())
         return tools
@@ -490,10 +730,12 @@ class TeamManager:
         profiler: Profiler,
         *,
         skill_registry: SkillRegistry | None = None,
+        plan_manager: PlanManager | None = None,
     ) -> None:
         self._client = client
         self._profiler = profiler
         self._skill_registry = skill_registry
+        self._plan_manager = plan_manager
         self._roster: dict[str, TeammateSpec] = {}
         self._active: dict[str, Teammate] = {}
         self._bus = Bus(user_dir / "inbox")
@@ -520,7 +762,9 @@ class TeamManager:
     def _on_done(self, name: str) -> None:
         self._active.pop(name, None)
 
-    def _make_teammate(self, spec: TeammateSpec) -> Teammate:
+    def _make_teammate(
+        self, spec: TeammateSpec, *, max_turns_override: int | None = None,
+    ) -> Teammate:
         return Teammate(
             spec,
             self._client,
@@ -530,6 +774,8 @@ class TeamManager:
             skill_registry=self._skill_registry,
             active_names_fn=self._active_names,
             done_fn=self._on_done,
+            plan_manager=self._plan_manager,
+            max_turns_override=max_turns_override,
         )
 
     # -- Public API (called from agent_loop) --------------------------------
@@ -538,9 +784,12 @@ class TeamManager:
         self._scan_dir(self._builtin_dir)
         self._scan_dir(self._user_dir)
 
-    def spawn(self, name: str, prompt: str) -> str:
+    def spawn(
+        self, name: str, prompt: str, *, max_turns: int | None = None,
+    ) -> str:
         if name in self._active:
-            return f"[error] '{name}' is already working."
+            state = self._active[name].status
+            return f"[error] '{name}' is currently {state}."
         spec = self._roster.get(name)
         if spec is None:
             self._rescan()
@@ -548,11 +797,12 @@ class TeamManager:
         if spec is None:
             available = ", ".join(sorted(self._roster.keys())) or "(none)"
             return f"[error] Unknown teammate '{name}'. Available: {available}"
-        teammate = self._make_teammate(spec)
+        teammate = self._make_teammate(spec, max_turns_override=max_turns)
         teammate.start()
         self._active[name] = teammate
+        effective = teammate._max_turns
         self._bus.send(self.LEAD, name, prompt, "message")
-        return f"Spawned '{name}' ({spec.model}, max {spec.max_turns} turns)."
+        return f"Spawned '{name}' ({spec.model}, max {effective} turns)."
 
     def send(
         self, to: str, content: str, msg_type: str = "message", **extra,
@@ -588,7 +838,10 @@ class TeamManager:
         lines: list[str] = []
         for name in sorted(self._roster):
             spec = self._roster[name]
-            state = "working" if name in self._active else "available"
+            if name in self._active:
+                state = self._active[name].status
+            else:
+                state = "offline"
             lines.append(
                 f"  {name} [{state}] {spec.description} ({spec.model})"
             )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
@@ -643,3 +644,121 @@ class TestPersistence:
         assert data["title"] == "Test Story"
         assert data["blocked_by"] == []
         assert "status" not in data
+
+
+# ======================================================================
+# PlanManager.claim_next
+# ======================================================================
+
+class TestClaimNext:
+    def test_claims_first_ready_task(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        pm.create(None, [{"id": "s1", "title": "S1"}])
+        pm.create("s1", [
+            {"id": "t1", "title": "Task 1"},
+            {"id": "t2", "title": "Task 2"},
+        ])
+        result = pm.claim_next("alice")
+        assert result is not None
+        assert result["story"] == "s1"
+        assert result["id"] == "t1"
+        assert result["title"] == "Task 1"
+
+        task = pm._task_graph("s1").load_all()["t1"]
+        assert task.status == "in_progress"
+        assert task.owner == "alice"
+
+    def test_skips_blocked_task(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        pm.create(None, [{"id": "s1", "title": "S1"}])
+        pm.create("s1", [
+            {"id": "t1", "title": "Blocker"},
+            {"id": "t2", "title": "Blocked", "blocked_by": ["t1"]},
+        ])
+        result = pm.claim_next("alice")
+        assert result["id"] == "t1"
+
+        result2 = pm.claim_next("bob")
+        assert result2 is None
+
+    def test_skips_owned_task(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        pm.create(None, [{"id": "s1", "title": "S1"}])
+        pm.create("s1", [{"id": "t1", "title": "Task 1"}])
+        pm.claim_next("alice")
+
+        result = pm.claim_next("bob")
+        assert result is None
+
+    def test_skips_completed_task(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        pm.create(None, [{"id": "s1", "title": "S1"}])
+        pm.create("s1", [
+            {"id": "t1", "title": "Task 1"},
+            {"id": "t2", "title": "Task 2"},
+        ])
+        pm.update("s1", [{"id": "t1", "status": "in_progress"}])
+        pm.update("s1", [{"id": "t1", "status": "completed"}])
+
+        result = pm.claim_next("bob")
+        assert result is not None
+        assert result["id"] == "t2"
+
+    def test_skips_blocked_story(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        pm.create(None, [
+            {"id": "s1", "title": "S1"},
+            {"id": "s2", "title": "S2", "blocked_by": ["s1"]},
+        ])
+        pm.create("s1", [{"id": "t1", "title": "T1"}])
+        pm.create("s2", [{"id": "t2", "title": "T2"}])
+
+        result = pm.claim_next("alice")
+        assert result["story"] == "s1"
+
+    def test_returns_none_when_empty(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        assert pm.claim_next("alice") is None
+
+    def test_returns_none_when_all_claimed(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        pm.create(None, [{"id": "s1", "title": "S1"}])
+        pm.create("s1", [{"id": "t1", "title": "T1"}])
+        pm.claim_next("alice")
+        assert pm.claim_next("bob") is None
+
+    def test_concurrent_claims_no_duplicates(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        pm.create(None, [{"id": "s1", "title": "S1"}])
+        pm.create("s1", [
+            {"id": f"t{i}", "title": f"Task {i}"} for i in range(10)
+        ])
+
+        results: list[dict | None] = []
+        lock = threading.Lock()
+        errors: list[Exception] = []
+
+        def claimer(name: str) -> None:
+            try:
+                while True:
+                    r = pm.claim_next(name)
+                    if r is None:
+                        break
+                    with lock:
+                        results.append(r)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=claimer, args=(f"agent-{i}",))
+            for i in range(5)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+        claimed_ids = [r["id"] for r in results]
+        assert len(claimed_ids) == 10
+        assert len(set(claimed_ids)) == 10

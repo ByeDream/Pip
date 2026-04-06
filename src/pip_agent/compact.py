@@ -165,6 +165,10 @@ def micro_compact(messages: list[dict], *, max_age: int | None = None) -> int:
             block["content"] = f"[Previous: used {tool_name}]"
             replaced += 1
 
+    if replaced and settings.verbose:
+        print(f"  [micro_compact] replaced {replaced} old tool_result(s), "
+              f"kept last {max_age} rounds")
+
     return replaced
 
 
