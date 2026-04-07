@@ -384,7 +384,17 @@ class PlanManager:
     def __init__(self, root: Path) -> None:
         self._root = root
         self._root.mkdir(parents=True, exist_ok=True)
-        self._claim_lock = threading.Lock()
+        self._claim_lock = threading.RLock()
+        self._board_revision = 0
+
+    @property
+    def board_revision(self) -> int:
+        with self._claim_lock:
+            return self._board_revision
+
+    def _bump_board_revision(self) -> None:
+        with self._claim_lock:
+            self._board_revision += 1
 
     # ------------------------------------------------------------------
     # Story I/O
@@ -521,6 +531,7 @@ class PlanManager:
         for meta in new_metas:
             self._save_meta(meta)
 
+        self._bump_board_revision()
         names = ", ".join(f"'{m.id}'" for m in new_metas)
         notice = f"<notice>Story {names} created.</notice>\n"
         return notice + _items_json(new_metas)
@@ -533,6 +544,7 @@ class PlanManager:
         created_ids = {e["id"] for e in items}
         all_tasks = ng.load_all()
         created = [all_tasks[tid] for tid in created_ids if tid in all_tasks]
+        self._bump_board_revision()
         notice = f"<notice>Tasks added to story '{story_id}'.</notice>\n"
         return notice + _items_json(created)
 
@@ -588,6 +600,7 @@ class PlanManager:
         for meta in modified:
             self._save_meta(meta)
 
+        self._bump_board_revision()
         return _items_json(modified)
 
     def _update_tasks(self, story_id: str, items: list[dict]) -> str:
@@ -600,6 +613,7 @@ class PlanManager:
 
         pruned = self._prune_completed_stories()
 
+        self._bump_board_revision()
         notices: list[str] = []
         for sid in pruned:
             notices.append(f"<notice>Story '{sid}' completed and removed.</notice>")
@@ -635,6 +649,7 @@ class PlanManager:
         for sid in story_ids:
             shutil.rmtree(self._story_dir(sid))
 
+        self._bump_board_revision()
         return f"Removed: {', '.join(story_ids)}"
 
     def _remove_tasks(self, story_id: str, task_ids: list[str]) -> str:
@@ -642,6 +657,7 @@ class PlanManager:
             raise ValueError(f"Story '{story_id}' not found")
         ng = self._task_graph(story_id)
         ng.remove(task_ids)
+        self._bump_board_revision()
         return f"Removed from '{story_id}': {', '.join(task_ids)}"
 
     # ------------------------------------------------------------------
@@ -654,6 +670,40 @@ class PlanManager:
             for d in self._root.iterdir()
         ) if self._root.exists() else False
 
+    def _first_claimable_slot(self) -> tuple[str, Task] | None:
+        """First pending, unblocked, unowned task. Caller must hold ``_claim_lock``."""
+        if not self._root.exists():
+            return None
+        all_metas = self._load_all_metas()
+        if not all_metas:
+            return None
+
+        story_statuses: dict[str, TaskStatus] = {
+            sid: self._derive_status(sid) for sid in all_metas
+        }
+
+        for sid, meta in all_metas.items():
+            if story_statuses[sid] == "completed":
+                continue
+            if _is_blocked_by_status(meta.blocked_by, story_statuses):
+                continue
+
+            ng = self._task_graph(sid)
+            tasks = ng.load_all()
+            for t in tasks.values():
+                if (
+                    t.status == "pending"
+                    and not t.blocked_by
+                    and not t.owner
+                ):
+                    return (sid, t)
+        return None
+
+    def has_claimable_work(self) -> bool:
+        """True if some task matches ``claim_next`` eligibility (read-only)."""
+        with self._claim_lock:
+            return self._first_claimable_slot() is not None
+
     def claim_next(self, owner: str) -> dict | None:
         """Atomically find and claim the next ready, unowned task.
 
@@ -662,36 +712,41 @@ class PlanManager:
         Returns ``{"story": ..., "id": ..., "title": ...}`` or ``None``.
         """
         with self._claim_lock:
-            if not self._root.exists():
+            slot = self._first_claimable_slot()
+            if slot is None:
                 return None
-            all_metas = self._load_all_metas()
-            if not all_metas:
-                return None
+            sid, t = slot
+            t.status = "in_progress"
+            t.owner = owner
+            ng = self._task_graph(sid)
+            ng.save(t)
+            self._bump_board_revision()
+            return {"story": sid, "id": t.id, "title": t.title}
 
-            story_statuses: dict[str, TaskStatus] = {
-                sid: self._derive_status(sid) for sid in all_metas
-            }
-
-            for sid, meta in all_metas.items():
-                if story_statuses[sid] == "completed":
-                    continue
-                if _is_blocked_by_status(meta.blocked_by, story_statuses):
-                    continue
-
-                ng = self._task_graph(sid)
-                tasks = ng.load_all()
-                for t in tasks.values():
-                    if (
-                        t.status == "pending"
-                        and not t.blocked_by
-                        and not t.owner
-                    ):
-                        t.status = "in_progress"
-                        t.owner = owner
-                        ng.save(t)
-                        return {"story": sid, "id": t.id, "title": t.title}
-
-        return None
+    def format_task(self, story_id: str, task_id: str) -> str:
+        """Single-task summary for tooling. Returns ``[error] ...`` on failure."""
+        if not self._story_exists(story_id):
+            return f"[error] Story '{story_id}' not found"
+        if self._is_story_blocked(story_id):
+            return f"[error] Story '{story_id}' is blocked by dependencies"
+        ng = self._task_graph(story_id)
+        tasks = ng.load_all()
+        if task_id not in tasks:
+            return f"[error] Task '{task_id}' not found in story '{story_id}'"
+        t = tasks[task_id]
+        lines = [
+            f"Task: {t.title}",
+            f"  id: {t.id}",
+            f"  status: {t.status}",
+            f"  owner: {t.owner or '(none)'}",
+        ]
+        if t.blocked_by:
+            lines.append(f"  blocked_by: {', '.join(t.blocked_by)}")
+        if t.created_at:
+            lines.append(f"  created_at: {t.created_at}")
+        if t.updated_at:
+            lines.append(f"  updated_at: {t.updated_at}")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Render

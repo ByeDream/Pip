@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from pip_agent.profiler import Profiler
 from pip_agent.subagent import SUBAGENT_TOOLS, run_subagent
+from pip_agent.tool_dispatch import DispatchResult
 
 
 def _text_block(text: str) -> SimpleNamespace:
@@ -75,7 +76,10 @@ class TestRunSubagent:
         client.messages.create.side_effect = [tool_response, final_response]
         profiler = Profiler()
 
-        with patch("pip_agent.subagent.execute_tool", return_value="a.py\nb.py\nc.py"):
+        with patch(
+            "pip_agent.subagent.dispatch_tool",
+            return_value=DispatchResult(content="a.py\nb.py\nc.py"),
+        ):
             result = run_subagent(client, "List python files", profiler)
 
         assert result == "found 3 files"
@@ -94,7 +98,10 @@ class TestRunSubagent:
         client.messages.create.return_value = tool_response
         profiler = Profiler()
 
-        with patch("pip_agent.subagent.execute_tool", return_value="hi"):
+        with patch(
+            "pip_agent.subagent.dispatch_tool",
+            return_value=DispatchResult(content="hi"),
+        ):
             result = run_subagent(client, "Run forever", profiler)
 
         assert client.messages.create.call_count == 2
@@ -112,7 +119,10 @@ class TestRunSubagent:
             mock_settings.max_tokens = 1024
             mock_settings.subagent_max_rounds = 1
             mock_settings.verbose = False
-            with patch("pip_agent.subagent.execute_tool", return_value="x"):
+            with patch(
+                "pip_agent.subagent.dispatch_tool",
+                return_value=DispatchResult(content="x"),
+            ):
                 result = run_subagent(client, "Do something", profiler)
 
         assert result == "(sub-agent returned no text)"

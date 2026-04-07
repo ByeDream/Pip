@@ -1,0 +1,268 @@
+from __future__ import annotations
+
+import json
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from pip_agent.tools import (
+    run_bash,
+    run_edit,
+    run_glob,
+    run_read,
+    run_web_fetch,
+    run_web_search,
+    run_write,
+)
+
+if TYPE_CHECKING:
+    import anthropic
+
+    from pip_agent.background import BackgroundTaskManager
+    from pip_agent.profiler import Profiler
+    from pip_agent.skills import SkillRegistry
+    from pip_agent.task_graph import PlanManager
+    from pip_agent.team import TeamManager
+
+
+@dataclass
+class DispatchResult:
+    content: str
+    used_task_tool: bool = False
+    compact_requested: bool = False
+    request_idle: bool = False
+
+
+@dataclass
+class TeammateToolSurface:
+    """Bound callables for teammate-only tools (avoids importing team from here)."""
+
+    send: Callable[[dict], str]
+    read_inbox: Callable[[], str]
+    request_idle: Callable[[], None]
+    claim_task: Callable[[dict], str]
+
+
+@dataclass
+class ToolContext:
+    profiler: Profiler | None = None
+    plan_manager: PlanManager | None = None
+    client: anthropic.Anthropic | None = None
+    skill_registry: SkillRegistry | None = None
+    bg_manager: BackgroundTaskManager | None = None
+    team_manager: TeamManager | None = None
+    teammate: TeammateToolSurface | None = None
+
+
+def _handle_plan_tool(name: str, inputs: dict, pm: PlanManager) -> str:
+    story = inputs.get("story")
+    if name == "task_create":
+        return pm.create(story, inputs.get("tasks", []))
+    if name == "task_update":
+        return pm.update(story, inputs.get("tasks", []))
+    if name == "task_list":
+        return pm.render(story)
+    if name == "task_remove":
+        return pm.remove(story, inputs.get("task_ids", []))
+    return f"Unknown task tool: {name}"
+
+
+def _wrap_simple(run: Callable[[dict], str], inp: dict) -> str:
+    try:
+        return run(inp)
+    except ValueError as e:
+        return f"[blocked] {e}"
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def _handle_compact(_ctx: ToolContext, _inp: dict) -> DispatchResult:
+    return DispatchResult(
+        content="Acknowledged. Context will be compacted.",
+        compact_requested=True,
+    )
+
+
+def _make_task_handler(tool_name: str) -> Callable[[ToolContext, dict], DispatchResult]:
+    def _handler(ctx: ToolContext, inp: dict) -> DispatchResult:
+        if ctx.plan_manager is None:
+            return DispatchResult(content=f"Unknown tool: {tool_name}")
+        try:
+            text = _handle_plan_tool(tool_name, inp, ctx.plan_manager)
+        except ValueError as e:
+            return DispatchResult(
+                content=f"[error] {e}",
+                used_task_tool=True,
+            )
+        return DispatchResult(content=text, used_task_tool=True)
+
+    return _handler
+
+
+def _handle_load_skill(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.skill_registry is None:
+        return DispatchResult(content="Unknown tool: load_skill")
+    return DispatchResult(content=ctx.skill_registry.load(inp["name"]))
+
+
+def _handle_task(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.client is None:
+        return DispatchResult(content="Unknown tool: task")
+    from pip_agent.subagent import run_subagent
+
+    if ctx.profiler is None:
+        return DispatchResult(content="[error] task tool requires profiler context")
+    text = run_subagent(
+        ctx.client,
+        inp["prompt"],
+        ctx.profiler,
+        skill_registry=ctx.skill_registry,
+    )
+    return DispatchResult(content=text)
+
+
+def _handle_bash(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if inp.get("background") and ctx.bg_manager is not None:
+        task_id = uuid.uuid4().hex[:8]
+        ctx.bg_manager.spawn(task_id, inp["command"], run_bash, inp)
+        return DispatchResult(content=f"[background:{task_id}] started")
+    return DispatchResult(content=_wrap_simple(run_bash, inp))
+
+
+def _handle_check_background(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.bg_manager is None:
+        return DispatchResult(content="Unknown tool: check_background")
+    return DispatchResult(content=ctx.bg_manager.check(inp.get("task_id")))
+
+
+def _handle_team_spawn(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.team_manager is None:
+        return DispatchResult(content="Unknown tool: team_spawn")
+    text = ctx.team_manager.spawn(
+        inp["name"],
+        inp["prompt"],
+        max_turns=inp.get("max_turns"),
+    )
+    return DispatchResult(content=text)
+
+
+def _handle_team_send(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.team_manager is None:
+        return DispatchResult(content="Unknown tool: team_send")
+    extra: dict = {}
+    for key in ("req_id", "approve"):
+        if key in inp:
+            extra[key] = inp[key]
+    text = ctx.team_manager.send(
+        inp["to"],
+        inp["content"],
+        inp.get("msg_type", "message"),
+        **extra,
+    )
+    return DispatchResult(content=text)
+
+
+def _handle_team_read_inbox(ctx: ToolContext, _inp: dict) -> DispatchResult:
+    if ctx.team_manager is None:
+        return DispatchResult(content="Unknown tool: team_read_inbox")
+    inbox = ctx.team_manager.read_inbox()
+    text = json.dumps(inbox, indent=2) if inbox else "(no messages)"
+    return DispatchResult(content=text)
+
+
+def _handle_team_status(ctx: ToolContext, _inp: dict) -> DispatchResult:
+    if ctx.team_manager is None:
+        return DispatchResult(content="Unknown tool: team_status")
+    return DispatchResult(content=ctx.team_manager.status())
+
+
+def _handle_send(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.teammate is None:
+        return DispatchResult(content="Unknown tool: send")
+    return DispatchResult(content=ctx.teammate.send(inp))
+
+
+def _handle_read_inbox(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.teammate is None:
+        return DispatchResult(content="Unknown tool: read_inbox")
+    return DispatchResult(content=ctx.teammate.read_inbox())
+
+
+def _handle_idle(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.teammate is None:
+        return DispatchResult(content="Unknown tool: idle")
+    ctx.teammate.request_idle()
+    return DispatchResult(
+        content="Entering idle mode.",
+        request_idle=True,
+    )
+
+
+def _handle_claim_task(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.teammate is None:
+        return DispatchResult(content="Unknown tool: claim_task")
+    return DispatchResult(content=ctx.teammate.claim_task(inp))
+
+
+def _handle_task_board_overview(ctx: ToolContext, _inp: dict) -> DispatchResult:
+    if ctx.plan_manager is None:
+        return DispatchResult(content="Unknown tool: task_board_overview")
+    return DispatchResult(content=ctx.plan_manager.render(None))
+
+
+def _handle_task_board_detail(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.plan_manager is None:
+        return DispatchResult(content="Unknown tool: task_board_detail")
+    text = ctx.plan_manager.format_task(inp["story"], inp["task_id"])
+    return DispatchResult(content=text)
+
+
+_TOOL_REGISTRY: dict[str, Callable[[ToolContext, dict], DispatchResult]] = {
+    "compact": _handle_compact,
+    "task_create": _make_task_handler("task_create"),
+    "task_update": _make_task_handler("task_update"),
+    "task_list": _make_task_handler("task_list"),
+    "task_remove": _make_task_handler("task_remove"),
+    "load_skill": _handle_load_skill,
+    "task": _handle_task,
+    "bash": _handle_bash,
+    "check_background": _handle_check_background,
+    "team_spawn": _handle_team_spawn,
+    "team_send": _handle_team_send,
+    "team_status": _handle_team_status,
+    "team_read_inbox": _handle_team_read_inbox,
+    "send": _handle_send,
+    "read_inbox": _handle_read_inbox,
+    "idle": _handle_idle,
+    "claim_task": _handle_claim_task,
+    "task_board_overview": _handle_task_board_overview,
+    "task_board_detail": _handle_task_board_detail,
+    "read": lambda ctx, inp: DispatchResult(content=_wrap_simple(run_read, inp)),
+    "write": lambda ctx, inp: DispatchResult(content=_wrap_simple(run_write, inp)),
+    "edit": lambda ctx, inp: DispatchResult(content=_wrap_simple(run_edit, inp)),
+    "glob": lambda ctx, inp: DispatchResult(content=_wrap_simple(run_glob, inp)),
+    "web_search": lambda ctx, inp: DispatchResult(
+        content=_wrap_simple(run_web_search, inp),
+    ),
+    "web_fetch": lambda ctx, inp: DispatchResult(
+        content=_wrap_simple(run_web_fetch, inp),
+    ),
+}
+
+
+def dispatch_tool(ctx: ToolContext, name: str, tool_input: dict) -> DispatchResult:
+    handler = _TOOL_REGISTRY.get(name)
+    if handler is None:
+        return DispatchResult(content=f"Unknown tool: {name}")
+
+    profile = name != "compact" and ctx.profiler is not None
+    if profile:
+        ctx.profiler.start(f"tool:{name}")
+    try:
+        return handler(ctx, tool_input)
+    finally:
+        if profile:
+            ctx.profiler.stop()
+
+

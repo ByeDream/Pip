@@ -4,7 +4,6 @@ import json
 import os
 import sys
 import time
-import uuid
 from pathlib import Path
 
 import anthropic
@@ -20,15 +19,13 @@ from pip_agent.config import settings
 from pip_agent.profiler import Profiler
 from pip_agent.skills import SkillRegistry
 from pip_agent.task_graph import PlanManager
-from pip_agent.subagent import run_subagent
 from pip_agent.team import TeamManager
+from pip_agent.tool_dispatch import ToolContext, dispatch_tool
 from pip_agent.tools import (
     ALL_TOOLS,
     TASK_TOOL_NAMES,
     TEAM_TOOL_NAMES,
     WORKDIR,
-    execute_tool,
-    run_bash,
 )
 
 BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
@@ -86,19 +83,6 @@ def _tool_summary(name: str, inputs: dict) -> str:
             value = value[:77] + "..."
         return f"{name}: {value}"
     return name
-
-
-def _handle_task_tool(name: str, inputs: dict, pm: PlanManager) -> str:
-    story = inputs.get("story")
-    if name == "task_create":
-        return pm.create(story, inputs.get("tasks", []))
-    if name == "task_update":
-        return pm.update(story, inputs.get("tasks", []))
-    if name == "task_list":
-        return pm.render(story)
-    if name == "task_remove":
-        return pm.remove(story, inputs.get("task_ids", []))
-    return f"Unknown task tool: {name}"
 
 
 def agent_loop(
@@ -195,6 +179,14 @@ def agent_loop(
             tool_results = []
             used_task_tool = False
             compact_requested = False
+            tool_ctx = ToolContext(
+                profiler=profiler,
+                plan_manager=plan_manager,
+                client=client,
+                skill_registry=skill_registry,
+                bg_manager=bg_manager,
+                team_manager=team_manager,
+            )
             for block in assistant_content:
                 if settings.verbose and hasattr(block, "text"):
                     print()
@@ -203,79 +195,14 @@ def agent_loop(
                     if settings.verbose:
                         print()
                         print(f"> {_tool_summary(block.name, block.input)}")
-                    if block.name == "compact":
-                        result = "Acknowledged. Context will be compacted."
-                        compact_requested = True
-                    elif block.name in TASK_TOOL_NAMES:
-                        profiler.start(f"tool:{block.name}")
-                        try:
-                            result = _handle_task_tool(
-                                block.name, block.input, plan_manager
-                            )
-                        except ValueError as e:
-                            result = f"[error] {e}"
-                        profiler.stop()
-                        if settings.verbose:
-                            print(result)
-                        used_task_tool = True
-                    elif block.name == "load_skill" and skill_registry is not None:
-                        profiler.start("tool:load_skill")
-                        result = skill_registry.load(block.input["name"])
-                        profiler.stop()
-                    elif block.name == "task":
-                        profiler.start("tool:task")
-                        result = run_subagent(
-                            client,
-                            block.input["prompt"],
-                            profiler,
-                            skill_registry=skill_registry,
-                        )
-                        profiler.stop()
-                    elif (
-                        block.name == "bash"
-                        and block.input.get("background")
-                        and bg_manager is not None
+                    outcome = dispatch_tool(tool_ctx, block.name, block.input)
+                    result = outcome.content
+                    used_task_tool |= outcome.used_task_tool
+                    compact_requested |= outcome.compact_requested
+                    if settings.verbose and block.name in (
+                        TASK_TOOL_NAMES | TEAM_TOOL_NAMES
                     ):
-                        task_id = uuid.uuid4().hex[:8]
-                        bg_manager.spawn(
-                            task_id, block.input["command"], run_bash, block.input
-                        )
-                        result = f"[background:{task_id}] started"
-                    elif block.name == "check_background" and bg_manager is not None:
-                        profiler.start("tool:check_background")
-                        result = bg_manager.check(block.input.get("task_id"))
-                        profiler.stop()
-                    elif block.name in TEAM_TOOL_NAMES and team_manager is not None:
-                        profiler.start(f"tool:{block.name}")
-                        if block.name == "team_spawn":
-                            result = team_manager.spawn(
-                                block.input["name"],
-                                block.input["prompt"],
-                                max_turns=block.input.get("max_turns"),
-                            )
-                        elif block.name == "team_send":
-                            extra = {}
-                            for key in ("req_id", "approve"):
-                                if key in block.input:
-                                    extra[key] = block.input[key]
-                            result = team_manager.send(
-                                block.input["to"],
-                                block.input["content"],
-                                block.input.get("msg_type", "message"),
-                                **extra,
-                            )
-                        elif block.name == "team_read_inbox":
-                            inbox = team_manager.read_inbox()
-                            result = json.dumps(inbox, indent=2) if inbox else "(no messages)"
-                        else:
-                            result = team_manager.status()
-                        profiler.stop()
-                        if settings.verbose:
-                            print(result)
-                    else:
-                        profiler.start(f"tool:{block.name}")
-                        result = execute_tool(block.name, block.input)
-                        profiler.stop()
+                        print(result)
                     tool_results.append(
                         {
                             "type": "tool_result",

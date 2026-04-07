@@ -7,16 +7,11 @@ import anthropic
 from pip_agent.compact import micro_compact
 from pip_agent.config import settings
 from pip_agent.profiler import Profiler
-from pip_agent.tools import (
-    ALL_TOOLS,
-    WORKDIR,
-    execute_tool,
-)
+from pip_agent.tool_dispatch import ToolContext, dispatch_tool
+from pip_agent.tools import ALL_TOOLS, TASK_TOOL_NAMES, TEAM_TOOL_NAMES, WORKDIR
 
 if TYPE_CHECKING:
     from pip_agent.skills import SkillRegistry
-
-from pip_agent.tools import TASK_TOOL_NAMES, TEAM_TOOL_NAMES
 
 SUBAGENT_TOOLS = [
     t for t in ALL_TOOLS
@@ -96,20 +91,14 @@ def run_subagent(
             break
 
         tool_results: list[dict] = []
+        sub_ctx = ToolContext(profiler=profiler, skill_registry=skill_registry)
         for block in assistant_content:
             if settings.verbose and hasattr(block, "text"):
                 print(f"  [sub] {block.text}")
             if block.type == "tool_use":
                 if settings.verbose:
                     print(f"  [sub] > {_tool_summary(block.name, block.input)}")
-                if block.name == "load_skill" and skill_registry is not None:
-                    profiler.start("tool:load_skill")
-                    result = skill_registry.load(block.input["name"])
-                    profiler.stop()
-                else:
-                    profiler.start(f"tool:{block.name}")
-                    result = execute_tool(block.name, block.input)
-                    profiler.stop()
+                result = dispatch_tool(sub_ctx, block.name, block.input).content
                 if len(result) > MAX_TOOL_OUTPUT:
                     result = result[:MAX_TOOL_OUTPUT] + "\n\n[truncated]"
                 tool_results.append(

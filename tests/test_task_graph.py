@@ -762,3 +762,83 @@ class TestClaimNext:
         claimed_ids = [r["id"] for r in results]
         assert len(claimed_ids) == 10
         assert len(set(claimed_ids)) == 10
+
+
+# ======================================================================
+# PlanManager.board_revision, has_claimable_work, format_task
+# ======================================================================
+
+
+class TestBoardRevision:
+    def test_starts_at_zero(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        assert pm.board_revision == 0
+
+    def test_bumps_on_create_story_tasks_and_claim(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        pm.create(None, [{"id": "s1", "title": "S1"}])
+        assert pm.board_revision == 1
+        pm.create("s1", [{"id": "t1", "title": "T1"}])
+        assert pm.board_revision == 2
+        pm.claim_next("alice")
+        assert pm.board_revision == 3
+
+
+class TestHasClaimableWork:
+    def test_true_when_unclaimed_ready_exists(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        pm.create(None, [{"id": "s1", "title": "S1"}])
+        pm.create("s1", [{"id": "t1", "title": "T1"}])
+        assert pm.has_claimable_work() is True
+
+    def test_false_when_none_ready(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        assert pm.has_claimable_work() is False
+
+    def test_false_after_claim_next_claims_all(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        pm.create(None, [{"id": "s1", "title": "S1"}])
+        pm.create("s1", [{"id": "t1", "title": "T1"}])
+        pm.claim_next("alice")
+        assert pm.has_claimable_work() is False
+
+    def test_matches_claim_next_skips_blocked(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        pm.create(None, [{"id": "s1", "title": "S1"}])
+        pm.create("s1", [
+            {"id": "t1", "title": "Blocker"},
+            {"id": "t2", "title": "Blocked", "blocked_by": ["t1"]},
+        ])
+        assert pm.has_claimable_work() is True
+        pm.claim_next("alice")
+        assert pm.has_claimable_work() is False
+
+
+class TestFormatTask:
+    def test_renders_task(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        pm.create(None, [{"id": "s1", "title": "S1"}])
+        pm.create("s1", [{"id": "t1", "title": "Hello"}])
+        text = pm.format_task("s1", "t1")
+        assert "Hello" in text
+        assert "t1" in text
+        assert "pending" in text
+
+    def test_unknown_story(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        assert pm.format_task("nope", "t1").startswith("[error]")
+
+    def test_unknown_task(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        pm.create(None, [{"id": "s1", "title": "S1"}])
+        pm.create("s1", [{"id": "t1", "title": "T1"}])
+        assert pm.format_task("s1", "missing").startswith("[error]")
+
+    def test_blocked_story(self, tmp_path):
+        pm = PlanManager(tmp_path)
+        pm.create(None, [
+            {"id": "s1", "title": "S1"},
+            {"id": "s2", "title": "S2", "blocked_by": ["s1"]},
+        ])
+        pm.create("s2", [{"id": "t1", "title": "T1"}])
+        assert pm.format_task("s2", "t1").startswith("[error]")

@@ -13,7 +13,8 @@ import yaml
 
 from pip_agent.config import settings
 from pip_agent.profiler import Profiler
-from pip_agent.tools import WORKDIR, execute_tool
+from pip_agent.tool_dispatch import TeammateToolSurface, ToolContext, dispatch_tool
+from pip_agent.tools import WORKDIR
 
 if TYPE_CHECKING:
     import anthropic
@@ -89,7 +90,10 @@ IDLE_SCHEMA = {
 
 CLAIM_TASK_SCHEMA = {
     "name": "claim_task",
-    "description": "Claim a task from the task board by story and task ID.",
+    "description": (
+        "Claim a task by story and task ID (sets in_progress and owner to you). "
+        "Use task_board_overview and task_board_detail to inspect the board first."
+    ),
     "input_schema": {
         "type": "object",
         "properties": {
@@ -105,6 +109,37 @@ CLAIM_TASK_SCHEMA = {
         "required": ["story", "task_id"],
     },
 }
+
+TASK_BOARD_OVERVIEW_SCHEMA = {
+    "name": "task_board_overview",
+    "description": (
+        "Show all stories and ready tasks on the task board (read-only summary)."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+TASK_BOARD_DETAIL_SCHEMA = {
+    "name": "task_board_detail",
+    "description": "Show one task's details (read-only) within a story.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "story": {
+                "type": "string",
+                "description": "Story ID containing the task.",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Task ID to inspect.",
+            },
+        },
+        "required": ["story", "task_id"],
+    },
+}
+
+TASK_BOARD_HINT = (
+    "<task-board-hint>Review the task board.</task-board-hint>"
+)
 
 IDLE_POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
@@ -345,8 +380,9 @@ class Teammate:
     """Autonomous agent on a daemon thread.
 
     Lifecycle: WAIT → WORK ⇄ IDLE → OFFLINE.
-    After finishing work the agent enters an idle cycle that polls for
-    inbox messages and scans the task board for unclaimed tasks.
+    Idle polls the inbox; when the task board has claimable work and the
+    board revision is new since the last overview/detail/claim, a short
+    hint message is injected (no automatic claim).
     """
 
     LEAD = "lead"
@@ -380,6 +416,7 @@ class Teammate:
         self._approved_shutdown = False
         self._idle_requested = False
         self._offline_reason = "unknown"
+        self._board_revision_seen: int | None = None
 
     @property
     def status(self) -> str:
@@ -543,7 +580,7 @@ class Teammate:
     # -- IDLE phase ---------------------------------------------------------
 
     def _idle_cycle(self) -> list[dict] | None:
-        """Poll inbox and task board. Returns work items or None on timeout."""
+        """Poll inbox; optional task-board hint if claimable work and dirty revision."""
         if settings.verbose:
             print(f"  [{self.spec.name}] entering idle (timeout={IDLE_TIMEOUT}s)")
         deadline = time.time() + IDLE_TIMEOUT
@@ -557,9 +594,14 @@ class Teammate:
                     print(f"  [{self.spec.name}] idle: inbox received, resuming work")
                 return inbox
 
-            task_msgs = self._scan_and_claim()
-            if task_msgs is not None:
-                return task_msgs
+            hint = self._maybe_task_board_hint()
+            if hint is not None:
+                if settings.verbose:
+                    print(
+                        f"  [{self.spec.name}] idle: task board hint "
+                        f"(claimable + dirty revision)"
+                    )
+                return hint
 
             self._shutdown.wait(timeout=IDLE_POLL_INTERVAL)
         self._offline_reason = "idle timeout"
@@ -567,24 +609,25 @@ class Teammate:
             print(f"  [{self.spec.name}] idle timeout, going offline")
         return None
 
-    def _scan_and_claim(self) -> list[dict] | None:
-        """Scan the task board and claim the next ready, unowned task."""
+    def _task_board_dirty(self) -> bool:
+        if self._plan_manager is None:
+            return False
+        rev = self._plan_manager.board_revision
+        seen = self._board_revision_seen
+        return seen is None or seen != rev
+
+    def _maybe_task_board_hint(self) -> list[dict] | None:
+        """If claimable work exists and board is dirty, inject a hint (no claim)."""
         if self._plan_manager is None:
             return None
-        claimed = self._plan_manager.claim_next(self.spec.name)
-        if claimed is None:
+        if not self._task_board_dirty():
             return None
-        if settings.verbose:
-            print(f"  [{self.spec.name}] idle: claimed task "
-                  f"{claimed['id']} from board")
+        if not self._plan_manager.has_claimable_work():
+            return None
         return [{
             "type": "message",
             "from": "task_board",
-            "content": (
-                f'<auto-claimed story="{claimed["story"]}"'
-                f' task="{claimed["id"]}">'
-                f'\n{claimed["title"]}\n</auto-claimed>'
-            ),
+            "content": TASK_BOARD_HINT,
         }]
 
     def _reinject_identity(self, messages: list[dict]) -> None:
@@ -621,39 +664,62 @@ class Teammate:
 
     # -- Tool dispatch ------------------------------------------------------
 
+    def _teammate_tool_surface(self) -> TeammateToolSurface:
+        return TeammateToolSurface(
+            send=self._handle_send,
+            read_inbox=self._surface_read_inbox,
+            request_idle=self._surface_request_idle,
+            claim_task=self._surface_claim_task,
+        )
+
+    def _surface_read_inbox(self) -> str:
+        msgs = self._bus.read_inbox(self.spec.name)
+        if not msgs:
+            return "(no messages)"
+        return json.dumps(msgs, indent=2)
+
+    def _surface_request_idle(self) -> None:
+        self._idle_requested = True
+
+    def _surface_claim_task(self, tool_input: dict) -> str:
+        if self._plan_manager is None:
+            return "Unknown tool: claim_task"
+        story = tool_input["story"]
+        task_id = tool_input["task_id"]
+        try:
+            result = self._plan_manager.update(
+                story,
+                [{"id": task_id, "status": "in_progress", "owner": self.spec.name}],
+            )
+        except ValueError as e:
+            return f"[error] {e}"
+        return str(result)
+
     def _exec_tool(self, name: str, tool_input: dict) -> str:
-        if name == "idle":
-            self._idle_requested = True
-            return "Entering idle mode."
-        if name == "claim_task" and self._plan_manager is not None:
-            self._profiler.start("tool:claim_task")
-            story = tool_input["story"]
-            task_id = tool_input["task_id"]
-            try:
-                result = self._plan_manager.update(
-                    story,
-                    [{"id": task_id, "status": "in_progress", "owner": self.spec.name}],
-                )
-            except ValueError as e:
-                result = f"[error] {e}"
-            self._profiler.stop()
-            return str(result)
-        if name == "send":
-            return self._handle_send(tool_input)
-        if name == "read_inbox":
-            msgs = self._bus.read_inbox(self.spec.name)
-            if not msgs:
-                return "(no messages)"
-            return json.dumps(msgs, indent=2)
-        if name == "load_skill" and self._skill_registry is not None:
-            self._profiler.start("tool:load_skill")
-            result = self._skill_registry.load(tool_input["name"])
-            self._profiler.stop()
-            return result
-        self._profiler.start(f"tool:{name}")
-        result = execute_tool(name, tool_input)
-        self._profiler.stop()
+        ctx = ToolContext(
+            profiler=self._profiler,
+            plan_manager=self._plan_manager,
+            skill_registry=self._skill_registry,
+            teammate=self._teammate_tool_surface(),
+        )
+        result = dispatch_tool(ctx, name, tool_input).content
+        self._maybe_mark_board_seen(name, result)
         return result
+
+    def _maybe_mark_board_seen(self, tool_name: str, result: str) -> None:
+        if self._plan_manager is None:
+            return
+        if tool_name not in (
+            "task_board_overview",
+            "task_board_detail",
+            "claim_task",
+        ):
+            return
+        if "Unknown tool:" in result:
+            return
+        if result.startswith("[error]") or result.startswith("[blocked]"):
+            return
+        self._board_revision_seen = self._plan_manager.board_revision
 
     def _handle_send(self, tool_input: dict) -> str:
         to = tool_input["to"]
@@ -696,6 +762,8 @@ class Teammate:
         tools.append(READ_INBOX_SCHEMA)
         tools.append(IDLE_SCHEMA)
         if self._plan_manager is not None:
+            tools.append(TASK_BOARD_OVERVIEW_SCHEMA)
+            tools.append(TASK_BOARD_DETAIL_SCHEMA)
             tools.append(CLAIM_TASK_SCHEMA)
         if self._skill_registry is not None and self._skill_registry.available:
             tools.append(self._skill_registry.tool_schema())
@@ -707,6 +775,12 @@ class Teammate:
             f"Working directory: {WORKDIR}\n"
             f"Use the 'send' tool to communicate with teammates or 'lead'.\n"
         )
+        if self._plan_manager is not None:
+            base += (
+                "Task board tools: task_board_overview, task_board_detail, "
+                "claim_task. Idle may deliver a task_board hint when new work "
+                "is available.\n"
+            )
         if self.spec.system_body:
             return base + "\n" + self.spec.system_body
         return base

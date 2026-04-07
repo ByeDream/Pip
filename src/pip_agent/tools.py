@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 import subprocess
-from collections.abc import Callable
 from pathlib import Path
 
 from pip_agent.config import settings
@@ -602,18 +601,8 @@ def run_web_fetch(tool_input: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Dispatch map and public API
+# Public API
 # ---------------------------------------------------------------------------
-
-TOOL_DISPATCH: dict[str, Callable[[dict], str]] = {
-    "bash": run_bash,
-    "read": run_read,
-    "write": run_write,
-    "edit": run_edit,
-    "glob": run_glob,
-    "web_search": run_web_search,
-    "web_fetch": run_web_fetch,
-}
 
 ALL_TOOLS = [
     BASH_SCHEMA,
@@ -637,12 +626,8 @@ ALL_TOOLS = [
 
 
 def execute_tool(name: str, tool_input: dict) -> str:
-    handler = TOOL_DISPATCH.get(name)
-    if handler is None:
-        return f"Unknown tool: {name}"
-    try:
-        return handler(tool_input)
-    except ValueError as e:
-        return f"[blocked] {e}"
-    except Exception as e:
-        return f"[error] {e}"
+    """Run filesystem / shell / web tools without lead-only dependencies."""
+    from pip_agent.tool_dispatch import ToolContext, dispatch_tool
+
+    ctx = ToolContext()
+    return dispatch_tool(ctx, name, tool_input).content

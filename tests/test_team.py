@@ -18,6 +18,7 @@ from pip_agent.team import (
     VALID_MSG_TYPES,
     _parse_frontmatter,
 )
+from pip_agent.tool_dispatch import DispatchResult
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +543,10 @@ class TestTeammateLLMLoop:
             stop_reason="tool_use",
         )
 
-        with patch("pip_agent.team.execute_tool", return_value="content"):
+        with patch(
+            "pip_agent.team.dispatch_tool",
+            return_value=DispatchResult(content="content"),
+        ):
             t._work([], [{"from": "lead", "type": "message", "content": "go"}])
 
         assert client.messages.create.call_count == 2
@@ -1073,17 +1077,19 @@ class TestClaimTaskTool:
         )
         names = {tool["name"] for tool in t_with._build_tools()}
         assert "claim_task" in names
+        assert "task_board_overview" in names
+        assert "task_board_detail" in names
 
 
 # ---------------------------------------------------------------------------
-# Autonomous task claiming in idle
+# Idle task board hint (no auto-claim)
 # ---------------------------------------------------------------------------
 
 
 class TestAutonomousClaim:
     @patch("pip_agent.team.IDLE_POLL_INTERVAL", 0.05)
     @patch("pip_agent.team.IDLE_TIMEOUT", 2)
-    def test_idle_claims_task_from_board(self, tmp_path):
+    def test_idle_injects_hint_without_claiming(self, tmp_path):
         from pip_agent.task_graph import PlanManager
 
         pm = PlanManager(tmp_path / "tasks")
@@ -1111,9 +1117,25 @@ class TestAutonomousClaim:
         time.sleep(1)
 
         task = pm._task_graph("s1").load_all()["t1"]
-        assert task.status == "in_progress"
-        assert task.owner == "alice"
+        assert task.status == "pending"
+        assert task.owner == ""
         assert call_count[0] >= 2
+
+    def test_task_board_hint_suppressed_when_revision_seen(self, tmp_path):
+        from pip_agent.task_graph import PlanManager
+
+        pm = PlanManager(tmp_path / "tasks")
+        pm.create(None, [{"id": "s1", "title": "S1"}])
+        pm.create("s1", [{"id": "t1", "title": "T1"}])
+        path = _write_md(tmp_path / "team", "alice", SAMPLE_MD)
+        spec = TeammateSpec.from_file(path)
+        t = Teammate(
+            spec, MagicMock(), Bus(tmp_path / "inbox"), Profiler(),
+            plan_manager=pm,
+        )
+        assert t._maybe_task_board_hint() is not None
+        t._board_revision_seen = pm.board_revision
+        assert t._maybe_task_board_hint() is None
 
     @patch("pip_agent.team.IDLE_POLL_INTERVAL", 0.05)
     @patch("pip_agent.team.IDLE_TIMEOUT", 0.5)
@@ -1234,7 +1256,10 @@ class TestMaxTurnsOverride:
             stop_reason="tool_use",
         )
 
-        with patch("pip_agent.team.execute_tool", return_value="content"):
+        with patch(
+            "pip_agent.team.dispatch_tool",
+            return_value=DispatchResult(content="content"),
+        ):
             t._work([], [{"from": "lead", "type": "message", "content": "go"}])
 
         assert client.messages.create.call_count == 2
@@ -1279,7 +1304,10 @@ class TestFinishNotification:
         )
 
         bus.send("lead", "alice", "Task")
-        with patch("pip_agent.team.execute_tool", return_value="ok"):
+        with patch(
+            "pip_agent.team.dispatch_tool",
+            return_value=DispatchResult(content="ok"),
+        ):
             t.start()
             time.sleep(1)
 
