@@ -15,7 +15,7 @@ when completed.
 ## Concepts
 
 - **Story** = a big goal (e.g. "Build user authentication").
-  Created as a directory under `.tasks/`.
+  Created as a directory under `.pip/tasks/`.
 - **Task** = a step within a story (e.g. "Design database schema").
   Created as a JSON file inside the story directory.
 - **blocked_by** = dependency list. Stories can block other stories;

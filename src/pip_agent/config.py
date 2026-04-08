@@ -23,8 +23,8 @@ class Settings(BaseSettings):
 
     compact_threshold: int = Field(default=50_000)
     compact_micro_age: int = Field(default=3)
-    transcripts_dir: str = Field(default=".transcripts")
-    tasks_dir: str = Field(default=".tasks")
+    transcripts_dir: str = Field(default=".pip/transcripts")
+    tasks_dir: str = Field(default=".pip/tasks")
 
     def check_required(self) -> None:
         errors: list[str] = []

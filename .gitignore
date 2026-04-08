@@ -40,8 +40,6 @@ htmlcov/
 
 # Pip-Boy runtime data
 .pip/
-.tasks/
-.transcripts/
 
 # OS
 .DS_Store
