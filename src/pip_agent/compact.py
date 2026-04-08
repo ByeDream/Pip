@@ -24,7 +24,8 @@ SUMMARY_SYSTEM_PROMPT = (
     "5. What remains to be done (outstanding todos)\n\n"
     "Be specific — include file paths, variable names, and concrete details "
     "the assistant will need to continue working. "
-    "Keep the summary under 1500 words."
+    "Keep the summary under 1500 words.\n\n"
+    "Write the summary in the same language the conversation was conducted in."
 )
 
 
