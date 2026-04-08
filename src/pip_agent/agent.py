@@ -266,6 +266,7 @@ def run() -> None:
     )
 
     tools: list[dict] = list(LEAD_TOOLS)
+    team_manager.patch_model_enum(tools)
     system_prompt = SYSTEM_PROMPT
     if skill_registry.available:
         tools.append(skill_registry.tool_schema())

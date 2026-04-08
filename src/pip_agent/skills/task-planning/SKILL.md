@@ -109,6 +109,9 @@ task_remove(story="setup-infra", task_ids=["setup-ci"])
 4. **Auto-cleanup**: When all tasks in a story complete, the story
    directory is automatically deleted from disk.
 
+When using Agent Team, teammates claim tasks from the board
+and manage their own status via `claim_task` and `task_update`.
+
 ## Rules
 
 - Task IDs: alphanumeric, dashes, underscores, 1-64 characters.

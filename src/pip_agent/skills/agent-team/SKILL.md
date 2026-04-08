@@ -50,7 +50,7 @@ team_spawn(name, prompt, model, max_turns)
 All four parameters are required:
 
 - **name**: must exist in the roster (use `team_status` to check)
-- **prompt**: detailed task instructions
+- **prompt**: project context and instructions for the teammate
 - **model**: use `team_list_models` to see available models.
   Pick stronger models for complex reasoning, cheaper models for
   simple/repetitive tasks.
@@ -75,33 +75,33 @@ Teammates use `send(to="lead", content)` to report back.
 
 ## Task Board Coordination
 
-When tasks are planned, teammates can see and claim work:
+When tasks are planned, teammates autonomously find and claim work:
 
-1. Teammates use `task_board_overview` to see available stories and ready tasks
-2. `task_board_detail(story, task_id)` to inspect a specific task
-3. `claim_task(story, task_id)` to take ownership and start working
+1. `task_board_overview` — see stories and ready tasks
+2. `task_board_detail(story, task_id)` — inspect a task
+3. `claim_task(story, task_id)` — take ownership (sets in_progress and owner)
+4. Complete the work, then update task status to completed
+5. Check board again for newly unblocked tasks
 
-When a teammate goes idle, the system hints if new claimable work appears.
+The system hints idle teammates when new claimable work appears.
 
 ## Lifecycle
 
 ```
-Spawned → Working → Idle ⇄ Working → Offline
+Offline → [team_spawn] → Working → Idle ⇄ Working → Offline
 ```
 
+- **Offline**: not running. All teammates start offline. Use `team_spawn` to activate them.
 - **Working**: actively calling tools and the LLM
 - **Idle**: waiting for inbox messages or task board changes (60s timeout)
-- **Offline**: finished — either task complete, max_turns exhausted,
-  idle timeout, or shutdown approved
 
-When `max_turns` is exhausted, the teammate notifies lead and goes offline.
-Re-spawn to continue.
+A teammate goes offline when: task complete, max_turns exhausted,
+idle timeout, or shutdown approved. Re-spawn to continue.
 
 ## Workflow Example
 
-1. Plan the work with `task_create`
-2. Create specialized teammates with `team_create` if needed
-3. Spawn teammates with appropriate models and turn budgets
-4. Teammates claim tasks and work in parallel
-5. Monitor via `team_status` and `team_read_inbox`
-6. Send follow-up instructions with `team_send` as needed
+1. Plan the work with `task_create` (stories, tasks, dependencies)
+2. Create and spawn teammates with project context
+3. Teammates check task board, claim and complete tasks autonomously
+4. Monitor via `team_status` and `team_read_inbox`
+5. Story auto-cleans when all tasks complete

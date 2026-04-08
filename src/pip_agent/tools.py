@@ -358,7 +358,10 @@ TEAM_SPAWN_SCHEMA = {
             },
             "prompt": {
                 "type": "string",
-                "description": "Initial task / instructions for the teammate.",
+                "description": (
+                    "Project context and instructions for the teammate. "
+                    "Teammates discover specific tasks from the task board."
+                ),
             },
             "model": {
                 "type": "string",

@@ -746,12 +746,38 @@ class TeamManager:
         self._scan_dir(self._builtin_dir)
         self._scan_dir(self._user_dir)
 
+    def patch_model_enum(self, tools: list[dict]) -> None:
+        """Inject valid model IDs as enum into team_spawn schema."""
+        valid = sorted(self._valid_models())
+        if not valid:
+            return
+        for tool in tools:
+            if tool.get("name") == "team_spawn":
+                tool["input_schema"]["properties"]["model"]["enum"] = valid
+                break
+
+    def _valid_models(self) -> set[str]:
+        path = self._user_dir.parent / "models.json"
+        if not path.is_file():
+            return set()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return {m["id"] for m in data if "id" in m}
+        except (json.JSONDecodeError, OSError, TypeError):
+            return set()
+
     def spawn(
         self, name: str, prompt: str, *, model: str, max_turns: int,
     ) -> str:
         if name in self._active:
             state = self._active[name].status
             return f"[error] '{name}' is currently {state}."
+        valid = self._valid_models()
+        if valid and model not in valid:
+            return (
+                f"[error] Unknown model '{model}'. "
+                f"Available: {', '.join(sorted(valid))}"
+            )
         spec = self._roster.get(name)
         if spec is None:
             self._rescan()
