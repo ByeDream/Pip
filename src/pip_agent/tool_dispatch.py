@@ -142,7 +142,8 @@ def _handle_team_spawn(ctx: ToolContext, inp: dict) -> DispatchResult:
     text = ctx.team_manager.spawn(
         inp["name"],
         inp["prompt"],
-        max_turns=inp.get("max_turns"),
+        model=inp["model"],
+        max_turns=inp["max_turns"],
     )
     return DispatchResult(content=text)
 
@@ -175,6 +176,39 @@ def _handle_team_status(ctx: ToolContext, _inp: dict) -> DispatchResult:
     if ctx.team_manager is None:
         return DispatchResult(content="Unknown tool: team_status")
     return DispatchResult(content=ctx.team_manager.status())
+
+
+def _handle_team_list_models(ctx: ToolContext, _inp: dict) -> DispatchResult:
+    if ctx.team_manager is None:
+        return DispatchResult(content="Unknown tool: team_list_models")
+    return DispatchResult(content=ctx.team_manager.list_models())
+
+
+def _handle_team_create(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.team_manager is None:
+        return DispatchResult(content="Unknown tool: team_create")
+    text = ctx.team_manager.create_teammate(
+        inp["name"], inp["description"], inp["system_prompt"],
+    )
+    return DispatchResult(content=text)
+
+
+def _handle_team_edit(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.team_manager is None:
+        return DispatchResult(content="Unknown tool: team_edit")
+    updates: dict[str, str] = {}
+    if "description" in inp:
+        updates["description"] = inp["description"]
+    if "system_prompt" in inp:
+        updates["system_prompt"] = inp["system_prompt"]
+    text = ctx.team_manager.edit_teammate(inp["name"], **updates)
+    return DispatchResult(content=text)
+
+
+def _handle_team_delete(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.team_manager is None:
+        return DispatchResult(content="Unknown tool: team_delete")
+    return DispatchResult(content=ctx.team_manager.delete_teammate(inp["name"]))
 
 
 def _handle_send(ctx: ToolContext, inp: dict) -> DispatchResult:
@@ -232,6 +266,10 @@ _TOOL_REGISTRY: dict[str, Callable[[ToolContext, dict], DispatchResult]] = {
     "team_send": _handle_team_send,
     "team_status": _handle_team_status,
     "team_read_inbox": _handle_team_read_inbox,
+    "team_list_models": _handle_team_list_models,
+    "team_create": _handle_team_create,
+    "team_edit": _handle_team_edit,
+    "team_delete": _handle_team_delete,
     "send": _handle_send,
     "read_inbox": _handle_read_inbox,
     "idle": _handle_idle,

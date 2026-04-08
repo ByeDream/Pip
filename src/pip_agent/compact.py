@@ -8,24 +8,10 @@ from typing import TYPE_CHECKING
 import anthropic
 
 from pip_agent.config import settings
+from pip_agent.tools import COMPACT_SCHEMA  # noqa: F401 — re-exported
 
 if TYPE_CHECKING:
     from pip_agent.profiler import Profiler
-
-COMPACT_SCHEMA = {
-    "name": "compact",
-    "description": (
-        "Compress the conversation history to free up context space. "
-        "Call this BEFORE a large operation (e.g. reading many files) "
-        "if you sense the conversation has been going on for a long time. "
-        "The system also compacts automatically when context is large, "
-        "so you only need this for proactive cleanup."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {},
-    },
-}
 
 SUMMARY_SYSTEM_PROMPT = (
     "You are a conversation summarizer. Given a conversation transcript "

@@ -10,7 +10,6 @@ import anthropic
 
 from pip_agent.background import BackgroundTaskManager
 from pip_agent.compact import (
-    COMPACT_SCHEMA,
     auto_compact,
     estimate_tokens,
     micro_compact,
@@ -22,7 +21,7 @@ from pip_agent.task_graph import PlanManager
 from pip_agent.team import TeamManager
 from pip_agent.tool_dispatch import ToolContext, dispatch_tool
 from pip_agent.tools import (
-    ALL_TOOLS,
+    LEAD_TOOLS,
     TASK_TOOL_NAMES,
     TEAM_TOOL_NAMES,
     WORKDIR,
@@ -48,10 +47,7 @@ except ImportError:
 SYSTEM_PROMPT = (
     f"You are Pip-Boy, a personal assistant agent. "
     f"Your working directory is {WORKDIR}. "
-    f"Use task tools to plan goals. "
-    f"Load the 'task-planning' skill for guidance. "
-    f"Prefer tools over prose. "
-    f"Spawn teammates and communicate via inboxes."
+    f"Read PIP_BOY.md in your working directory before starting work."
 )
 
 NAG_THRESHOLD = 3
@@ -72,6 +68,7 @@ _TOOL_KEY_PARAM: dict[str, str] = {
     "check_background": "task_id",
     "team_spawn": "name",
     "team_send": "to",
+    "team_list_models": "",
 }
 
 
@@ -157,13 +154,22 @@ def agent_loop(
             auto_compact(client, messages, system_prompt, transcripts_dir, profiler)
 
         profiler.start("api")
-        response = client.messages.create(
-            model=settings.model,
-            max_tokens=settings.max_tokens,
-            system=system_prompt,
-            tools=tools,
-            messages=messages,
-        )
+        try:
+            response = client.messages.create(
+                model=settings.model,
+                max_tokens=settings.max_tokens,
+                system=system_prompt,
+                tools=tools,
+                messages=messages,
+            )
+        except KeyboardInterrupt:
+            profiler.stop()
+            print("\n  [interrupted] API call cancelled.")
+            break
+        except anthropic.APIError as exc:
+            profiler.stop()
+            print(f"\n  [api_error] {exc}")
+            break
         usage = response.usage
         last_input_tokens = usage.input_tokens
         profiler.stop(
@@ -259,8 +265,7 @@ def run() -> None:
         plan_manager=plan_manager,
     )
 
-    tools: list[dict] = list(ALL_TOOLS)
-    tools.append(COMPACT_SCHEMA)
+    tools: list[dict] = list(LEAD_TOOLS)
     system_prompt = SYSTEM_PROMPT
     if skill_registry.available:
         tools.append(skill_registry.tool_schema())
@@ -298,19 +303,26 @@ def run() -> None:
             print(json.dumps(inbox, indent=2) if inbox else "(no messages)")
             continue
 
-        agent_loop(
-            client,
-            messages,
-            user_input,
-            profiler,
-            plan_manager,
-            tools=tools,
-            system_prompt=system_prompt,
-            skill_registry=skill_registry,
-            transcripts_dir=transcripts_dir,
-            bg_manager=bg_manager,
-            team_manager=team_manager,
-        )
+        try:
+            agent_loop(
+                client,
+                messages,
+                user_input,
+                profiler,
+                plan_manager,
+                tools=tools,
+                system_prompt=system_prompt,
+                skill_registry=skill_registry,
+                transcripts_dir=transcripts_dir,
+                bg_manager=bg_manager,
+                team_manager=team_manager,
+            )
+        except KeyboardInterrupt:
+            print("\n  [interrupted] Returning to prompt.")
+            continue
+        except anthropic.APIError as exc:
+            print(f"\n  [api_error] {exc}")
+            continue
 
         last = messages[-1]
         if last["role"] == "assistant":

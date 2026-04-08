@@ -14,128 +14,20 @@ import yaml
 from pip_agent.config import settings
 from pip_agent.profiler import Profiler
 from pip_agent.tool_dispatch import TeammateToolSurface, ToolContext, dispatch_tool
-from pip_agent.tools import WORKDIR
+from pip_agent.tools import (
+    LEAD_TOOLS,
+    TEAMMATE_BLOCKED_TOOLS,
+    TEAMMATE_EXTRA_TOOLS,
+    VALID_MSG_TYPES,
+    WORKDIR,
+)
 
 if TYPE_CHECKING:
     import anthropic
     from pip_agent.skills import SkillRegistry
     from pip_agent.task_graph import PlanManager
 
-VALID_MSG_TYPES = frozenset({
-    "message",
-    "broadcast",
-    "shutdown_request",
-    "shutdown_response",
-    "plan_request",
-    "plan_response",
-    "status",
-})
-
-DEFAULT_TOOLS = [
-    "bash", "read", "write", "edit", "glob", "web_search", "web_fetch",
-]
-
 MAX_TOOL_OUTPUT = 50_000
-
-SEND_SCHEMA = {
-    "name": "send",
-    "description": (
-        "Send a message to a teammate or to 'lead' (the main agent). "
-        "Use msg_type='broadcast' to send to all active teammates. "
-        "For protocol responses, include req_id and approve."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "to": {
-                "type": "string",
-                "description": "Recipient name.",
-            },
-            "content": {
-                "type": "string",
-                "description": "Message content.",
-            },
-            "msg_type": {
-                "type": "string",
-                "enum": sorted(VALID_MSG_TYPES),
-                "description": "Message type. Default: message.",
-            },
-            "req_id": {
-                "type": "string",
-                "description": "Request ID (for protocol responses).",
-            },
-            "approve": {
-                "type": "boolean",
-                "description": "Approve or reject (for protocol responses).",
-            },
-        },
-        "required": ["to", "content"],
-    },
-}
-
-READ_INBOX_SCHEMA = {
-    "name": "read_inbox",
-    "description": "Read and drain your inbox. Returns all pending messages.",
-    "input_schema": {"type": "object", "properties": {}},
-}
-
-IDLE_SCHEMA = {
-    "name": "idle",
-    "description": (
-        "Signal that current work is complete. "
-        "Enter idle mode to await new tasks or messages."
-    ),
-    "input_schema": {"type": "object", "properties": {}},
-}
-
-CLAIM_TASK_SCHEMA = {
-    "name": "claim_task",
-    "description": (
-        "Claim a task by story and task ID (sets in_progress and owner to you). "
-        "Use task_board_overview and task_board_detail to inspect the board first."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "story": {
-                "type": "string",
-                "description": "Story ID containing the task.",
-            },
-            "task_id": {
-                "type": "string",
-                "description": "Task ID to claim.",
-            },
-        },
-        "required": ["story", "task_id"],
-    },
-}
-
-TASK_BOARD_OVERVIEW_SCHEMA = {
-    "name": "task_board_overview",
-    "description": (
-        "Show all stories and ready tasks on the task board (read-only summary)."
-    ),
-    "input_schema": {"type": "object", "properties": {}},
-}
-
-TASK_BOARD_DETAIL_SCHEMA = {
-    "name": "task_board_detail",
-    "description": "Show one task's details (read-only) within a story.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "story": {
-                "type": "string",
-                "description": "Story ID containing the task.",
-            },
-            "task_id": {
-                "type": "string",
-                "description": "Task ID to inspect.",
-            },
-        },
-        "required": ["story", "task_id"],
-    },
-}
 
 TASK_BOARD_HINT = (
     "<task-board-hint>Review the task board.</task-board-hint>"
@@ -165,30 +57,29 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
 class TeammateSpec:
     name: str
     description: str
-    model: str
-    max_turns: int
-    tools: list[str]
     system_body: str
 
     @classmethod
     def from_file(cls, path: Path) -> TeammateSpec:
         text = path.read_text(encoding="utf-8")
         meta, body = _parse_frontmatter(text)
-        name = meta.get("name", path.stem)
-        description = meta.get("description", "")
-        model = meta.get("model", settings.model)
-        max_turns = int(meta.get("max_turns", settings.subagent_max_rounds))
-        raw_tools = meta.get("tools", DEFAULT_TOOLS)
-        if isinstance(raw_tools, str):
-            raw_tools = [t.strip() for t in raw_tools.split(",")]
         return cls(
-            name=name,
-            description=description,
-            model=model,
-            max_turns=max_turns,
-            tools=list(raw_tools),
+            name=meta.get("name", path.stem),
+            description=meta.get("description", ""),
             system_body=body,
         )
+
+    def to_frontmatter(self) -> str:
+        lines = [
+            "---",
+            f"name: {self.name}",
+            f'description: "{self.description}"',
+            "---",
+        ]
+        if self.system_body:
+            lines.append("")
+            lines.append(self.system_body)
+        return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -394,14 +285,16 @@ class Teammate:
         bus: Bus,
         profiler: Profiler,
         *,
+        model: str,
+        max_turns: int,
         protocol: ProtocolTracker | None = None,
         skill_registry: SkillRegistry | None = None,
         active_names_fn: callable = lambda: [],
         done_fn: callable | None = None,
         plan_manager: PlanManager | None = None,
-        max_turns_override: int | None = None,
     ) -> None:
         self.spec = spec
+        self._model = model
         self._client = client
         self._bus = bus
         self._profiler = profiler
@@ -410,7 +303,7 @@ class Teammate:
         self._active_names_fn = active_names_fn
         self._done_fn = done_fn
         self._plan_manager = plan_manager
-        self._max_turns = max_turns_override or spec.max_turns
+        self._max_turns = max_turns
         self._status = "working"
         self._shutdown = threading.Event()
         self._approved_shutdown = False
@@ -514,7 +407,7 @@ class Teammate:
             self._profiler.start(f"api:teammate:{self.spec.name}")
             try:
                 response = self._client.messages.create(
-                    model=self.spec.model,
+                    model=self._model,
                     max_tokens=settings.max_tokens,
                     system=system,
                     tools=tools,
@@ -754,17 +647,11 @@ class Teammate:
     # -- Tool & prompt construction -----------------------------------------
 
     def _build_tools(self) -> list[dict]:
-        from pip_agent.tools import ALL_TOOLS
-
-        allowed = set(self.spec.tools)
-        tools = [t for t in ALL_TOOLS if t["name"] in allowed]
-        tools.append(SEND_SCHEMA)
-        tools.append(READ_INBOX_SCHEMA)
-        tools.append(IDLE_SCHEMA)
-        if self._plan_manager is not None:
-            tools.append(TASK_BOARD_OVERVIEW_SCHEMA)
-            tools.append(TASK_BOARD_DETAIL_SCHEMA)
-            tools.append(CLAIM_TASK_SCHEMA)
+        tools = [
+            t for t in LEAD_TOOLS
+            if t["name"] not in TEAMMATE_BLOCKED_TOOLS
+        ]
+        tools.extend(TEAMMATE_EXTRA_TOOLS)
         if self._skill_registry is not None and self._skill_registry.available:
             tools.append(self._skill_registry.tool_schema())
         return tools
@@ -837,19 +724,20 @@ class TeamManager:
         self._active.pop(name, None)
 
     def _make_teammate(
-        self, spec: TeammateSpec, *, max_turns_override: int | None = None,
+        self, spec: TeammateSpec, *, model: str, max_turns: int,
     ) -> Teammate:
         return Teammate(
             spec,
             self._client,
             self._bus,
             self._profiler,
+            model=model,
+            max_turns=max_turns,
             protocol=self._protocol,
             skill_registry=self._skill_registry,
             active_names_fn=self._active_names,
             done_fn=self._on_done,
             plan_manager=self._plan_manager,
-            max_turns_override=max_turns_override,
         )
 
     # -- Public API (called from agent_loop) --------------------------------
@@ -859,7 +747,7 @@ class TeamManager:
         self._scan_dir(self._user_dir)
 
     def spawn(
-        self, name: str, prompt: str, *, max_turns: int | None = None,
+        self, name: str, prompt: str, *, model: str, max_turns: int,
     ) -> str:
         if name in self._active:
             state = self._active[name].status
@@ -871,12 +759,11 @@ class TeamManager:
         if spec is None:
             available = ", ".join(sorted(self._roster.keys())) or "(none)"
             return f"[error] Unknown teammate '{name}'. Available: {available}"
-        teammate = self._make_teammate(spec, max_turns_override=max_turns)
+        teammate = self._make_teammate(spec, model=model, max_turns=max_turns)
         teammate.start()
         self._active[name] = teammate
-        effective = teammate._max_turns
         self._bus.send(self.LEAD, name, prompt, "message")
-        return f"Spawned '{name}' ({spec.model}, max {effective} turns)."
+        return f"Spawned '{name}' ({model}, max {max_turns} turns)."
 
     def send(
         self, to: str, content: str, msg_type: str = "message", **extra,
@@ -913,13 +800,63 @@ class TeamManager:
         for name in sorted(self._roster):
             spec = self._roster[name]
             if name in self._active:
-                state = self._active[name].status
+                tm = self._active[name]
+                lines.append(
+                    f"  {name} [{tm.status}] {spec.description}"
+                    f" ({tm._model}, {tm._max_turns} turns)"
+                )
             else:
-                state = "offline"
-            lines.append(
-                f"  {name} [{state}] {spec.description} ({spec.model})"
-            )
+                lines.append(f"  {name} [offline] {spec.description}")
         return "\n".join(lines)
+
+    def create_teammate(self, name: str, description: str, system_prompt: str) -> str:
+        if name in self._roster:
+            return f"[error] Teammate '{name}' already exists."
+        spec = TeammateSpec(name=name, description=description, system_body=system_prompt)
+        path = self._user_dir / f"{name}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(spec.to_frontmatter(), encoding="utf-8")
+        self._roster[name] = spec
+        return f"Created teammate '{name}' at {path.relative_to(WORKDIR)}"
+
+    def edit_teammate(self, name: str, **updates: str) -> str:
+        spec = self._roster.get(name)
+        if spec is None:
+            self._rescan()
+            spec = self._roster.get(name)
+        if spec is None:
+            return f"[error] Unknown teammate '{name}'."
+        new_desc = updates.get("description", spec.description)
+        new_body = updates.get("system_prompt", spec.system_body)
+        new_spec = TeammateSpec(name=name, description=new_desc, system_body=new_body)
+        path = self._user_dir / f"{name}.md"
+        if not path.is_file():
+            path = self._builtin_dir / f"{name}.md"
+        path.write_text(new_spec.to_frontmatter(), encoding="utf-8")
+        self._roster[name] = new_spec
+        return f"Updated teammate '{name}'."
+
+    def delete_teammate(self, name: str) -> str:
+        if name in self._active:
+            return f"[error] '{name}' is currently active. Stop it first."
+        path = self._user_dir / f"{name}.md"
+        if not path.is_file():
+            path = self._builtin_dir / f"{name}.md"
+        if not path.is_file():
+            return f"[error] Teammate '{name}' not found."
+        path.unlink()
+        self._roster.pop(name, None)
+        return f"Deleted teammate '{name}'."
+
+    def list_models(self) -> str:
+        path = self._user_dir.parent / "models.json"
+        if not path.is_file():
+            return "[error] No models.json found in .pip/"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            return f"[error] Failed to read models.json: {exc}"
+        return json.dumps(data, indent=2)
 
     def deactivate_all(self) -> None:
         for t in self._active.values():

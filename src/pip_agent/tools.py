@@ -345,9 +345,9 @@ TASK_TOOL_NAMES = frozenset({"task_create", "task_update", "task_list", "task_re
 TEAM_SPAWN_SCHEMA = {
     "name": "team_spawn",
     "description": (
-        "Spawn a pre-defined teammate with an initial task. "
-        "The teammate starts working immediately. "
-        "Use team_status to see available teammates."
+        "Spawn a teammate and start it working on a task immediately. "
+        "Use team_status to see available teammates, "
+        "team_list_models to choose a model."
     ),
     "input_schema": {
         "type": "object",
@@ -360,12 +360,24 @@ TEAM_SPAWN_SCHEMA = {
                 "type": "string",
                 "description": "Initial task / instructions for the teammate.",
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Model ID for this teammate. "
+                    "Use team_list_models to see available options. "
+                    "Pick stronger models for complex reasoning, "
+                    "cheaper models for simple/repetitive tasks."
+                ),
+            },
             "max_turns": {
                 "type": "integer",
-                "description": "Max tool-use rounds for this session. Omit to use the teammate default.",
+                "description": (
+                    "Max tool-use rounds for this session. "
+                    "Allocate more turns for complex tasks."
+                ),
             },
         },
-        "required": ["name", "prompt"],
+        "required": ["name", "prompt", "model", "max_turns"],
     },
 }
 
@@ -429,7 +441,83 @@ TEAM_READ_INBOX_SCHEMA = {
     },
 }
 
-TEAM_TOOL_NAMES = frozenset({"team_spawn", "team_send", "team_status", "team_read_inbox"})
+TEAM_LIST_MODELS_SCHEMA = {
+    "name": "team_list_models",
+    "description": "List available models with descriptions. Use to choose a model when spawning teammates.",
+    "input_schema": {
+        "type": "object",
+        "properties": {},
+    },
+}
+
+TEAM_CREATE_SCHEMA = {
+    "name": "team_create",
+    "description": (
+        "Create a new teammate definition. "
+        "The teammate becomes available for spawning immediately."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Teammate name (lowercase, hyphens/underscores). Must be unique.",
+            },
+            "description": {
+                "type": "string",
+                "description": "Brief description of the teammate's role and expertise.",
+            },
+            "system_prompt": {
+                "type": "string",
+                "description": "System prompt body defining the teammate's identity and behavior.",
+            },
+        },
+        "required": ["name", "description", "system_prompt"],
+    },
+}
+
+TEAM_EDIT_SCHEMA = {
+    "name": "team_edit",
+    "description": "Edit an existing teammate definition. Only provided fields are updated.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Teammate name to edit (must exist).",
+            },
+            "description": {
+                "type": "string",
+                "description": "New description (omit to keep current).",
+            },
+            "system_prompt": {
+                "type": "string",
+                "description": "New system prompt body (omit to keep current).",
+            },
+        },
+        "required": ["name"],
+    },
+}
+
+TEAM_DELETE_SCHEMA = {
+    "name": "team_delete",
+    "description": "Delete a teammate definition. Cannot delete a currently active teammate.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Teammate name to delete.",
+            },
+        },
+        "required": ["name"],
+    },
+}
+
+TEAM_TOOL_NAMES = frozenset({
+    "team_spawn", "team_send", "team_status", "team_read_inbox",
+    "team_list_models", "team_create", "team_edit", "team_delete",
+})
 
 CHECK_BACKGROUND_SCHEMA = {
     "name": "check_background",
@@ -444,6 +532,155 @@ CHECK_BACKGROUND_SCHEMA = {
         },
     },
 }
+
+COMPACT_SCHEMA = {
+    "name": "compact",
+    "description": (
+        "Compress the conversation history to free up context space. "
+        "Call this BEFORE a large operation (e.g. reading many files) "
+        "if you sense the conversation has been going on for a long time. "
+        "The system also compacts automatically when context is large, "
+        "so you only need this for proactive cleanup."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {},
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Teammate-only tool schemas
+# ---------------------------------------------------------------------------
+
+VALID_MSG_TYPES = frozenset({
+    "message",
+    "broadcast",
+    "shutdown_request",
+    "shutdown_response",
+    "plan_request",
+    "plan_response",
+    "status",
+})
+
+SEND_SCHEMA = {
+    "name": "send",
+    "description": (
+        "Send a message to a teammate or to 'lead' (the main agent). "
+        "Use msg_type='broadcast' to send to all active teammates. "
+        "For protocol responses, include req_id and approve."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "to": {
+                "type": "string",
+                "description": "Recipient name.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Message content.",
+            },
+            "msg_type": {
+                "type": "string",
+                "enum": sorted(VALID_MSG_TYPES),
+                "description": "Message type. Default: message.",
+            },
+            "req_id": {
+                "type": "string",
+                "description": "Request ID (for protocol responses).",
+            },
+            "approve": {
+                "type": "boolean",
+                "description": "Approve or reject (for protocol responses).",
+            },
+        },
+        "required": ["to", "content"],
+    },
+}
+
+READ_INBOX_SCHEMA = {
+    "name": "read_inbox",
+    "description": "Read and drain your inbox. Returns all pending messages.",
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+IDLE_SCHEMA = {
+    "name": "idle",
+    "description": (
+        "Signal that current work is complete. "
+        "Enter idle mode to await new tasks or messages."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+CLAIM_TASK_SCHEMA = {
+    "name": "claim_task",
+    "description": (
+        "Claim a task by story and task ID (sets in_progress and owner to you). "
+        "Use task_board_overview and task_board_detail to inspect the board first."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "story": {
+                "type": "string",
+                "description": "Story ID containing the task.",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Task ID to claim.",
+            },
+        },
+        "required": ["story", "task_id"],
+    },
+}
+
+TASK_BOARD_OVERVIEW_SCHEMA = {
+    "name": "task_board_overview",
+    "description": (
+        "Show all stories and ready tasks on the task board (read-only summary)."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+TASK_BOARD_DETAIL_SCHEMA = {
+    "name": "task_board_detail",
+    "description": "Show one task's details (read-only) within a story.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "story": {
+                "type": "string",
+                "description": "Story ID containing the task.",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Task ID to inspect.",
+            },
+        },
+        "required": ["story", "task_id"],
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Tool groups
+# ---------------------------------------------------------------------------
+
+TEAMMATE_BLOCKED_TOOLS = frozenset({
+    "task_create", "task_update", "task_list", "task_remove",
+    "team_spawn", "team_send", "team_status", "team_read_inbox",
+    "team_create", "team_edit", "team_delete", "team_list_models",
+    "task", "check_background", "compact",
+})
+
+TEAMMATE_EXTRA_TOOLS = [
+    SEND_SCHEMA,
+    READ_INBOX_SCHEMA,
+    IDLE_SCHEMA,
+    CLAIM_TASK_SCHEMA,
+    TASK_BOARD_OVERVIEW_SCHEMA,
+    TASK_BOARD_DETAIL_SCHEMA,
+]
 
 # ---------------------------------------------------------------------------
 # Tool implementations
@@ -604,7 +841,7 @@ def run_web_fetch(tool_input: dict) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-ALL_TOOLS = [
+LEAD_TOOLS = [
     BASH_SCHEMA,
     READ_SCHEMA,
     WRITE_SCHEMA,
@@ -622,7 +859,14 @@ ALL_TOOLS = [
     TEAM_SEND_SCHEMA,
     TEAM_STATUS_SCHEMA,
     TEAM_READ_INBOX_SCHEMA,
+    TEAM_LIST_MODELS_SCHEMA,
+    TEAM_CREATE_SCHEMA,
+    TEAM_EDIT_SCHEMA,
+    TEAM_DELETE_SCHEMA,
+    COMPACT_SCHEMA,
 ]
+
+ALL_TOOLS = LEAD_TOOLS
 
 
 def execute_tool(name: str, tool_input: dict) -> str:
