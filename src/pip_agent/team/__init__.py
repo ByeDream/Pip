@@ -572,6 +572,10 @@ class Teammate:
         self._idle_requested = True
 
     def _exec_tool(self, name: str, tool_input: dict) -> str:
+        wt = self._worktree_manager
+        workdir = None
+        if wt is not None and wt.exists(self.spec.name):
+            workdir = wt.worktree_path(self.spec.name)
         ctx = ToolContext(
             profiler=self._profiler,
             plan_manager=self._plan_manager,
@@ -579,6 +583,7 @@ class Teammate:
             worktree_manager=self._worktree_manager,
             teammate=self._teammate_tool_surface(),
             caller=self.spec.name,
+            workdir=workdir,
         )
         result = dispatch_tool(ctx, name, tool_input).content
         self._maybe_mark_board_seen(name, result)

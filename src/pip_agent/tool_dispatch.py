@@ -4,6 +4,7 @@ import json
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pip_agent.tools import (
@@ -52,6 +53,7 @@ class ToolContext:
     worktree_manager: WorktreeManager | None = None
     teammate: TeammateToolSurface | None = None
     caller: str = "lead"
+    workdir: Path | None = None
 
 
 def _handle_plan_tool(name: str, inputs: dict, pm: PlanManager) -> str:
@@ -67,9 +69,11 @@ def _handle_plan_tool(name: str, inputs: dict, pm: PlanManager) -> str:
     return f"Unknown task tool: {name}"
 
 
-def _wrap_simple(run: Callable[[dict], str], inp: dict) -> str:
+def _wrap_simple(
+    run: Callable, inp: dict, *, workdir: Path | None = None,
+) -> str:
     try:
-        return run(inp)
+        return run(inp, workdir=workdir) if workdir else run(inp)
     except ValueError as e:
         return f"[blocked] {e}"
     except Exception as e:
@@ -108,10 +112,12 @@ def _handle_load_skill(ctx: ToolContext, inp: dict) -> DispatchResult:
 
 def _handle_bash(ctx: ToolContext, inp: dict) -> DispatchResult:
     if inp.get("background") and ctx.bg_manager is not None:
+        from functools import partial
         task_id = uuid.uuid4().hex[:8]
-        ctx.bg_manager.spawn(task_id, inp["command"], run_bash, inp)
+        fn = partial(run_bash, workdir=ctx.workdir) if ctx.workdir else run_bash
+        ctx.bg_manager.spawn(task_id, inp["command"], fn, inp)
         return DispatchResult(content=f"[background:{task_id}] started")
-    return DispatchResult(content=_wrap_simple(run_bash, inp))
+    return DispatchResult(content=_wrap_simple(run_bash, inp, workdir=ctx.workdir))
 
 
 def _handle_check_background(ctx: ToolContext, inp: dict) -> DispatchResult:
@@ -355,10 +361,18 @@ _TOOL_REGISTRY: dict[str, Callable[[ToolContext, dict], DispatchResult]] = {
     "claim_task": _handle_claim_task,
     "task_board_overview": _handle_task_board_overview,
     "task_board_detail": _handle_task_board_detail,
-    "read": lambda ctx, inp: DispatchResult(content=_wrap_simple(run_read, inp)),
-    "write": lambda ctx, inp: DispatchResult(content=_wrap_simple(run_write, inp)),
-    "edit": lambda ctx, inp: DispatchResult(content=_wrap_simple(run_edit, inp)),
-    "glob": lambda ctx, inp: DispatchResult(content=_wrap_simple(run_glob, inp)),
+    "read": lambda ctx, inp: DispatchResult(
+        content=_wrap_simple(run_read, inp, workdir=ctx.workdir),
+    ),
+    "write": lambda ctx, inp: DispatchResult(
+        content=_wrap_simple(run_write, inp, workdir=ctx.workdir),
+    ),
+    "edit": lambda ctx, inp: DispatchResult(
+        content=_wrap_simple(run_edit, inp, workdir=ctx.workdir),
+    ),
+    "glob": lambda ctx, inp: DispatchResult(
+        content=_wrap_simple(run_glob, inp, workdir=ctx.workdir),
+    ),
     "web_search": lambda ctx, inp: DispatchResult(
         content=_wrap_simple(run_web_search, inp),
     ),

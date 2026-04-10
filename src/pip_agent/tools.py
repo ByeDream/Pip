@@ -9,10 +9,11 @@ from pip_agent.config import settings
 WORKDIR = Path.cwd()
 
 
-def safe_path(raw: str) -> Path:
-    """Resolve a path and ensure it lives inside WORKDIR."""
-    resolved = (WORKDIR / raw).resolve()
-    if not resolved.is_relative_to(WORKDIR):
+def safe_path(raw: str, *, workdir: Path | None = None) -> Path:
+    """Resolve a path and ensure it lives inside the working directory."""
+    wd = workdir or WORKDIR
+    resolved = (wd / raw).resolve()
+    if not resolved.is_relative_to(wd):
         raise ValueError(f"Path escapes working directory: {raw}")
     return resolved
 
@@ -703,9 +704,10 @@ _TEAMMATE_ONLY = frozenset({
 # ---------------------------------------------------------------------------
 
 
-def run_bash(tool_input: dict) -> str:
+def run_bash(tool_input: dict, *, workdir: Path | None = None) -> str:
     command = tool_input["command"]
     timeout = tool_input.get("timeout", 120)
+    cwd = workdir or WORKDIR
     try:
         result = subprocess.run(
             command,
@@ -715,6 +717,7 @@ def run_bash(tool_input: dict) -> str:
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            cwd=cwd,
         )
         output = result.stdout + result.stderr
         if result.returncode != 0:
@@ -724,8 +727,8 @@ def run_bash(tool_input: dict) -> str:
         return f"[timed out after {timeout}s]"
 
 
-def run_read(tool_input: dict) -> str:
-    path = safe_path(tool_input["file_path"])
+def run_read(tool_input: dict, *, workdir: Path | None = None) -> str:
+    path = safe_path(tool_input["file_path"], workdir=workdir)
     if not path.is_file():
         return f"File not found: {tool_input['file_path']}"
 
@@ -743,16 +746,16 @@ def run_read(tool_input: dict) -> str:
     return header + "\n" + "\n".join(numbered)
 
 
-def run_write(tool_input: dict) -> str:
-    path = safe_path(tool_input["file_path"])
+def run_write(tool_input: dict, *, workdir: Path | None = None) -> str:
+    path = safe_path(tool_input["file_path"], workdir=workdir)
     content = tool_input["content"]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return f"Wrote {len(content.encode('utf-8'))} bytes to {tool_input['file_path']}"
 
 
-def run_edit(tool_input: dict) -> str:
-    path = safe_path(tool_input["file_path"])
+def run_edit(tool_input: dict, *, workdir: Path | None = None) -> str:
+    path = safe_path(tool_input["file_path"], workdir=workdir)
     if not path.is_file():
         return f"File not found: {tool_input['file_path']}"
 
@@ -771,8 +774,9 @@ def run_edit(tool_input: dict) -> str:
     return f"Edited {tool_input['file_path']} (replaced 1 occurrence)."
 
 
-def run_glob(tool_input: dict) -> str:
-    base = safe_path(tool_input.get("path", "."))
+def run_glob(tool_input: dict, *, workdir: Path | None = None) -> str:
+    wd = workdir or WORKDIR
+    base = safe_path(tool_input.get("path", "."), workdir=workdir)
     if not base.is_dir():
         return f"Directory not found: {tool_input.get('path', '.')}"
 
@@ -781,7 +785,7 @@ def run_glob(tool_input: dict) -> str:
     paths = []
     for m in matches[:200]:
         try:
-            paths.append(str(m.relative_to(WORKDIR)))
+            paths.append(str(m.relative_to(wd)))
         except ValueError:
             continue
     if not paths:
