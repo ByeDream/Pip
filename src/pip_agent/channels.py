@@ -12,7 +12,6 @@ import base64
 import json
 import logging
 import random
-import sys
 import threading
 import time
 import uuid
@@ -189,7 +188,8 @@ class WeChatChannel(Channel):
         except ImportError:
             pass
 
-        while True:
+        deadline = time.time() + 300
+        while time.time() < deadline:
             try:
                 resp = self._http.get(
                     f"{self.ILINK_BASE}/ilink/bot/get_qrcode_status",
@@ -222,6 +222,10 @@ class WeChatChannel(Channel):
                 self._save_creds()
                 print(f"  [wechat] Login successful (account={self._account_id})")
                 return True
+            log.warning("wechat QR unknown status: %s", status)
+
+        print("  [wechat] QR login timed out (5 min).")
+        return False
 
     # -- getupdates long-poll --
 
@@ -597,5 +601,5 @@ def wecom_ws_loop(
     stop: threading.Event,
 ) -> None:
     """WebSocket loop for WeCom, runs in a daemon thread."""
-    print(f"  [wecom] WebSocket loop starting")
+    print("  [wecom] WebSocket loop starting")
     wecom.start(stop)

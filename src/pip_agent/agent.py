@@ -522,7 +522,8 @@ def run(mode: str = "auto") -> None:
             if stop_event.is_set():
                 break
 
-            for sk, msgs in list(remote_buffers.items()):
+            ready = []
+            for sk, msgs in remote_buffers.items():
                 if not msgs:
                     continue
                 first = msgs[0]
@@ -531,22 +532,26 @@ def run(mode: str = "auto") -> None:
                     continue
                 if isinstance(ch, WeChatChannel) and not ch.has_context_token(first.peer_id):
                     continue
+                ready.append(sk)
 
-                combined_text = "\n".join(m.text for m in msgs)
-                remote_buffers[sk] = []
-
-                combined = InboundMessage(
-                    text=combined_text,
-                    sender_id=first.sender_id,
-                    channel=first.channel,
-                    peer_id=first.peer_id,
-                )
+            if ready:
                 poll_pause.set()
                 try:
-                    _process_inbound(
-                        combined, conversations, channel_mgr, client, profiler,
-                        plan_manager, **common_kwargs,
-                    )
+                    for sk in ready:
+                        msgs = remote_buffers[sk]
+                        remote_buffers[sk] = []
+                        first = msgs[0]
+
+                        combined = InboundMessage(
+                            text="\n".join(m.text for m in msgs),
+                            sender_id=first.sender_id,
+                            channel=first.channel,
+                            peer_id=first.peer_id,
+                        )
+                        _process_inbound(
+                            combined, conversations, channel_mgr, client, profiler,
+                            plan_manager, **common_kwargs,
+                        )
                 finally:
                     poll_pause.clear()
 
