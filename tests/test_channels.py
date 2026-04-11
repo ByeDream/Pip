@@ -281,3 +281,7 @@ class TestWeChatSend:
     def test_send_without_context_token(self, wechat):
         ok = wechat.send("unknown_user", "Hello!")
         assert ok is False
+
+    def test_has_context_token(self, wechat):
+        assert wechat.has_context_token("user@im.wechat") is True
+        assert wechat.has_context_token("nobody") is False

@@ -11,7 +11,6 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 import random
 import sys
 import threading
@@ -104,6 +103,7 @@ class WeChatChannel(Channel):
         self._account_id: str = ""
         self._user_id: str = ""
         self._get_updates_buf: str = ""
+        self._closing = False
 
         self._context_tokens: dict[str, str] = {}
 
@@ -239,7 +239,8 @@ class WeChatChannel(Channel):
             )
             data = resp.json()
         except Exception as exc:
-            log.warning("wechat getupdates error: %s", exc)
+            if not self._closing:
+                log.warning("wechat getupdates error: %s", exc)
             return []
 
         ret = data.get("ret", 0)
@@ -291,10 +292,13 @@ class WeChatChannel(Channel):
 
     # -- send --
 
+    def has_context_token(self, peer_id: str) -> bool:
+        return bool(self._context_tokens.get(peer_id))
+
     def send(self, to: str, text: str, **kw: Any) -> bool:
         ctx_token = self._context_tokens.get(to, "")
         if not ctx_token:
-            log.warning("wechat send: no context_token for %s", to)
+            print(f"  [wechat] Cannot reply to {to}: no context_token")
             return False
 
         ok = True
@@ -326,8 +330,10 @@ class WeChatChannel(Channel):
         return ok
 
     def send_typing(self, to: str) -> None:
-        """Send typing indicator via sendtyping API."""
+        """Send typing indicator via sendtyping API (fire-and-forget)."""
         ctx_token = self._context_tokens.get(to, "")
+        if not ctx_token:
+            return
         try:
             self._http.post(
                 f"{self._base_url}/ilink/bot/sendtyping",
@@ -337,6 +343,7 @@ class WeChatChannel(Channel):
                     "context_token": ctx_token,
                     "base_info": {"channel_version": "1.0.0"},
                 },
+                timeout=5.0,
             )
         except Exception:
             pass
@@ -361,6 +368,7 @@ class WeChatChannel(Channel):
         return chunks
 
     def close(self) -> None:
+        self._closing = True
         self._http.close()
 
 
@@ -550,11 +558,15 @@ def wechat_poll_loop(
     queue: list[InboundMessage],
     lock: threading.Lock,
     stop: threading.Event,
+    pause: threading.Event | None = None,
 ) -> None:
     """Long-poll loop for WeChat, runs in a daemon thread."""
-    print(f"  [wechat] Polling started")
+    print("  [wechat] Polling started")
     consecutive_errors = 0
     while not stop.is_set():
+        if pause is not None and pause.is_set():
+            stop.wait(0.5)
+            continue
         if not wechat.is_logged_in:
             stop.wait(5.0)
             continue
@@ -564,7 +576,16 @@ def wechat_poll_loop(
             if msgs:
                 with lock:
                     queue.extend(msgs)
+        except OSError:
+            if stop.is_set():
+                break
+            consecutive_errors += 1
+            wait = min(30.0, 2.0 * consecutive_errors)
+            log.warning("wechat poll OSError (retry in %.0fs)", wait)
+            stop.wait(wait)
         except Exception as exc:
+            if stop.is_set():
+                break
             consecutive_errors += 1
             wait = min(30.0, 2.0 * consecutive_errors)
             log.warning("wechat poll error: %s (retry in %.0fs)", exc, wait)

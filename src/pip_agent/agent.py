@@ -310,7 +310,10 @@ def _process_inbound(
     if reply_text:
         ch = channel_mgr.get(inbound.channel)
         if ch:
-            ch.send(inbound.peer_id, reply_text)
+            if not ch.send(inbound.peer_id, reply_text):
+                print(f"  [warning] Failed to send reply via {inbound.channel}, "
+                      f"printing to terminal instead:")
+                print(reply_text)
 
     profiler.flush()
 
@@ -387,6 +390,7 @@ def run(mode: str = "auto") -> None:
     channel_mgr.register(cli_channel)
 
     stop_event = threading.Event()
+    poll_pause = threading.Event()
     msg_queue: list[InboundMessage] = []
     q_lock = threading.Lock()
     bg_threads: list[threading.Thread] = []
@@ -412,7 +416,7 @@ def run(mode: str = "auto") -> None:
                 channel_mgr.register(wechat_channel)
                 t = threading.Thread(
                     target=wechat_poll_loop, daemon=True,
-                    args=(wechat_channel, msg_queue, q_lock, stop_event),
+                    args=(wechat_channel, msg_queue, q_lock, stop_event, poll_pause),
                 )
                 t.start()
                 bg_threads.append(t)
@@ -476,14 +480,12 @@ def run(mode: str = "auto") -> None:
         stdin_thread.start()
         print("  (multi-channel mode: type and press Enter)")
 
+        remote_buffers: dict[str, list[InboundMessage]] = {}
+
         while not stop_event.is_set():
             with q_lock:
                 batch = msg_queue[:]
                 msg_queue.clear()
-
-            if not batch:
-                time.sleep(0.3)
-                continue
 
             for inbound in batch:
                 if inbound.channel == "cli":
@@ -502,45 +504,85 @@ def run(mode: str = "auto") -> None:
                             print(f"  - {name}")
                         continue
 
-                if settings.verbose and inbound.channel != "cli":
-                    print(f"\n  [{inbound.channel}] {inbound.sender_id}: "
-                          f"{inbound.text[:80]}")
-
-                _process_inbound(
-                    inbound, conversations, channel_mgr, client, profiler,
-                    plan_manager, **common_kwargs,
-                )
-
-                # drain background tasks for CLI session
-                cli_messages = conversations.get(cli_session_key, [])
-                while bg_manager.has_pending():
                     if settings.verbose:
-                        print("  (waiting for background tasks...)")
-                    time.sleep(1)
-                    notifications = bg_manager.drain()
-                    if notifications:
-                        for n in notifications:
-                            profiler.record("bg:bash", n.elapsed_ms)
-                            if settings.verbose:
-                                print(
-                                    f"  [bg:{n.task_id} {n.status}"
-                                    f" ({n.elapsed_ms:.0f}ms)] {n.result}"
-                                )
-                        parts = [
-                            f'<background-result task_id="{n.task_id}"'
-                            f' status="{n.status}"'
-                            f' elapsed_ms="{n.elapsed_ms:.0f}">'
-                            f"\n{n.result}\n</background-result>"
-                            for n in notifications
-                        ]
-                        cli_messages.append({
-                            "role": "user",
-                            "content": (
-                                "<background-results>\n"
-                                + "".join(parts)
-                                + "\n</background-results>"
-                            ),
-                        })
+                        print(f"\n  [cli] {inbound.text[:80]}")
+
+                    poll_pause.set()
+                    try:
+                        _process_inbound(
+                            inbound, conversations, channel_mgr, client, profiler,
+                            plan_manager, **common_kwargs,
+                        )
+                    finally:
+                        poll_pause.clear()
+                else:
+                    sk = build_session_key(inbound.channel, inbound.peer_id)
+                    remote_buffers.setdefault(sk, []).append(inbound)
+
+            if stop_event.is_set():
+                break
+
+            for sk, msgs in list(remote_buffers.items()):
+                if not msgs:
+                    continue
+                first = msgs[0]
+                ch = channel_mgr.get(first.channel)
+                if not ch:
+                    continue
+                if isinstance(ch, WeChatChannel) and not ch.has_context_token(first.peer_id):
+                    continue
+
+                combined_text = "\n".join(m.text for m in msgs)
+                remote_buffers[sk] = []
+
+                combined = InboundMessage(
+                    text=combined_text,
+                    sender_id=first.sender_id,
+                    channel=first.channel,
+                    peer_id=first.peer_id,
+                )
+                poll_pause.set()
+                try:
+                    _process_inbound(
+                        combined, conversations, channel_mgr, client, profiler,
+                        plan_manager, **common_kwargs,
+                    )
+                finally:
+                    poll_pause.clear()
+
+            # drain background tasks for CLI session
+            cli_messages = conversations.get(cli_session_key, [])
+            while bg_manager.has_pending():
+                if settings.verbose:
+                    print("  (waiting for background tasks...)")
+                time.sleep(1)
+                notifications = bg_manager.drain()
+                if notifications:
+                    for n in notifications:
+                        profiler.record("bg:bash", n.elapsed_ms)
+                        if settings.verbose:
+                            print(
+                                f"  [bg:{n.task_id} {n.status}"
+                                f" ({n.elapsed_ms:.0f}ms)] {n.result}"
+                            )
+                    parts = [
+                        f'<background-result task_id="{n.task_id}"'
+                        f' status="{n.status}"'
+                        f' elapsed_ms="{n.elapsed_ms:.0f}">'
+                        f"\n{n.result}\n</background-result>"
+                        for n in notifications
+                    ]
+                    cli_messages.append({
+                        "role": "user",
+                        "content": (
+                            "<background-results>\n"
+                            + "".join(parts)
+                            + "\n</background-results>"
+                        ),
+                    })
+
+            if not batch and not any(remote_buffers.values()):
+                time.sleep(0.3)
     else:
         # CLI-only mode: original blocking REPL (preserves readline, etc.)
         messages = conversations[cli_session_key]
@@ -619,6 +661,6 @@ def run(mode: str = "auto") -> None:
     # -- Cleanup --
     stop_event.set()
     team_manager.deactivate_all()
-    for t in bg_threads:
-        t.join(timeout=3.0)
     channel_mgr.close_all()
+    for t in bg_threads:
+        t.join(timeout=5.0)
