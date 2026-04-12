@@ -4,6 +4,9 @@ Unified slash-command dispatch for all channels.
 Commands are intercepted before routing and agent_loop. Each handler
 receives the current message context and returns a response string
 (or None to signal no reply needed).
+
+All commands are flat (single-level):
+  /help, /bind, /name, /unbind, /clear, /status, /exit
 """
 
 from __future__ import annotations
@@ -57,7 +60,10 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
     args = parts[1] if len(parts) > 1 else ""
 
     handlers = {
-        "/init": _cmd_init,
+        "/help": _cmd_help,
+        "/bind": _cmd_bind,
+        "/name": _cmd_name,
+        "/unbind": _cmd_unbind,
         "/clear": _cmd_clear,
         "/status": _cmd_status,
         "/exit": _cmd_exit,
@@ -71,28 +77,39 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
 
 
 # ---------------------------------------------------------------------------
-# /init
+# /help
 # ---------------------------------------------------------------------------
 
-_INIT_HELP = """\
-Usage: /init <agent-id> [options]
+_HELP_TEXT = """\
+Available commands:
 
-Bind the current chat context to an agent.
-If the agent doesn't exist yet, a new one is auto-created (cloned from default).
+  /help                          Show this help
+  /bind <agent-id> [options]     Bind current chat to an agent (auto-creates if needed)
+  /name <display_name>           Set display name for the current agent
+  /unbind                        Remove current chat's routing binding
+  /clear                         Remove binding and delete the agent config
+  /status                        Show current routing info
+  /exit                          Quit Pip-Boy (CLI only)
 
-Options:
-  --name <display_name>        Set display name for the agent
-  --scope <dm_scope>           Override session isolation (per-guild, per-guild-peer, main)
-  --model <model>              Override model
-  --max-tokens <n>             Override max tokens
-  --compact-threshold <n>      Override compact threshold
-  --compact-micro-age <n>      Override compact micro age
-  --help                       Show this help
+/bind options:
+  --scope <dm_scope>             Session isolation (per-guild, per-guild-peer, main)
+  --model <model>                Override model
+  --max-tokens <n>               Override max tokens
+  --compact-threshold <n>        Override compact threshold
+  --compact-micro-age <n>        Override compact micro age
 
-In a group chat, creates a guild-level (T2) binding.
-In a private chat, creates a peer-level (T1) binding.
+In a group chat, /bind creates a guild-level (T2) binding.
+In a private chat, /bind creates a peer-level (T1) binding.
 Bindings persist across restarts in .pip/agents/bindings.json."""
 
+
+def _cmd_help(ctx: CommandContext, args: str) -> CommandResult:
+    return CommandResult(handled=True, response=_HELP_TEXT)
+
+
+# ---------------------------------------------------------------------------
+# /bind
+# ---------------------------------------------------------------------------
 
 def _persist_agent_md(cfg: AgentConfig, agents_dir: Path | None) -> None:
     """Write an AgentConfig to its .md file."""
@@ -133,9 +150,9 @@ def _auto_create_agent(
     return cfg, None
 
 
-def _cmd_init(ctx: CommandContext, args: str) -> CommandResult:
-    if not args.strip() or args.strip() == "--help":
-        return CommandResult(handled=True, response=_INIT_HELP)
+def _cmd_bind(ctx: CommandContext, args: str) -> CommandResult:
+    if not args.strip():
+        return CommandResult(handled=True, response="Usage: /bind <agent-id> [options]\nType /help for details.")
 
     try:
         tokens = shlex.split(args)
@@ -152,14 +169,12 @@ def _cmd_init(ctx: CommandContext, args: str) -> CommandResult:
             return CommandResult(handled=True, response=err)
         created_new = True
 
-    _KNOWN_FLAGS = {"name", "scope", "model", "max_tokens", "compact_threshold", "compact_micro_age"}
+    _KNOWN_FLAGS = {"scope", "model", "max_tokens", "compact_threshold", "compact_micro_age"}
 
     overrides: dict[str, Any] = {}
     i = 1
     while i < len(tokens):
         tok = tokens[i]
-        if tok == "--help":
-            return CommandResult(handled=True, response=_INIT_HELP)
         if tok.startswith("--"):
             key = tok.lstrip("-").replace("-", "_")
             if key not in {k.replace("-", "_") for k in _KNOWN_FLAGS}:
@@ -170,13 +185,6 @@ def _cmd_init(ctx: CommandContext, args: str) -> CommandResult:
             i += 2
         else:
             return CommandResult(handled=True, response=f"Unknown option: {tok}")
-
-    agent_name = overrides.pop("name", None)
-    if agent_name:
-        from dataclasses import replace as _replace
-        agent = _replace(agent, name=agent_name)
-        ctx.registry.register_agent(agent)
-        _persist_agent_md(agent, ctx.registry.agents_dir)
 
     inbound = ctx.inbound
     if inbound.is_group and inbound.guild_id:
@@ -216,21 +224,61 @@ def _cmd_init(ctx: CommandContext, args: str) -> CommandResult:
 
 
 # ---------------------------------------------------------------------------
+# /name
+# ---------------------------------------------------------------------------
+
+def _cmd_name(ctx: CommandContext, args: str) -> CommandResult:
+    new_name = args.strip()
+    if not new_name:
+        return CommandResult(handled=True, response="Usage: /name <display_name>")
+
+    inbound = ctx.inbound
+    agent_id, _ = ctx.bindings.resolve(
+        channel=inbound.channel,
+        account_id=inbound.account_id,
+        guild_id=inbound.guild_id,
+        peer_id=inbound.peer_id,
+    )
+    if not agent_id:
+        agent_id = ctx.registry.default_agent().id
+
+    agent = ctx.registry.get_agent(agent_id)
+    if not agent:
+        return CommandResult(handled=True, response="No agent found for this context.")
+
+    from dataclasses import replace as _replace
+    agent = _replace(agent, name=new_name)
+    ctx.registry.register_agent(agent)
+    _persist_agent_md(agent, ctx.registry.agents_dir)
+
+    return CommandResult(
+        handled=True,
+        response=f"Agent '{agent_id}' renamed to **{new_name}**.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# /unbind
+# ---------------------------------------------------------------------------
+
+def _cmd_unbind(ctx: CommandContext, args: str) -> CommandResult:
+    inbound = ctx.inbound
+    if inbound.is_group and inbound.guild_id:
+        removed = ctx.bindings.remove("guild_id", inbound.guild_id)
+    else:
+        removed = ctx.bindings.remove("peer_id", inbound.peer_id)
+
+    if removed:
+        ctx.bindings.save(ctx.bindings_path)
+        return CommandResult(handled=True, response="Binding removed. Falling back to default agent.")
+    return CommandResult(handled=True, response="No binding found for this context.")
+
+
+# ---------------------------------------------------------------------------
 # /clear
 # ---------------------------------------------------------------------------
 
 def _cmd_clear(ctx: CommandContext, args: str) -> CommandResult:
-    sub = args.strip().lower()
-    if not sub or sub == "binding":
-        return _clear_binding(ctx)
-    if sub == "history":
-        return CommandResult(handled=True, response="/clear history — not yet implemented")
-    if sub == "all":
-        return _clear_all(ctx)
-    return CommandResult(handled=True, response=f"Unknown: /clear {sub}. Try: binding, history, all")
-
-
-def _clear_all(ctx: CommandContext) -> CommandResult:
     """Remove current chat's binding and delete its bound agent (except default)."""
     inbound = ctx.inbound
     if inbound.is_group and inbound.guild_id:
@@ -264,19 +312,6 @@ def _clear_all(ctx: CommandContext) -> CommandResult:
 
     lines.append("Falling back to default agent.")
     return CommandResult(handled=True, response="\n".join(lines))
-
-
-def _clear_binding(ctx: CommandContext) -> CommandResult:
-    inbound = ctx.inbound
-    if inbound.is_group and inbound.guild_id:
-        removed = ctx.bindings.remove("guild_id", inbound.guild_id)
-    else:
-        removed = ctx.bindings.remove("peer_id", inbound.peer_id)
-
-    if removed:
-        ctx.bindings.save(ctx.bindings_path)
-        return CommandResult(handled=True, response="Binding removed. Falling back to default agent.")
-    return CommandResult(handled=True, response="No binding found for this context.")
 
 
 # ---------------------------------------------------------------------------

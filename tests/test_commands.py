@@ -111,25 +111,36 @@ class TestDispatchCommand:
 
 
 # ---------------------------------------------------------------------------
-# /init
+# /help
 # ---------------------------------------------------------------------------
 
-class TestInit:
+class TestHelp:
     def test_help(self, registry, bindings_path):
-        ctx = _make_ctx("/init --help", registry, bindings_path)
+        ctx = _make_ctx("/help", registry, bindings_path)
         result = dispatch_command(ctx)
         assert result.handled is True
-        assert "Usage" in result.response
+        assert "/bind" in result.response
+        assert "/name" in result.response
+        assert "/unbind" in result.response
+        assert "/clear" in result.response
+        assert "/status" in result.response
+        assert "/exit" in result.response
 
+
+# ---------------------------------------------------------------------------
+# /bind
+# ---------------------------------------------------------------------------
+
+class TestBind:
     def test_no_args(self, registry, bindings_path):
-        ctx = _make_ctx("/init", registry, bindings_path)
+        ctx = _make_ctx("/bind", registry, bindings_path)
         result = dispatch_command(ctx)
         assert result.handled is True
-        assert "Usage" in result.response
+        assert "usage" in result.response.lower()
 
     def test_bind_guild(self, registry, bindings_path):
         ctx = _make_ctx(
-            "/init pm-bot", registry, bindings_path,
+            "/bind pm-bot", registry, bindings_path,
             guild_id="g1", is_group=True,
         )
         result = dispatch_command(ctx)
@@ -142,7 +153,7 @@ class TestInit:
         assert aid == "pm-bot"
 
     def test_bind_peer(self, registry, bindings_path):
-        ctx = _make_ctx("/init pip-boy", registry, bindings_path, peer_id="u2")
+        ctx = _make_ctx("/bind pip-boy", registry, bindings_path, peer_id="u2")
         result = dispatch_command(ctx)
         assert result.handled is True
         assert "Pip-Boy" in result.response
@@ -154,7 +165,7 @@ class TestInit:
 
     def test_auto_create_agent(self, registry, bindings_path):
         ctx = _make_ctx(
-            "/init new-bot", registry, bindings_path,
+            "/bind new-bot", registry, bindings_path,
             guild_id="g3", is_group=True,
         )
         result = dispatch_command(ctx)
@@ -173,7 +184,7 @@ class TestInit:
 
     def test_with_overrides(self, registry, bindings_path):
         ctx = _make_ctx(
-            "/init pm-bot --model gpt-4o --scope main --max-tokens 2048",
+            "/bind pm-bot --model gpt-4o --scope main --max-tokens 2048",
             registry, bindings_path,
             guild_id="g2", is_group=True,
         )
@@ -189,20 +200,20 @@ class TestInit:
         assert binding.overrides["max_tokens"] == "2048"
 
     def test_unknown_flag(self, registry, bindings_path):
-        ctx = _make_ctx("/init pm-bot --bogus", registry, bindings_path)
+        ctx = _make_ctx("/bind pm-bot --bogus", registry, bindings_path)
         result = dispatch_command(ctx)
         assert result.handled is True
         assert "Unknown" in result.response
 
     def test_replaces_existing_binding(self, registry, bindings_path):
         ctx1 = _make_ctx(
-            "/init pip-boy", registry, bindings_path,
+            "/bind pip-boy", registry, bindings_path,
             guild_id="g1", is_group=True,
         )
         dispatch_command(ctx1)
 
         ctx2 = _make_ctx(
-            "/init pm-bot", registry, bindings_path,
+            "/bind pm-bot", registry, bindings_path,
             guild_id="g1", is_group=True,
         )
         ctx2.bindings.load(bindings_path)
@@ -215,19 +226,74 @@ class TestInit:
 
 
 # ---------------------------------------------------------------------------
-# /clear
+# /name
 # ---------------------------------------------------------------------------
 
-class TestClear:
-    def test_clear_binding(self, registry, bindings_path):
+class TestName:
+    def test_name_no_args(self, registry, bindings_path):
+        ctx = _make_ctx("/name", registry, bindings_path)
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        assert "usage" in result.response.lower()
+
+    def test_name_default_agent(self, registry, bindings_path):
+        ctx = _make_ctx("/name NewPip", registry, bindings_path)
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        assert "NewPip" in result.response
+        agent = registry.get_agent("pip-boy")
+        assert agent.name == "NewPip"
+
+    def test_name_bound_agent(self, registry, bindings_path):
         ctx = _make_ctx(
-            "/init pm-bot", registry, bindings_path,
+            "/bind pm-bot", registry, bindings_path,
             guild_id="g1", is_group=True,
         )
         dispatch_command(ctx)
 
         ctx2 = _make_ctx(
-            "/clear binding", registry, bindings_path,
+            "/name 产品助手", registry, bindings_path,
+            guild_id="g1", is_group=True,
+        )
+        ctx2.bindings.load(bindings_path)
+        result = dispatch_command(ctx2)
+        assert result.handled is True
+        assert "产品助手" in result.response
+        assert registry.get_agent("pm-bot").name == "产品助手"
+
+    def test_name_persists_to_file(self, registry, bindings_path):
+        ctx = _make_ctx(
+            "/bind pm-bot", registry, bindings_path,
+            guild_id="g1", is_group=True,
+        )
+        dispatch_command(ctx)
+
+        ctx2 = _make_ctx(
+            "/name Alice", registry, bindings_path,
+            guild_id="g1", is_group=True,
+        )
+        ctx2.bindings.load(bindings_path)
+        dispatch_command(ctx2)
+
+        md_path = registry.agents_dir / "pm-bot.md"
+        content = md_path.read_text(encoding="utf-8")
+        assert "name: Alice" in content
+
+
+# ---------------------------------------------------------------------------
+# /unbind
+# ---------------------------------------------------------------------------
+
+class TestUnbind:
+    def test_unbind_removes_binding(self, registry, bindings_path):
+        ctx = _make_ctx(
+            "/bind pm-bot", registry, bindings_path,
+            guild_id="g1", is_group=True,
+        )
+        dispatch_command(ctx)
+
+        ctx2 = _make_ctx(
+            "/unbind", registry, bindings_path,
             guild_id="g1", is_group=True,
         )
         ctx2.bindings.load(bindings_path)
@@ -235,17 +301,51 @@ class TestClear:
         assert result.handled is True
         assert "removed" in result.response.lower()
 
-    def test_clear_no_binding(self, registry, bindings_path):
-        ctx = _make_ctx("/clear", registry, bindings_path)
+    def test_unbind_no_binding(self, registry, bindings_path):
+        ctx = _make_ctx("/unbind", registry, bindings_path)
         result = dispatch_command(ctx)
         assert result.handled is True
         assert "no binding" in result.response.lower()
 
-    def test_clear_history_stub(self, registry, bindings_path):
-        ctx = _make_ctx("/clear history", registry, bindings_path)
+
+# ---------------------------------------------------------------------------
+# /clear
+# ---------------------------------------------------------------------------
+
+class TestClear:
+    def test_clear_deletes_agent(self, registry, bindings_path):
+        ctx = _make_ctx(
+            "/bind new-bot", registry, bindings_path,
+            guild_id="g1", is_group=True,
+        )
+        dispatch_command(ctx)
+        assert registry.get_agent("new-bot") is not None
+
+        ctx2 = _make_ctx(
+            "/clear", registry, bindings_path,
+            guild_id="g1", is_group=True,
+        )
+        ctx2.bindings.load(bindings_path)
+        result = dispatch_command(ctx2)
+        assert result.handled is True
+        assert "deleted" in result.response.lower()
+        assert registry.get_agent("new-bot") is None
+
+        md_path = registry.agents_dir / "new-bot.md"
+        assert not md_path.exists()
+
+    def test_clear_default_not_deleted(self, registry, bindings_path):
+        ctx = _make_ctx("/clear", registry, bindings_path)
         result = dispatch_command(ctx)
         assert result.handled is True
-        assert "not yet" in result.response.lower()
+        assert "default" in result.response.lower()
+        assert registry.get_agent("pip-boy") is not None
+
+    def test_clear_no_binding(self, registry, bindings_path):
+        ctx = _make_ctx("/clear", registry, bindings_path, peer_id="nobody")
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        assert "no binding" in result.response.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +361,7 @@ class TestStatus:
 
     def test_status_with_binding(self, registry, bindings_path):
         ctx = _make_ctx(
-            "/init pm-bot", registry, bindings_path,
+            "/bind pm-bot", registry, bindings_path,
             guild_id="g1", is_group=True,
         )
         dispatch_command(ctx)
