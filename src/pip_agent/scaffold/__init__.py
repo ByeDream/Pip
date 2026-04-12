@@ -18,13 +18,14 @@ def ensure_workspace(workdir: Path) -> None:
     _ensure_dirs(workdir)
     _ensure_agents_md(workdir)
     _ensure_copy(workdir / ".pip" / "models.json", "models.json")
+    _ensure_copy(workdir / ".pip" / "agents" / "pip-boy.md", "pip-boy.md")
     _ensure_copy(workdir / ".env", "env.example")
     _ensure_gitignore(workdir)
     _check_git(workdir)
 
 
 def _ensure_dirs(workdir: Path) -> None:
-    for rel in (".pip", ".pip/team", ".pip/skills"):
+    for rel in (".pip", ".pip/team", ".pip/skills", ".pip/agents"):
         d = workdir / rel
         d.mkdir(parents=True, exist_ok=True)
         logger.debug("Directory ensured: %s", d)

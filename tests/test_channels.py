@@ -15,7 +15,6 @@ from pip_agent.channels import (
     CLIChannel,
     InboundMessage,
     WeChatChannel,
-    build_session_key,
 )
 
 
@@ -40,21 +39,6 @@ class TestInboundMessage:
         )
         assert m.channel == "wechat"
         assert m.raw["seq"] == 1
-
-
-# ---------------------------------------------------------------------------
-# build_session_key
-# ---------------------------------------------------------------------------
-
-class TestBuildSessionKey:
-    def test_cli(self):
-        assert build_session_key("cli", "cli-user") == "cli:cli-user"
-
-    def test_wechat(self):
-        assert build_session_key("wechat", "abc@im.wechat") == "wechat:abc@im.wechat"
-
-    def test_wecom(self):
-        assert build_session_key("wecom", "chat123") == "wecom:chat123"
 
 
 # ---------------------------------------------------------------------------

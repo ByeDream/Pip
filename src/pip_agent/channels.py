@@ -33,13 +33,11 @@ class InboundMessage:
     text: str
     sender_id: str
     channel: str = ""           # "cli", "wechat", "wecom"
-    peer_id: str = ""           # conversation scope key
+    peer_id: str = ""           # conversation scope key (user id for DMs)
+    guild_id: str = ""          # group/guild id (e.g. WeCom chatid)
+    account_id: str = ""        # bot account id (for T3 routing)
     is_group: bool = False
     raw: dict = field(default_factory=dict)
-
-
-def build_session_key(channel: str, peer_id: str) -> str:
-    return f"{channel}:{peer_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +287,7 @@ class WeChatChannel(Channel):
                 sender_id=from_user,
                 channel="wechat",
                 peer_id=from_user,
+                account_id=self._account_id,
                 raw=msg,
             ))
 
@@ -458,13 +457,18 @@ class WecomChannel(Channel):
                 sender_id = sender
 
             chat_id = body.get("chatid", "")
-            chat_type = body.get("chat_type", "")
+            chat_type = body.get("chattype", "") or body.get("chat_type", "")
             is_group = chat_type == "group"
+            guild_id = chat_id if is_group else ""
             peer_id = chat_id if chat_id else sender_id
 
             text = body.get("text", {}).get("content", "")
             if not text:
                 return
+
+            print(f"  [wecom:debug] chat_type={chat_type!r} chat_id={chat_id!r} "
+                  f"is_group={is_group} guild_id={guild_id!r} peer_id={peer_id!r} "
+                  f"sender_id={sender_id!r} from={body.get('from')!r}")
 
             self._pending_frames[peer_id] = frame
 
@@ -473,6 +477,8 @@ class WecomChannel(Channel):
                 sender_id=sender_id,
                 channel="wecom",
                 peer_id=peer_id,
+                guild_id=guild_id,
+                account_id=self._bot_id,
                 is_group=is_group,
                 raw=frame,
             )

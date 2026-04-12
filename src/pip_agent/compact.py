@@ -174,11 +174,14 @@ def summarize_messages(
     messages: list[dict],
     system_prompt: str,
     profiler: Profiler | None = None,
+    model: str = "",
 ) -> tuple[str, int, int]:
     """Call the LLM to produce a conversation summary.
 
     Returns (summary_text, input_tokens, output_tokens).
     """
+    if not model:
+        model = settings.model
     transcript = _format_for_summary(messages)
     prompt = (
         f"Here is the conversation transcript to summarize:\n\n"
@@ -191,7 +194,7 @@ def summarize_messages(
         profiler.start("api:compact")
 
     response = client.messages.create(
-        model=settings.model,
+        model=model,
         max_tokens=2048,
         system=SUMMARY_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],

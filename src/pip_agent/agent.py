@@ -17,10 +17,10 @@ from pip_agent.channels import (
     InboundMessage,
     WeChatChannel,
     WecomChannel,
-    build_session_key,
     wechat_poll_loop,
     wecom_ws_loop,
 )
+from pip_agent.commands import CommandContext, CommandResult, dispatch_command
 from pip_agent.compact import (
     auto_compact,
     estimate_tokens,
@@ -28,6 +28,12 @@ from pip_agent.compact import (
 )
 from pip_agent.config import settings
 from pip_agent.profiler import Profiler
+from pip_agent.routing import (
+    AgentRegistry,
+    BindingTable,
+    build_session_key,
+    resolve_effective_config,
+)
 from pip_agent.skills import SkillRegistry
 from pip_agent.task_graph import PlanManager
 from pip_agent.team import TeamManager
@@ -57,11 +63,8 @@ try:
 except ImportError:
     pass
 
-SYSTEM_PROMPT = (
-    f"You are Pip-Boy, a personal assistant agent. "
-    f"Your working directory is {WORKDIR}. "
-    f"Read AGENTS.md in your working directory before starting work."
-)
+AGENTS_DIR = WORKDIR / ".pip" / "agents"
+BINDINGS_PATH = AGENTS_DIR / "bindings.json"
 
 NAG_THRESHOLD = 3
 
@@ -107,6 +110,10 @@ def agent_loop(
     *,
     tools: list[dict],
     system_prompt: str,
+    model: str = "",
+    max_tokens: int = 0,
+    compact_threshold: int = 0,
+    compact_micro_age: int = 0,
     skill_registry: SkillRegistry | None = None,
     transcripts_dir: Path | None = None,
     bg_manager: BackgroundTaskManager | None = None,
@@ -116,13 +123,19 @@ def agent_loop(
     peer_id: str = "",
 ) -> str | None:
     """Run one agent turn.  Returns the final assistant text (if any)."""
+    from pip_agent.routing import DEFAULT_COMPACT_THRESHOLD, DEFAULT_MAX_TOKENS, DEFAULT_MODEL
+
+    effective_model = model or DEFAULT_MODEL
+    effective_max_tokens = max_tokens or DEFAULT_MAX_TOKENS
+    effective_compact_threshold = compact_threshold or DEFAULT_COMPACT_THRESHOLD
+
     messages.append({"role": "user", "content": user_input})
     rounds_since_todo = 0
     last_input_tokens = 0
     final_text: str | None = None
 
     while True:
-        micro_compact(messages)
+        micro_compact(messages, max_age=compact_micro_age or None)
 
         if bg_manager is not None:
             notifications = bg_manager.drain()
@@ -143,7 +156,7 @@ def agent_loop(
                                 f"\n{n.result}\n</background-result>"
                             ),
                         })
-                        profiler.record(f"bg:bash", n.elapsed_ms)
+                        profiler.record("bg:bash", n.elapsed_ms)
 
         if team_manager is not None:
             inbox = team_manager.read_inbox()
@@ -171,14 +184,14 @@ def agent_loop(
                             ),
                         })
 
-        if transcripts_dir is not None and estimate_tokens(messages) > settings.compact_threshold:
+        if transcripts_dir is not None and estimate_tokens(messages) > effective_compact_threshold:
             auto_compact(client, messages, system_prompt, transcripts_dir, profiler)
 
         profiler.start("api")
         try:
             response = client.messages.create(
-                model=settings.model,
-                max_tokens=settings.max_tokens,
+                model=effective_model,
+                max_tokens=effective_max_tokens,
                 system=system_prompt,
                 tools=tools,
                 messages=messages,
@@ -249,7 +262,7 @@ def agent_loop(
                 )
             messages.append({"role": "user", "content": tool_results})
 
-            if compact_requested or last_input_tokens > settings.compact_threshold:
+            if compact_requested or last_input_tokens > effective_compact_threshold:
                 if settings.verbose:
                     reason = "tool:compact" if compact_requested else f"input_tokens={last_input_tokens}"
                     print(f"  [context] auto_compact triggered ({reason})")
@@ -274,8 +287,9 @@ def _process_inbound(
     profiler: Profiler,
     plan_manager: PlanManager,
     *,
+    registry: AgentRegistry,
+    binding_table: BindingTable,
     tools: list[dict],
-    system_prompt: str,
     skill_registry: SkillRegistry | None = None,
     transcripts_dir: Path | None = None,
     bg_manager: BackgroundTaskManager | None = None,
@@ -283,10 +297,49 @@ def _process_inbound(
     worktree_manager: WorktreeManager | None = None,
 ) -> None:
     """Run agent_loop for one InboundMessage and route the reply."""
-    sk = build_session_key(inbound.channel, inbound.peer_id)
+    agent_id, binding = binding_table.resolve(
+        channel=inbound.channel,
+        account_id=inbound.account_id,
+        guild_id=inbound.guild_id,
+        peer_id=inbound.peer_id,
+    )
+    if not agent_id:
+        agent_id = registry.default_agent().id
+
+    agent_cfg = registry.get_agent(agent_id)
+    if not agent_cfg:
+        agent_cfg = registry.default_agent()
+
+    effective = resolve_effective_config(agent_cfg, binding)
+
+    if settings.verbose:
+        print(
+            f"  [route] agent={effective.id!r} model={effective.effective_model!r}"
+            f" binding={binding!r}"
+        )
+
+    sk = build_session_key(
+        agent_id=effective.id,
+        channel=inbound.channel,
+        peer_id=inbound.peer_id,
+        guild_id=inbound.guild_id,
+        is_group=inbound.is_group,
+        dm_scope=effective.effective_dm_scope,
+    )
     if sk not in conversations:
         conversations[sk] = []
     messages = conversations[sk]
+
+    system_prompt = effective.system_prompt(workdir=str(WORKDIR))
+    if skill_registry and skill_registry.available:
+        system_prompt += "\n\n" + skill_registry.catalog_prompt()
+
+    user_input = inbound.text
+    if inbound.is_group:
+        user_input = (
+            f'<group-message from="{inbound.sender_id}">'
+            f"\n{inbound.text}\n</group-message>"
+        )
 
     if inbound.channel == "wechat":
         wc = channel_mgr.get("wechat")
@@ -294,23 +347,30 @@ def _process_inbound(
             wc.send_typing(inbound.peer_id)
 
     ch = channel_mgr.get(inbound.channel)
+    reply_peer = inbound.peer_id
+    if inbound.is_group and inbound.guild_id:
+        reply_peer = inbound.guild_id
 
     try:
         reply_text = agent_loop(
             client,
             messages,
-            inbound.text,
+            user_input,
             profiler,
             plan_manager,
             tools=tools,
             system_prompt=system_prompt,
+            model=effective.effective_model,
+            max_tokens=effective.effective_max_tokens,
+            compact_threshold=effective.effective_compact_threshold,
+            compact_micro_age=effective.effective_compact_micro_age,
             skill_registry=skill_registry,
             transcripts_dir=transcripts_dir,
             bg_manager=bg_manager,
             team_manager=team_manager,
             worktree_manager=worktree_manager,
             channel=ch,
-            peer_id=inbound.peer_id,
+            peer_id=reply_peer,
         )
     except KeyboardInterrupt:
         print("\n  [interrupted] Returning to prompt.")
@@ -321,7 +381,7 @@ def _process_inbound(
 
     if reply_text:
         if ch:
-            if not ch.send(inbound.peer_id, reply_text):
+            if not ch.send(reply_peer, reply_text):
                 print(f"  [warning] Failed to send reply via {inbound.channel}, "
                       f"printing to terminal instead:")
                 print(reply_text)
@@ -363,6 +423,13 @@ def run(mode: str = "auto") -> None:
     ensure_workspace(WORKDIR)
     settings.check_required()
 
+    # -- Routing setup --
+    registry = AgentRegistry(AGENTS_DIR)
+    binding_table = BindingTable()
+    binding_table.load(BINDINGS_PATH)
+
+    default_agent = registry.default_agent()
+
     client_kwargs: dict = {"api_key": settings.anthropic_api_key}
     if settings.anthropic_base_url:
         client_kwargs["base_url"] = settings.anthropic_base_url
@@ -390,10 +457,8 @@ def run(mode: str = "auto") -> None:
 
     tools: list[dict] = tools_for_role("lead")
     team_manager.patch_model_enum(tools)
-    system_prompt = SYSTEM_PROMPT
     if skill_registry.available:
         tools.append(skill_registry.tool_schema())
-        system_prompt += "\n\n" + skill_registry.catalog_prompt()
 
     # -- Channel setup --
     channel_mgr = ChannelManager()
@@ -456,25 +521,33 @@ def run(mode: str = "auto") -> None:
         except Exception as exc:
             print(f"  [wecom] Init failed: {exc}")
 
+    agents_list = ", ".join(a.id for a in registry.list_agents())
     print(
         "============================================\n"
         "  ROBCO INDUSTRIES (TM) TERMLINK PROTOCOL\n"
         "  PIP-BOY 3000 MARK IV\n"
         "  Personal Assistant Module v0.1.0\n"
         "============================================\n"
-        "  Welcome, Vault Dweller. Type 'exit' to\n"
+        "  Welcome, Vault Dweller. Type '/exit' to\n"
         "  power down.\n"
         f"  Channels: {', '.join(channel_mgr.list_channels())}\n"
+        f"  Agents: {agents_list}\n"
         "============================================"
     )
 
     conversations: dict[str, list[dict]] = {}
-    cli_session_key = build_session_key("cli", "cli-user")
+    cli_session_key = build_session_key(
+        agent_id=default_agent.id,
+        channel="cli",
+        peer_id="cli-user",
+        dm_scope=default_agent.effective_dm_scope,
+    )
     conversations[cli_session_key] = []
 
     common_kwargs = dict(
+        registry=registry,
+        binding_table=binding_table,
         tools=tools,
-        system_prompt=system_prompt,
         skill_registry=skill_registry,
         transcripts_dir=transcripts_dir,
         bg_manager=bg_manager,
@@ -499,6 +572,32 @@ def run(mode: str = "auto") -> None:
                 msg_queue.clear()
 
             for inbound in batch:
+                # -- Unified slash command dispatch (all channels) --
+                if settings.verbose:
+                    print(f"  [dispatch] channel={inbound.channel} text={inbound.text!r}")
+                cmd_ctx = CommandContext(
+                    inbound=inbound,
+                    registry=registry,
+                    bindings=binding_table,
+                    bindings_path=BINDINGS_PATH,
+                    workdir=str(WORKDIR),
+                )
+                result = dispatch_command(cmd_ctx)
+                if settings.verbose:
+                    print(f"  [dispatch] handled={result.handled} response={result.response!r}")
+                if result.handled:
+                    if result.response:
+                        ch = channel_mgr.get(inbound.channel)
+                        if ch:
+                            target = inbound.guild_id if inbound.is_group and inbound.guild_id else inbound.peer_id
+                            ok = ch.send(target, result.response)
+                            if settings.verbose:
+                                print(f"  [dispatch] send to={target!r} ok={ok}")
+                    if result.exit_requested:
+                        stop_event.set()
+                    continue
+
+                # -- Legacy CLI-only commands --
                 if inbound.channel == "cli":
                     if inbound.text.lower() == "exit":
                         stop_event.set()
@@ -527,8 +626,8 @@ def run(mode: str = "auto") -> None:
                     finally:
                         poll_pause.clear()
                 else:
-                    sk = build_session_key(inbound.channel, inbound.peer_id)
-                    remote_buffers.setdefault(sk, []).append(inbound)
+                    buf_key = f"{inbound.channel}:{inbound.guild_id or inbound.peer_id}"
+                    remote_buffers.setdefault(buf_key, []).append(inbound)
 
             if stop_event.is_set():
                 break
@@ -558,6 +657,9 @@ def run(mode: str = "auto") -> None:
                             sender_id=first.sender_id,
                             channel=first.channel,
                             peer_id=first.peer_id,
+                            guild_id=first.guild_id,
+                            account_id=first.account_id,
+                            is_group=first.is_group,
                         )
                         _process_inbound(
                             combined, conversations, channel_mgr, client, profiler,
@@ -602,6 +704,9 @@ def run(mode: str = "auto") -> None:
     else:
         # CLI-only mode: original blocking REPL (preserves readline, etc.)
         messages = conversations[cli_session_key]
+        cli_system_prompt = default_agent.system_prompt(workdir=str(WORKDIR))
+        if skill_registry.available:
+            cli_system_prompt += "\n\n" + skill_registry.catalog_prompt()
 
         while True:
             try:
@@ -611,11 +716,38 @@ def run(mode: str = "auto") -> None:
                 team_manager.deactivate_all()
                 break
 
+            if not user_input:
+                continue
+
+            # -- Unified slash command dispatch --
+            if user_input.startswith("/"):
+                cli_inbound = InboundMessage(
+                    text=user_input,
+                    sender_id="cli-user",
+                    channel="cli",
+                    peer_id="cli-user",
+                )
+                cmd_ctx = CommandContext(
+                    inbound=cli_inbound,
+                    registry=registry,
+                    bindings=binding_table,
+                    bindings_path=BINDINGS_PATH,
+                    workdir=str(WORKDIR),
+                )
+                result = dispatch_command(cmd_ctx)
+                if result.handled:
+                    if result.response:
+                        print(result.response)
+                    if result.exit_requested:
+                        team_manager.deactivate_all()
+                        break
+                    continue
+
+            # -- Legacy bare 'exit' compat --
             if user_input.lower() == "exit":
                 team_manager.deactivate_all()
                 break
-            if not user_input:
-                continue
+
             if user_input == "/team":
                 print(team_manager.status())
                 continue
@@ -631,9 +763,19 @@ def run(mode: str = "auto") -> None:
                     user_input,
                     profiler,
                     plan_manager,
+                    tools=tools,
+                    system_prompt=cli_system_prompt,
+                    model=default_agent.effective_model,
+                    max_tokens=default_agent.effective_max_tokens,
+                    compact_threshold=default_agent.effective_compact_threshold,
+                    compact_micro_age=default_agent.effective_compact_micro_age,
                     channel=cli_channel,
                     peer_id="cli-user",
-                    **common_kwargs,
+                    skill_registry=skill_registry,
+                    transcripts_dir=transcripts_dir,
+                    bg_manager=bg_manager,
+                    team_manager=team_manager,
+                    worktree_manager=worktree_manager,
                 )
             except KeyboardInterrupt:
                 print("\n  [interrupted] Returning to prompt.")
