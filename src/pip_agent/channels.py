@@ -416,10 +416,21 @@ class WecomChannel(Channel):
         """Create WSClient, register handlers, run in current thread's event loop."""
         import asyncio
 
+        class _QuietLogger:
+            def debug(self, msg: str, *args: object) -> None:
+                pass
+            def info(self, msg: str, *args: object) -> None:
+                log.info("[AiBotSDK] %s", msg)
+            def warn(self, msg: str, *args: object) -> None:
+                log.warning("[AiBotSDK] %s", msg)
+            def error(self, msg: str, *args: object) -> None:
+                log.error("[AiBotSDK] %s", msg)
+
         self._ws_client = WSClient(
             WSClientOptions(
                 bot_id=self._bot_id,
                 secret=self._bot_secret,
+                logger=_QuietLogger(),
             )
         )
         ws = self._ws_client
