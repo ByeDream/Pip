@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -11,6 +12,7 @@ import anthropic
 
 from pip_agent.background import BackgroundTaskManager
 from pip_agent.channels import (
+    Attachment,
     Channel,
     ChannelManager,
     CLIChannel,
@@ -74,6 +76,7 @@ _TOOL_KEY_PARAM: dict[str, str] = {
     "write": "file_path",
     "edit": "file_path",
     "glob": "pattern",
+    "grep": "pattern",
     "web_search": "query",
     "web_fetch": "url",
     "load_skill": "name",
@@ -104,7 +107,7 @@ def _tool_summary(name: str, inputs: dict) -> str:
 def agent_loop(
     client: anthropic.Anthropic,
     messages: list[dict],
-    user_input: str,
+    user_input: str | list,
     profiler: Profiler,
     plan_manager: PlanManager,
     *,
@@ -185,7 +188,17 @@ def agent_loop(
                         })
 
         if transcripts_dir is not None and estimate_tokens(messages) > effective_compact_threshold:
+            current_input = messages[-1]["content"] if messages[-1]["role"] == "user" else None
+            has_media = isinstance(current_input, list) and any(
+                isinstance(b, dict) and b.get("type") not in ("text", "tool_result")
+                for b in current_input
+            )
             auto_compact(client, messages, system_prompt, transcripts_dir, profiler)
+            if has_media and current_input is not None:
+                summary_text = messages[0]["content"]
+                blocks: list[dict] = [{"type": "text", "text": summary_text}]
+                blocks.extend(current_input)
+                messages[0]["content"] = blocks
 
         profiler.start("api")
         try:
@@ -334,12 +347,46 @@ def _process_inbound(
     if skill_registry and skill_registry.available:
         system_prompt += "\n\n" + skill_registry.catalog_prompt()
 
-    user_input = inbound.text
+    user_input: str | list = inbound.text
     if inbound.is_group:
         user_input = (
             f'<group-message from="{inbound.sender_id}">'
             f"\n{inbound.text}\n</group-message>"
         )
+
+    if inbound.attachments:
+        content_blocks: list[dict] = []
+        if user_input:
+            content_blocks.append({"type": "text", "text": user_input})
+        for att in inbound.attachments:
+            if att.type == "image" and att.data:
+                content_blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": att.mime_type or "image/jpeg",
+                        "data": base64.b64encode(att.data).decode(),
+                    },
+                })
+            elif att.type == "image":
+                content_blocks.append({"type": "text", "text": att.text or "[Image]"})
+            elif att.type == "file" and att.text:
+                content_blocks.append({
+                    "type": "text",
+                    "text": f'<attached-file name="{att.filename}">\n{att.text}\n</attached-file>',
+                })
+            elif att.type == "file":
+                content_blocks.append({
+                    "type": "text",
+                    "text": f"[File: {att.filename}] (binary, cannot display)",
+                })
+            elif att.type == "voice":
+                content_blocks.append({
+                    "type": "text",
+                    "text": f"[Voice transcription]: {att.text}" if att.text else "[Voice message]",
+                })
+        if content_blocks:
+            user_input = content_blocks
 
     if inbound.channel == "wechat":
         wc = channel_mgr.get("wechat")
@@ -652,14 +699,18 @@ def run(mode: str = "auto") -> None:
                         remote_buffers[sk] = []
                         first = msgs[0]
 
+                        all_atts: list[Attachment] = []
+                        for m in msgs:
+                            all_atts.extend(m.attachments)
                         combined = InboundMessage(
-                            text="\n".join(m.text for m in msgs),
+                            text="\n".join(m.text for m in msgs if m.text),
                             sender_id=first.sender_id,
                             channel=first.channel,
                             peer_id=first.peer_id,
                             guild_id=first.guild_id,
                             account_id=first.account_id,
                             is_group=first.is_group,
+                            attachments=all_atts,
                         )
                         _process_inbound(
                             combined, conversations, channel_mgr, client, profiler,

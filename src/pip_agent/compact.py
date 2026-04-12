@@ -66,6 +66,8 @@ def _format_for_summary(messages: list[dict]) -> str:
                         parts.append(f"  [tool_result] {text}")
                     elif block.get("type") == "text":
                         parts.append(block.get("text", ""))
+                    elif block.get("type") == "image":
+                        parts.append("[Image attached]")
                     elif block.get("type") == "tool_use":
                         parts.append(
                             f"  [tool_use: {block.get('name', '?')}] "
@@ -107,10 +109,32 @@ PRESERVE_RESULT_TOOLS = {"read"}
 PRESERVE_RESULT_PREFIXES = ("task_",)
 
 
+_IMAGE_TOKEN_ESTIMATE = 1600  # Anthropic bills images by pixel area, not base64 size
+
+
 def estimate_tokens(messages: list[dict]) -> int:
-    """Rough token estimate: serialize to string, divide by 4."""
-    text = json.dumps(messages, default=str)
-    return len(text) // 4
+    """Rough token estimate: serialize to string, divide by 4.
+
+    Image blocks are counted as a fixed ~1600 tokens each (Anthropic's
+    average for a medium image) instead of the raw base64 string which
+    would massively over-count and trigger premature compaction.
+    """
+    image_count = 0
+
+    def _strip_images(obj: object) -> object:
+        nonlocal image_count
+        if isinstance(obj, dict):
+            if obj.get("type") == "image":
+                image_count += 1
+                return {"type": "image", "source": "(stripped)"}
+            return {k: _strip_images(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_strip_images(item) for item in obj]
+        return obj
+
+    stripped = _strip_images(messages)
+    text = json.dumps(stripped, default=str)
+    return len(text) // 4 + image_count * _IMAGE_TOKEN_ESTIMATE
 
 
 def micro_compact(messages: list[dict], *, max_age: int | None = None) -> int:

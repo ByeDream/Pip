@@ -144,6 +144,33 @@ GLOB_SCHEMA = {
     },
 }
 
+GREP_SCHEMA = {
+    "name": "grep",
+    "description": (
+        "Search file contents using regex. Returns matching lines with "
+        "file paths and line numbers. Useful for finding definitions, "
+        "references, and patterns across the codebase."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "Regex pattern to search for.",
+            },
+            "path": {
+                "type": "string",
+                "description": "Directory or file to search (relative). Default: '.'.",
+            },
+            "include": {
+                "type": "string",
+                "description": "Glob filter, e.g. '*.py'. Default: all files.",
+            },
+        },
+        "required": ["pattern"],
+    },
+}
+
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
     "description": "Search the web and return results with titles, URLs, and snippets.",
@@ -796,6 +823,63 @@ def run_glob(tool_input: dict, *, workdir: Path | None = None) -> str:
     return "\n".join(paths)
 
 
+_GREP_MAX_MATCHES = 100
+_GREP_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".pip"}
+_GREP_MAX_LINE_LEN = 500
+
+
+def run_grep(tool_input: dict, *, workdir: Path | None = None) -> str:
+    wd = workdir or WORKDIR
+    base = safe_path(tool_input.get("path", "."), workdir=workdir)
+    if not base.exists():
+        return f"Path not found: {tool_input.get('path', '.')}"
+
+    pattern_str = tool_input["pattern"]
+    try:
+        pattern = re.compile(pattern_str)
+    except re.error as e:
+        return f"Invalid regex: {e}"
+
+    include = tool_input.get("include", "")
+    matches: list[str] = []
+
+    def _search_file(fp: Path) -> None:
+        try:
+            text = fp.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, PermissionError):
+            return
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if len(matches) >= _GREP_MAX_MATCHES:
+                return
+            if pattern.search(line):
+                rel = str(fp.relative_to(wd))
+                display = line if len(line) <= _GREP_MAX_LINE_LEN else line[:_GREP_MAX_LINE_LEN] + "..."
+                matches.append(f"{rel}:{lineno}: {display}")
+
+    if base.is_file():
+        _search_file(base)
+    else:
+        for fp in sorted(base.rglob(include or "*")):
+            if len(matches) >= _GREP_MAX_MATCHES:
+                break
+            if any(part in _GREP_SKIP_DIRS for part in fp.parts):
+                continue
+            if fp.is_file():
+                try:
+                    if fp.stat().st_size > 2 * 1024 * 1024:
+                        continue
+                except OSError:
+                    continue
+                _search_file(fp)
+
+    if not matches:
+        return "(no matches)"
+    result = "\n".join(matches)
+    if len(matches) >= _GREP_MAX_MATCHES:
+        result += f"\n[truncated at {_GREP_MAX_MATCHES} matches]"
+    return result
+
+
 def _search_tavily(query: str, max_results: int) -> str:
     from tavily import TavilyClient  # type: ignore[import-untyped]
 
@@ -870,6 +954,7 @@ ALL_TOOLS = [
     WRITE_SCHEMA,
     EDIT_SCHEMA,
     GLOB_SCHEMA,
+    GREP_SCHEMA,
     WEB_SEARCH_SCHEMA,
     WEB_FETCH_SCHEMA,
     TASK_CREATE_SCHEMA,

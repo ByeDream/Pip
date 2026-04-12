@@ -9,6 +9,7 @@ WeCom (企业微信智能机器人 WebSocket SDK) without platform-specific logi
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import random
@@ -22,9 +23,34 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+
+def _detect_image_mime(data: bytes) -> str:
+    """Detect image MIME type from magic bytes. Falls back to image/jpeg."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:4] == b"GIF8":
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
 # ---------------------------------------------------------------------------
 # InboundMessage
 # ---------------------------------------------------------------------------
+
+@dataclass
+class Attachment:
+    """Media attachment carried alongside an InboundMessage."""
+
+    type: str                       # "image", "file", "voice"
+    data: bytes | None = None
+    filename: str = ""
+    mime_type: str = ""
+    text: str = ""                  # ASR transcription for voice, or text file content
+
 
 @dataclass
 class InboundMessage:
@@ -38,6 +64,7 @@ class InboundMessage:
     account_id: str = ""        # bot account id (for T3 routing)
     is_group: bool = False
     raw: dict = field(default_factory=dict)
+    attachments: list[Attachment] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +77,14 @@ class Channel(ABC):
     @abstractmethod
     def send(self, to: str, text: str, **kw: Any) -> bool:
         ...
+
+    def send_image(self, to: str, image_data: bytes, caption: str = "", **kw: Any) -> bool:
+        """Send an image. Subclasses override; default is no-op."""
+        return False
+
+    def send_file(self, to: str, file_data: bytes, filename: str = "", caption: str = "", **kw: Any) -> bool:
+        """Send a file. Subclasses override; default is no-op."""
+        return False
 
     def close(self) -> None:
         pass
@@ -411,6 +446,8 @@ class WecomChannel(Channel):
         self._ws_client: Any = None
         self._pending_frames: dict[str, Any] = {}
 
+    _DOWNLOAD_TIMEOUT = 30  # seconds
+
     def start(self, stop_event: threading.Event) -> None:
         """Create WSClient, register handlers, run in current thread's event loop."""
         import asyncio
@@ -434,6 +471,97 @@ class WecomChannel(Channel):
         )
         ws = self._ws_client
 
+        # -- helpers (closures) --
+
+        def _parse_frame(body: dict) -> tuple[str, str, bool, str, str]:
+            """Return (sender_id, peer_id, is_group, guild_id, chat_type)."""
+            sender = body.get("from", {})
+            if isinstance(sender, dict):
+                sender_id = sender.get("user_id", sender.get("open_id", ""))
+            elif isinstance(sender, str):
+                sender_id = sender
+            else:
+                sender_id = ""
+            chat_id = body.get("chatid", "")
+            chat_type = body.get("chattype", "") or body.get("chat_type", "")
+            is_group = chat_type == "group"
+            guild_id = chat_id if is_group else ""
+            peer_id = chat_id if chat_id else sender_id
+            return sender_id, peer_id, is_group, guild_id, chat_type
+
+        async def _download_media(url: str, aeskey: str | None = None) -> bytes | None:
+            try:
+                data, _ = await asyncio.wait_for(
+                    ws.download_file(url, aeskey),
+                    timeout=self._DOWNLOAD_TIMEOUT,
+                )
+                return data
+            except Exception as exc:
+                log.warning("wecom media download failed: %s", exc)
+                return None
+
+        async def _collect_quote_attachments(body: dict) -> list[Attachment]:
+            """Download media from a quoted (reply-to) message."""
+            quote = body.get("quote")
+            if not quote:
+                return []
+            atts: list[Attachment] = []
+            qt = quote.get("msgtype", "")
+            if qt == "image" and quote.get("image", {}).get("url"):
+                img = quote["image"]
+                data = await _download_media(img["url"], img.get("aeskey"))
+                atts.append(Attachment(
+                    type="image", data=data,
+                    mime_type=_detect_image_mime(data) if data else "",
+                    text="" if data else "[Quoted image]",
+                ))
+            elif qt == "file" and quote.get("file", {}).get("url"):
+                fi = quote["file"]
+                data = await _download_media(fi["url"], fi.get("aeskey"))
+                fname = fi.get("filename", "file")
+                text_content = ""
+                if data:
+                    try:
+                        text_content = data.decode("utf-8")
+                    except (UnicodeDecodeError, ValueError):
+                        pass
+                atts.append(Attachment(
+                    type="file", data=data, filename=fname, text=text_content,
+                ))
+            elif qt == "voice" and quote.get("voice", {}).get("content"):
+                atts.append(Attachment(
+                    type="voice", text=quote["voice"]["content"],
+                ))
+            elif qt == "text" and quote.get("text", {}).get("content"):
+                pass  # text quotes are handled naturally by the SDK
+            return atts
+
+        def _enqueue(frame: dict, text: str, attachments: list[Attachment]) -> None:
+            body = frame.get("body", {})
+            sender_id, peer_id, is_group, guild_id, chat_type = _parse_frame(body)
+            if not text and not attachments:
+                return
+            log.debug(
+                "wecom enqueue: type=%s peer=%s sender=%s atts=%d",
+                body.get("msgtype", "?"), peer_id, sender_id, len(attachments),
+            )
+            self._pending_frames[peer_id] = frame
+            msg = InboundMessage(
+                text=text,
+                sender_id=sender_id,
+                channel="wecom",
+                peer_id=peer_id,
+                guild_id=guild_id,
+                account_id=self._bot_id,
+                is_group=is_group,
+                raw=frame,
+                attachments=attachments,
+            )
+            with self._q_lock:
+                self._msg_queue.append(msg)
+
+        # -- event handlers --
+
         @ws.on("authenticated")
         def _on_auth():
             print("  [wecom] Authenticated")
@@ -446,44 +574,85 @@ class WecomChannel(Channel):
         def _on_error(err: Exception):
             log.warning("wecom error: %s", err)
 
-        @ws.on("message.text")
-        async def _on_text(frame: dict):
+        @ws.on("message")
+        async def _on_message(frame: dict):
+            """Unified handler — detect fields regardless of msgtype.
+
+            WeCom may deliver image/file fields under unexpected msgtypes
+            (e.g. "stream", or text+image without "mixed"), so we check
+            all fields unconditionally, matching pipi's strategy.
+            """
             body = frame.get("body", {})
-            sender = body.get("from", {})
-            sender_id = ""
-            if isinstance(sender, dict):
-                sender_id = sender.get("user_id", sender.get("open_id", ""))
-            elif isinstance(sender, str):
-                sender_id = sender
-
-            chat_id = body.get("chatid", "")
-            chat_type = body.get("chattype", "") or body.get("chat_type", "")
-            is_group = chat_type == "group"
-            guild_id = chat_id if is_group else ""
-            peer_id = chat_id if chat_id else sender_id
-
-            text = body.get("text", {}).get("content", "")
-            if not text:
+            if not body:
                 return
+            msgtype = body.get("msgtype", "")
+            text_parts: list[str] = []
+            atts: list[Attachment] = []
 
-            print(f"  [wecom:debug] chat_type={chat_type!r} chat_id={chat_id!r} "
-                  f"is_group={is_group} guild_id={guild_id!r} peer_id={peer_id!r} "
-                  f"sender_id={sender_id!r} from={body.get('from')!r}")
+            # -- mixed: iterate msg_item explicitly --
+            if msgtype == "mixed" and body.get("mixed", {}).get("msg_item"):
+                for item in body["mixed"]["msg_item"]:
+                    mt = item.get("msgtype", "")
+                    if mt == "text":
+                        t = item.get("text", {}).get("content", "")
+                        if t:
+                            text_parts.append(t)
+                    elif mt == "image":
+                        img = item.get("image", {})
+                        url = img.get("url", "")
+                        if url:
+                            data = await _download_media(url, img.get("aeskey"))
+                            atts.append(Attachment(
+                                type="image", data=data,
+                                mime_type=_detect_image_mime(data) if data else "",
+                                text="" if data else "[Image]",
+                            ))
+                        else:
+                            atts.append(Attachment(type="image", text="[Image]"))
+            else:
+                # -- field detection: check text, image, file, voice
+                #    unconditionally (a message may carry multiple) --
+                text_content = body.get("text", {}).get("content", "")
+                if text_content:
+                    text_parts.append(text_content)
 
-            self._pending_frames[peer_id] = frame
+                if body.get("image", {}).get("url"):
+                    img = body["image"]
+                    data = await _download_media(img["url"], img.get("aeskey"))
+                    atts.append(Attachment(
+                        type="image", data=data,
+                        mime_type=_detect_image_mime(data) if data else "",
+                        text="" if data else "[Image]",
+                    ))
 
-            msg = InboundMessage(
-                text=text,
-                sender_id=sender_id,
-                channel="wecom",
-                peer_id=peer_id,
-                guild_id=guild_id,
-                account_id=self._bot_id,
-                is_group=is_group,
-                raw=frame,
-            )
-            with self._q_lock:
-                self._msg_queue.append(msg)
+                if msgtype == "file" and body.get("file", {}).get("url"):
+                    fi = body["file"]
+                    data = await _download_media(fi["url"], fi.get("aeskey"))
+                    fname = fi.get("filename", "file")
+                    text_content_f = ""
+                    if data:
+                        try:
+                            text_content_f = data.decode("utf-8")
+                        except (UnicodeDecodeError, ValueError):
+                            pass
+                    atts.append(Attachment(
+                        type="file", data=data, filename=fname, text=text_content_f,
+                    ))
+
+                if msgtype == "voice":
+                    asr = body.get("voice", {}).get("content", "")
+                    atts.append(Attachment(
+                        type="voice",
+                        text=asr if asr else "[Voice message]",
+                    ))
+
+            # -- quote (reply-to) attachments --
+            atts.extend(await _collect_quote_attachments(body))
+
+            text = "\n".join(text_parts)
+            if not text and not atts:
+                return
+            _enqueue(frame, text, atts)
 
         async def _run():
             await ws.connect()
@@ -498,45 +667,134 @@ class WecomChannel(Channel):
         if not frame or not self._ws_client:
             log.warning("wecom send: no frame for %s, trying send_message", to)
             return self._send_proactive(to, text)
-
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(self._reply_async(frame, text))
-            else:
-                loop.run_until_complete(self._reply_async(frame, text))
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            loop.run_until_complete(self._reply_async(frame, text))
-            loop.close()
+        self._run_async(self._reply_async(frame, text))
         return True
 
     async def _reply_async(self, frame: dict, text: str) -> None:
         stream_id = generate_req_id("stream")
         await self._ws_client.reply_stream(frame, stream_id, text, True)
 
-    def _send_proactive(self, to: str, text: str) -> bool:
-        """Fallback: proactive push via send_message (markdown)."""
-        if not self._ws_client:
-            return False
+    # -- media upload pipeline (WebSocket protocol, no SDK uploadMedia needed) --
+
+    _UPLOAD_CHUNK_SIZE = 512 * 1024  # 512 KB per chunk
+    _MAX_UPLOAD_CHUNKS = 100
+
+    async def _ws_command(self, body: dict, cmd: str) -> dict:
+        """Send a raw WS command and return the response frame."""
+        req_id = generate_req_id(cmd)
+        frame: dict = {"headers": {"req_id": req_id}}
+        return await self._ws_client.reply(frame, body, cmd)
+
+    async def _upload_media_bytes(
+        self, data: bytes, media_type: str, filename: str,
+    ) -> str:
+        """Upload media via init→chunk→finish and return media_id."""
+        total_size = len(data)
+        total_chunks = (total_size + self._UPLOAD_CHUNK_SIZE - 1) // self._UPLOAD_CHUNK_SIZE
+        if total_chunks > self._MAX_UPLOAD_CHUNKS:
+            raise ValueError(
+                f"File too large: {total_chunks} chunks exceeds {self._MAX_UPLOAD_CHUNKS}"
+            )
+
+        init_resp = await self._ws_command({
+            "type": media_type,
+            "filename": filename,
+            "total_size": total_size,
+            "total_chunks": total_chunks,
+            "md5": hashlib.md5(data).hexdigest(),
+        }, "aibot_upload_media_init")
+
+        init_body = init_resp.get("body", {})
+        upload_id = str(init_body.get("upload_id", "")).strip()
+        if not upload_id:
+            raise RuntimeError(f"upload_media_init: no upload_id in {init_resp}")
+
+        for idx, start in enumerate(range(0, total_size, self._UPLOAD_CHUNK_SIZE)):
+            chunk = data[start:start + self._UPLOAD_CHUNK_SIZE]
+            await self._ws_command({
+                "upload_id": upload_id,
+                "chunk_index": idx,
+                "base64_data": base64.b64encode(chunk).decode("ascii"),
+            }, "aibot_upload_media_chunk")
+
+        finish_resp = await self._ws_command(
+            {"upload_id": upload_id}, "aibot_upload_media_finish",
+        )
+        finish_body = finish_resp.get("body", {})
+        media_id = str(finish_body.get("media_id", "")).strip()
+        if not media_id:
+            raise RuntimeError(f"upload_media_finish: no media_id in {finish_resp}")
+        return media_id
+
+    async def _send_media_msg(self, chat_id: str, media_type: str, media_id: str) -> None:
+        await self._ws_client.send_message(chat_id, {
+            "msgtype": media_type,
+            media_type: {"media_id": media_id},
+        })
+
+    def _run_async(self, coro: Any) -> Any:
+        """Schedule an async coroutine from a sync context."""
         import asyncio
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                asyncio.ensure_future(
-                    self._ws_client.send_message(to, {
+                asyncio.ensure_future(coro)
+                return None
+            return loop.run_until_complete(coro)
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+
+    def send_image(self, to: str, image_data: bytes, caption: str = "", **kw: Any) -> bool:
+        if not self._ws_client or not image_data:
+            return False
+        try:
+            async def _do() -> None:
+                media_id = await self._upload_media_bytes(image_data, "image", "image.jpg")
+                await self._send_media_msg(to, "image", media_id)
+                if caption:
+                    await self._ws_client.send_message(to, {
                         "msgtype": "markdown",
-                        "markdown": {"content": text},
+                        "markdown": {"content": caption},
                     })
+            self._run_async(_do())
+            return True
+        except Exception as exc:
+            log.warning("wecom send_image error: %s", exc)
+            return False
+
+    def send_file(self, to: str, file_data: bytes, filename: str = "", caption: str = "", **kw: Any) -> bool:
+        if not self._ws_client or not file_data:
+            return False
+        try:
+            async def _do() -> None:
+                media_id = await self._upload_media_bytes(
+                    file_data, "file", filename or "file",
                 )
-            else:
-                loop.run_until_complete(
-                    self._ws_client.send_message(to, {
+                await self._send_media_msg(to, "file", media_id)
+                if caption:
+                    await self._ws_client.send_message(to, {
                         "msgtype": "markdown",
-                        "markdown": {"content": text},
+                        "markdown": {"content": caption},
                     })
-                )
+            self._run_async(_do())
+            return True
+        except Exception as exc:
+            log.warning("wecom send_file error: %s", exc)
+            return False
+
+    def _send_proactive(self, to: str, text: str) -> bool:
+        """Fallback: proactive push via send_message (markdown)."""
+        if not self._ws_client:
+            return False
+        try:
+            self._run_async(self._ws_client.send_message(to, {
+                "msgtype": "markdown",
+                "markdown": {"content": text},
+            }))
         except Exception as exc:
             log.warning("wecom send_message error: %s", exc)
             return False

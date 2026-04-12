@@ -11,6 +11,7 @@ from pip_agent.tools import (
     run_bash,
     run_edit,
     run_glob,
+    run_grep,
     run_read,
     run_web_fetch,
     run_web_search,
@@ -402,6 +403,9 @@ _TOOL_REGISTRY: dict[str, Callable[[ToolContext, dict], DispatchResult]] = {
     ),
     "glob": lambda ctx, inp: DispatchResult(
         content=_wrap_simple(run_glob, inp, workdir=ctx.workdir),
+    ),
+    "grep": lambda ctx, inp: DispatchResult(
+        content=_wrap_simple(run_grep, inp, workdir=ctx.workdir),
     ),
     "web_search": lambda ctx, inp: DispatchResult(
         content=_wrap_simple(run_web_search, inp),
