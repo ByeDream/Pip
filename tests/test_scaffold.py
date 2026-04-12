@@ -8,8 +8,6 @@ import pytest
 
 from pip_agent.scaffold import (
     _SCAFFOLD_DIR,
-    _SENTINEL,
-    _SENTINEL_END,
     ensure_workspace,
 )
 
@@ -21,12 +19,9 @@ def test_fresh_init(tmp_path: Path) -> None:
     assert (tmp_path / ".pip").is_dir()
     assert (tmp_path / ".pip" / "team").is_dir()
     assert (tmp_path / ".pip" / "skills").is_dir()
+    assert (tmp_path / ".pip" / "memory" / "pip-boy").is_dir()
 
-    agents = tmp_path / "AGENTS.md"
-    assert agents.exists()
-    text = agents.read_text(encoding="utf-8")
-    assert _SENTINEL in text
-    assert _SENTINEL_END in text
+    assert not (tmp_path / "AGENTS.md").exists()
 
     models = tmp_path / ".pip" / "models.json"
     assert models.exists()
@@ -35,6 +30,7 @@ def test_fresh_init(tmp_path: Path) -> None:
     assert any(m["id"] == "claude-sonnet-4-6" for m in data)
 
     assert (tmp_path / ".env").exists()
+    assert (tmp_path / ".pip" / "user.md").exists()
 
     gitignore = tmp_path / ".gitignore"
     assert gitignore.exists()
@@ -59,7 +55,8 @@ def test_idempotent(tmp_path: Path) -> None:
         )
 
 
-def test_agents_md_append(tmp_path: Path) -> None:
+def test_existing_agents_md_untouched(tmp_path: Path) -> None:
+    """If the user has their own AGENTS.md, scaffold should not touch it."""
     (tmp_path / ".git").mkdir()
     custom = "# My Project\n\nSome custom content.\n"
     (tmp_path / "AGENTS.md").write_text(custom, encoding="utf-8")
@@ -67,22 +64,7 @@ def test_agents_md_append(tmp_path: Path) -> None:
     ensure_workspace(tmp_path)
 
     text = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
-    assert text.startswith("# My Project")
-    assert _SENTINEL in text
-    assert _SENTINEL_END in text
-    assert "Some custom content." in text
-
-
-def test_agents_md_no_duplicate(tmp_path: Path) -> None:
-    (tmp_path / ".git").mkdir()
-    template = (_SCAFFOLD_DIR / "agents.md").read_text(encoding="utf-8")
-    existing = f"# Existing\n\n{_SENTINEL}\n{template}\n{_SENTINEL_END}\n"
-    (tmp_path / "AGENTS.md").write_text(existing, encoding="utf-8")
-
-    ensure_workspace(tmp_path)
-
-    text = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
-    assert text == existing
+    assert text == custom
 
 
 def test_gitignore_merge(tmp_path: Path) -> None:

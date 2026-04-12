@@ -28,6 +28,11 @@ from pip_agent.routing import (
     resolve_effective_config,
 )
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pip_agent.memory import MemoryStore
+
 
 @dataclass
 class CommandContext:
@@ -36,6 +41,7 @@ class CommandContext:
     bindings: BindingTable
     bindings_path: Any  # Path
     workdir: str = ""
+    memory_store: MemoryStore | None = None
 
 
 @dataclass
@@ -66,6 +72,9 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
         "/unbind": _cmd_unbind,
         "/clear": _cmd_clear,
         "/status": _cmd_status,
+        "/memory": _cmd_memory,
+        "/axioms": _cmd_axioms,
+        "/recall": _cmd_recall,
         "/exit": _cmd_exit,
     }
 
@@ -89,6 +98,9 @@ Available commands:
   /unbind                        Remove current chat's routing binding
   /clear                         Remove binding and delete the agent config
   /status                        Show current routing info
+  /memory                        Show memory statistics for the current agent
+  /axioms                        Show current judgment principles
+  /recall <query>                Search through stored memories
   /exit                          Quit Pip-Boy (CLI only)
 
 /bind options:
@@ -142,7 +154,12 @@ def _auto_create_agent(
         return None, f"Agent '{agent_id}' not found and agents directory is not configured."
 
     default = registry.default_agent()
-    body = "Your working directory is {workdir}.\nRead AGENTS.md in your working directory before starting work."
+    body = (
+        "## Identity\n\n"
+        f"You are {agent_id}, a personal assistant agent.\n"
+        "Your working directory is {workdir}.\n"
+        "If AGENTS.md exists in your working directory, read it for project context."
+    )
     cfg = replace(default, id=agent_id, name=agent_id, system_body=body)
 
     _persist_agent_md(cfg, agents_dir)
@@ -360,6 +377,53 @@ def _cmd_status(ctx: CommandContext, args: str) -> CommandResult:
         lines.append(f"Guild: {inbound.guild_id}")
     lines.append(f"Peer: {inbound.peer_id}")
 
+    return CommandResult(handled=True, response="\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# /memory, /axioms, /recall
+# ---------------------------------------------------------------------------
+
+def _cmd_memory(ctx: CommandContext, args: str) -> CommandResult:
+    if ctx.memory_store is None:
+        return CommandResult(handled=True, response="Memory system not initialized.")
+    s = ctx.memory_store.stats()
+    lines = [
+        f"Agent: {s['agent_id']}",
+        f"Observations: {s['observations']}",
+        f"Memories: {s['memories']}",
+        f"Axioms: {'yes' if s['has_axioms'] else 'none'} ({s['axiom_lines']} lines)",
+    ]
+    if s.get("last_reflect_at"):
+        from datetime import datetime, timezone
+        t = datetime.fromtimestamp(s["last_reflect_at"], tz=timezone.utc)
+        lines.append(f"Last reflect: {t.strftime('%Y-%m-%d %H:%M UTC')}")
+    if s.get("last_consolidate_at"):
+        from datetime import datetime, timezone
+        t = datetime.fromtimestamp(s["last_consolidate_at"], tz=timezone.utc)
+        lines.append(f"Last consolidate: {t.strftime('%Y-%m-%d %H:%M UTC')}")
+    return CommandResult(handled=True, response="\n".join(lines))
+
+
+def _cmd_axioms(ctx: CommandContext, args: str) -> CommandResult:
+    if ctx.memory_store is None:
+        return CommandResult(handled=True, response="Memory system not initialized.")
+    axioms = ctx.memory_store.load_axioms()
+    if not axioms:
+        return CommandResult(handled=True, response="No axioms yet. They emerge after enough conversations.")
+    return CommandResult(handled=True, response=axioms)
+
+
+def _cmd_recall(ctx: CommandContext, args: str) -> CommandResult:
+    if ctx.memory_store is None:
+        return CommandResult(handled=True, response="Memory system not initialized.")
+    query = args.strip()
+    if not query:
+        return CommandResult(handled=True, response="Usage: /recall <query>")
+    results = ctx.memory_store.search(query, top_k=5)
+    if not results:
+        return CommandResult(handled=True, response="(no matching memories)")
+    lines = [f"- {r.get('text', '')} (score: {r.get('score', 0)})" for r in results]
     return CommandResult(handled=True, response="\n".join(lines))
 
 

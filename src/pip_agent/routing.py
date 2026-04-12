@@ -64,7 +64,6 @@ def normalize_agent_id(value: str) -> str:
 class AgentConfig:
     id: str
     name: str = ""
-    personality: str = ""
     system_body: str = ""
     model: str = ""
     max_tokens: int = 0
@@ -93,14 +92,8 @@ class AgentConfig:
         return self.compact_micro_age or DEFAULT_COMPACT_MICRO_AGE
 
     def system_prompt(self, workdir: str = "") -> str:
-        parts: list[str] = []
-        display = self.name or self.id
-        parts.append(f"You are {display}.")
-        if self.personality:
-            parts.append(self.personality)
-        if self.system_body:
-            parts.append(self.system_body.replace("{workdir}", workdir))
-        return "\n".join(parts)
+        body = self.system_body.replace("{workdir}", workdir) if self.system_body else ""
+        return body
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +120,6 @@ def agent_config_from_file(path: Path) -> AgentConfig:
     return AgentConfig(
         id=normalize_agent_id(meta.get("id", path.stem)),
         name=meta.get("name", ""),
-        personality=meta.get("personality", ""),
         system_body=body,
         model=meta.get("model", ""),
         max_tokens=int(meta["max_tokens"]) if "max_tokens" in meta else 0,
@@ -290,9 +282,15 @@ _BUILTIN_DEFAULT = AgentConfig(
     id=DEFAULT_AGENT_ID,
     name="Pip-Boy",
     system_body=(
+        "## Identity\n\n"
         "You are Pip-Boy, a personal assistant agent.\n"
         "Your working directory is {workdir}.\n"
-        "Read AGENTS.md in your working directory before starting work."
+        "If AGENTS.md exists in your working directory, read it for project context.\n\n"
+        "## Rules\n\n"
+        "- **Direct execution** — Simple, single-step requests. Just use your tools.\n"
+        "- **Tasks** — Multi-step goals that need structured tracking.\n"
+        "- **Background tasks** — Long-running shell commands. Use `background: true`.\n"
+        "- **Agent Team** — Parallel work, specialized roles, or tasks too large for a single context."
     ),
     model=DEFAULT_MODEL,
     max_tokens=DEFAULT_MAX_TOKENS,

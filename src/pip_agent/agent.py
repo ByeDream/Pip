@@ -39,6 +39,8 @@ from pip_agent.routing import (
 from pip_agent.skills import SkillRegistry
 from pip_agent.task_graph import PlanManager
 from pip_agent.team import TeamManager
+from pip_agent.memory import MemoryStore
+from pip_agent.memory.scheduler import MemoryScheduler
 from pip_agent.tool_dispatch import ToolContext, dispatch_tool
 from pip_agent.tools import (
     TASK_TOOL_NAMES,
@@ -91,6 +93,9 @@ _TOOL_KEY_PARAM: dict[str, str] = {
     "claim_task": "task_id",
     "task_board_overview": "",
     "task_board_detail": "task_id",
+    "user_profile_update": "name",
+    "memory_write": "content",
+    "memory_search": "query",
 }
 
 
@@ -122,8 +127,10 @@ def agent_loop(
     bg_manager: BackgroundTaskManager | None = None,
     team_manager: TeamManager | None = None,
     worktree_manager: WorktreeManager | None = None,
+    memory_store: MemoryStore | None = None,
     channel: Channel | None = None,
     peer_id: str = "",
+    sender_id: str = "",
 ) -> str | None:
     """Run one agent turn.  Returns the final assistant text (if any)."""
     from pip_agent.routing import DEFAULT_COMPACT_THRESHOLD, DEFAULT_MAX_TOKENS, DEFAULT_MODEL
@@ -239,8 +246,10 @@ def agent_loop(
                 bg_manager=bg_manager,
                 team_manager=team_manager,
                 worktree_manager=worktree_manager,
+                memory_store=memory_store,
                 channel=channel,
                 peer_id=peer_id,
+                sender_id=sender_id,
             )
             for block in assistant_content:
                 if hasattr(block, "text") and block.text.strip():
@@ -308,6 +317,7 @@ def _process_inbound(
     bg_manager: BackgroundTaskManager | None = None,
     team_manager: TeamManager | None = None,
     worktree_manager: WorktreeManager | None = None,
+    memory_store: MemoryStore | None = None,
 ) -> None:
     """Run agent_loop for one InboundMessage and route the reply."""
     agent_id, binding = binding_table.resolve(
@@ -346,6 +356,16 @@ def _process_inbound(
     system_prompt = effective.system_prompt(workdir=str(WORKDIR))
     if skill_registry and skill_registry.available:
         system_prompt += "\n\n" + skill_registry.catalog_prompt()
+
+    user_text = inbound.text if isinstance(inbound.text, str) else ""
+    if memory_store:
+        system_prompt = memory_store.enrich_prompt(
+            system_prompt, user_text,
+            channel=inbound.channel,
+            agent_id=effective.id,
+            workdir=str(WORKDIR),
+            sender_id=inbound.sender_id,
+        )
 
     user_input: str | list = inbound.text
     if inbound.is_group:
@@ -416,8 +436,10 @@ def _process_inbound(
             bg_manager=bg_manager,
             team_manager=team_manager,
             worktree_manager=worktree_manager,
+            memory_store=memory_store,
             channel=ch,
             peer_id=reply_peer,
+            sender_id=inbound.sender_id,
         )
     except KeyboardInterrupt:
         print("\n  [interrupted] Returning to prompt.")
@@ -492,6 +514,10 @@ def run(mode: str = "auto") -> None:
 
     worktree_manager = WorktreeManager(WORKDIR)
     transcripts_dir = WORKDIR / ".pip" / "transcripts"
+    memory_store = MemoryStore(
+        base_dir=WORKDIR / ".pip" / "memory",
+        agent_id=default_agent.id,
+    )
     team_manager = TeamManager(
         BUILTIN_TEAM_DIR,
         USER_TEAM_DIR,
@@ -518,6 +544,14 @@ def run(mode: str = "auto") -> None:
     q_lock = threading.Lock()
     bg_threads: list[threading.Thread] = []
     has_remote_channels = False
+
+    memory_scheduler = MemoryScheduler(
+        memory_store, client, transcripts_dir, stop_event,
+        model=settings.model,
+    )
+    mem_thread = threading.Thread(target=memory_scheduler.run, daemon=True)
+    mem_thread.start()
+    bg_threads.append(mem_thread)
 
     state_dir = WORKDIR / ".pip"
 
@@ -600,6 +634,7 @@ def run(mode: str = "auto") -> None:
         bg_manager=bg_manager,
         team_manager=team_manager,
         worktree_manager=worktree_manager,
+        memory_store=memory_store,
     )
 
     if has_remote_channels:
@@ -628,6 +663,7 @@ def run(mode: str = "auto") -> None:
                     bindings=binding_table,
                     bindings_path=BINDINGS_PATH,
                     workdir=str(WORKDIR),
+                    memory_store=memory_store,
                 )
                 result = dispatch_command(cmd_ctx)
                 if settings.verbose:
@@ -755,9 +791,9 @@ def run(mode: str = "auto") -> None:
     else:
         # CLI-only mode: original blocking REPL (preserves readline, etc.)
         messages = conversations[cli_session_key]
-        cli_system_prompt = default_agent.system_prompt(workdir=str(WORKDIR))
+        cli_system_prompt_base = default_agent.system_prompt(workdir=str(WORKDIR))
         if skill_registry.available:
-            cli_system_prompt += "\n\n" + skill_registry.catalog_prompt()
+            cli_system_prompt_base += "\n\n" + skill_registry.catalog_prompt()
 
         while True:
             try:
@@ -784,6 +820,7 @@ def run(mode: str = "auto") -> None:
                     bindings=binding_table,
                     bindings_path=BINDINGS_PATH,
                     workdir=str(WORKDIR),
+                    memory_store=memory_store,
                 )
                 result = dispatch_command(cmd_ctx)
                 if result.handled:
@@ -807,6 +844,14 @@ def run(mode: str = "auto") -> None:
                 print(json.dumps(inbox, indent=2) if inbox else "(no messages)")
                 continue
 
+            cli_system_prompt = memory_store.enrich_prompt(
+                cli_system_prompt_base, user_input,
+                channel="cli",
+                agent_id=default_agent.id,
+                workdir=str(WORKDIR),
+                sender_id="cli-user",
+            )
+
             try:
                 reply_text = agent_loop(
                     client,
@@ -822,11 +867,13 @@ def run(mode: str = "auto") -> None:
                     compact_micro_age=default_agent.effective_compact_micro_age,
                     channel=cli_channel,
                     peer_id="cli-user",
+                    sender_id="cli-user",
                     skill_registry=skill_registry,
                     transcripts_dir=transcripts_dir,
                     bg_manager=bg_manager,
                     team_manager=team_manager,
                     worktree_manager=worktree_manager,
+                    memory_store=memory_store,
                 )
             except KeyboardInterrupt:
                 print("\n  [interrupted] Returning to prompt.")

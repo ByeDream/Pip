@@ -1,0 +1,179 @@
+"""L1 Observer: extract behavioral observations from recent transcripts.
+
+Reads saved transcript JSON files, formats them, and asks an LLM to identify
+decision patterns, judgment frameworks, and recurring preferences — focusing
+on HOW the user thinks rather than WHAT was done.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from pathlib import Path
+from typing import Any
+
+import anthropic
+
+log = logging.getLogger(__name__)
+
+REFLECT_SYSTEM = (
+    "You are a behavioral analyst. Given conversation transcripts between a "
+    "user and an AI assistant, extract observations about the user's decision "
+    "patterns, judgment frameworks, values, and recurring preferences.\n\n"
+    "Focus on HOW the user thinks and decides, not WHAT they asked for.\n"
+    "Look for: decision patterns, quality standards, communication style, "
+    "repeated frustrations, value trade-offs, and cognitive heuristics.\n\n"
+    "Output a JSON array of observation objects. Each object has:\n"
+    '  {"text": "...", "category": "decision|judgment|communication|value|preference"}\n\n'
+    "Output 3-8 observations. If there is nothing meaningful, output [].\n"
+    "Output all observations in English, regardless of the transcript language.\n"
+    "Return ONLY the JSON array, no markdown fences or extra text."
+)
+
+MAX_TRANSCRIPTS = 50
+MAX_TRANSCRIPT_CHARS = 3000
+
+
+def _format_transcript(messages: list[dict]) -> str:
+    """Simplified transcript formatter for reflection (not reusing compact's)."""
+    lines: list[str] = []
+    for msg in messages:
+        role = msg.get("role", "?").upper()
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            lines.append(f"[{role}] {content[:500]}")
+        elif isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        parts.append(block.get("text", "")[:500])
+                    elif block.get("type") == "tool_use":
+                        parts.append(f"[tool: {block.get('name', '?')}]")
+            if parts:
+                lines.append(f"[{role}] " + " ".join(parts))
+    return "\n".join(lines)
+
+
+def _load_transcripts(
+    transcripts_dir: Path,
+    agent_id: str,
+    since: float,
+) -> list[str]:
+    """Load and format transcripts for the given agent since a timestamp."""
+    if not transcripts_dir.is_dir():
+        return []
+
+    files = sorted(transcripts_dir.glob("*.json"), reverse=True)
+    formatted: list[str] = []
+
+    for fp in files[:MAX_TRANSCRIPTS * 2]:
+        try:
+            ts = int(fp.stem)
+        except ValueError:
+            continue
+        if ts < since:
+            continue
+
+        try:
+            messages = json.loads(fp.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        if not isinstance(messages, list):
+            continue
+
+        text = _format_transcript(messages)
+        if not text.strip():
+            continue
+
+        has_agent_content = any(
+            isinstance(m.get("content"), str) and m.get("content", "").strip()
+            for m in messages
+            if m.get("role") == "assistant"
+        )
+        if not has_agent_content:
+            continue
+
+        if len(text) > MAX_TRANSCRIPT_CHARS:
+            text = text[:MAX_TRANSCRIPT_CHARS] + "\n[truncated]"
+        formatted.append(f"--- Transcript {fp.stem} ---\n{text}")
+
+        if len(formatted) >= MAX_TRANSCRIPTS:
+            break
+
+    return formatted
+
+
+def reflect(
+    client: anthropic.Anthropic,
+    transcripts_dir: Path,
+    agent_id: str,
+    since: float,
+    *,
+    model: str = "",
+) -> list[dict[str, Any]]:
+    """Run L1 reflection on recent transcripts.
+
+    Returns list of observation dicts: [{text, category}, ...].
+    """
+    from pip_agent.config import settings
+    if not model:
+        model = settings.model
+
+    transcripts = _load_transcripts(transcripts_dir, agent_id, since)
+    if not transcripts:
+        log.debug("reflect: no transcripts since %s for agent %s", since, agent_id)
+        return []
+
+    combined = "\n\n".join(transcripts)
+    if len(combined) > 60000:
+        combined = combined[:60000] + "\n[truncated]"
+
+    prompt = (
+        f"Here are recent conversation transcripts for agent '{agent_id}':\n\n"
+        f"{combined}\n\n"
+        "Extract behavioral observations about the user now."
+    )
+
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            system=REFLECT_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as exc:
+        log.warning("reflect LLM call failed: %s", exc)
+        return []
+
+    text = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            text += block.text
+
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+    try:
+        observations = json.loads(text)
+    except json.JSONDecodeError:
+        log.warning("reflect: LLM returned invalid JSON: %.200s", text)
+        return []
+
+    if not isinstance(observations, list):
+        return []
+
+    now = time.time()
+    valid: list[dict[str, Any]] = []
+    for obs in observations:
+        if isinstance(obs, dict) and obs.get("text"):
+            valid.append({
+                "ts": now,
+                "text": str(obs["text"]),
+                "category": str(obs.get("category", "observation")),
+                "source": "auto",
+            })
+    return valid

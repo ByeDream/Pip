@@ -81,13 +81,12 @@ class TestAgentConfig:
     def test_system_prompt(self):
         cfg = AgentConfig(id="bot", name="TestBot", system_body="Working at {workdir}.")
         prompt = cfg.system_prompt(workdir="/tmp/test")
-        assert "TestBot" in prompt
         assert "/tmp/test" in prompt
 
-    def test_system_prompt_id_fallback(self):
+    def test_system_prompt_empty_body(self):
         cfg = AgentConfig(id="my-agent")
         prompt = cfg.system_prompt()
-        assert "my-agent" in prompt
+        assert prompt == ""
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +104,6 @@ class TestAgentConfigFromFile:
             "dm_scope: main\n"
             "compact_threshold: 10000\n"
             "compact_micro_age: 2\n"
-            "personality: Helpful assistant\n"
             "---\n"
             "Be concise.\n",
             encoding="utf-8",
@@ -118,7 +116,6 @@ class TestAgentConfigFromFile:
         assert cfg.dm_scope == "main"
         assert cfg.compact_threshold == 10000
         assert cfg.compact_micro_age == 2
-        assert cfg.personality == "Helpful assistant"
         assert cfg.system_body == "Be concise."
 
     def test_no_frontmatter(self, tmp_path):

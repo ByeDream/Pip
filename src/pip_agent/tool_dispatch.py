@@ -21,6 +21,7 @@ from pip_agent.tools import (
 if TYPE_CHECKING:
     from pip_agent.background import BackgroundTaskManager
     from pip_agent.channels import Channel
+    from pip_agent.memory import MemoryStore
     from pip_agent.profiler import Profiler
     from pip_agent.skills import SkillRegistry
     from pip_agent.task_graph import PlanManager
@@ -53,11 +54,13 @@ class ToolContext:
     bg_manager: BackgroundTaskManager | None = None
     team_manager: TeamManager | None = None
     worktree_manager: WorktreeManager | None = None
+    memory_store: MemoryStore | None = None
     teammate: TeammateToolSurface | None = None
     caller: str = "lead"
     workdir: Path | None = None
     channel: Channel | None = None
     peer_id: str = ""
+    sender_id: str = ""
 
 
 def _handle_plan_tool(name: str, inputs: dict, pm: PlanManager) -> str:
@@ -358,6 +361,46 @@ def _handle_task_board_overview(ctx: ToolContext, _inp: dict) -> DispatchResult:
     return DispatchResult(content=ctx.plan_manager.render(None))
 
 
+def _handle_user_profile_update(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.memory_store is None:
+        return DispatchResult(content="Unknown tool: user_profile_update")
+    ch_name = ctx.channel.name if ctx.channel else "cli"
+    result = ctx.memory_store.update_user_profile(
+        sender_id=ctx.sender_id,
+        channel=ch_name,
+        name=inp.get("name", ""),
+        call_me=inp.get("call_me", ""),
+        timezone=inp.get("timezone", ""),
+        notes=inp.get("notes", ""),
+    )
+    return DispatchResult(content=result)
+
+
+def _handle_memory_write(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.memory_store is None:
+        return DispatchResult(content="Unknown tool: memory_write")
+    content = inp.get("content", "").strip()
+    if not content:
+        return DispatchResult(content="[error] 'content' is required")
+    category = inp.get("category", "observation")
+    ctx.memory_store.write_single(content, category=category, source="user")
+    return DispatchResult(content=f"Remembered: {content}")
+
+
+def _handle_memory_search(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.memory_store is None:
+        return DispatchResult(content="Unknown tool: memory_search")
+    query = inp.get("query", "").strip()
+    if not query:
+        return DispatchResult(content="[error] 'query' is required")
+    top_k = inp.get("top_k", 5)
+    results = ctx.memory_store.search(query, top_k=top_k)
+    if not results:
+        return DispatchResult(content="(no matching memories)")
+    lines = [f"- {r.get('text', '')} (score: {r.get('score', 0)})" for r in results]
+    return DispatchResult(content="\n".join(lines))
+
+
 def _handle_task_board_detail(ctx: ToolContext, inp: dict) -> DispatchResult:
     if ctx.plan_manager is None:
         return DispatchResult(content="Unknown tool: task_board_detail")
@@ -392,6 +435,9 @@ _TOOL_REGISTRY: dict[str, Callable[[ToolContext, dict], DispatchResult]] = {
     "claim_task": _handle_claim_task,
     "task_board_overview": _handle_task_board_overview,
     "task_board_detail": _handle_task_board_detail,
+    "user_profile_update": _handle_user_profile_update,
+    "memory_write": _handle_memory_write,
+    "memory_search": _handle_memory_search,
     "read": lambda ctx, inp: DispatchResult(
         content=_wrap_simple(run_read, inp, workdir=ctx.workdir),
     ),

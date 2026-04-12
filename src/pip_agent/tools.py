@@ -584,6 +584,79 @@ CHECK_BACKGROUND_SCHEMA = {
     },
 }
 
+USER_PROFILE_UPDATE_SCHEMA = {
+    "name": "user_profile_update",
+    "description": (
+        "Update the user's profile. Use this when you learn the user's name, "
+        "preferred name, timezone, or other personal context. "
+        "Only set fields you have learned — omit fields you don't know."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "The user's real name.",
+            },
+            "call_me": {
+                "type": "string",
+                "description": "What the user prefers to be called.",
+            },
+            "timezone": {
+                "type": "string",
+                "description": "The user's timezone (e.g. 'Asia/Shanghai', 'US/Pacific').",
+            },
+            "notes": {
+                "type": "string",
+                "description": "Additional notes about the user (append, don't overwrite).",
+            },
+        },
+    },
+}
+
+MEMORY_WRITE_SCHEMA = {
+    "name": "memory_write",
+    "description": (
+        "Save an important observation about the user's behavior, preferences, "
+        "or decision patterns. Focus on HOW the user thinks or decides, not just "
+        "WHAT they said. Patterns and judgment heuristics are more valuable than facts. "
+        "Always write the content in English regardless of conversation language."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The behavioral observation in English.",
+            },
+            "category": {
+                "type": "string",
+                "description": "Category: decision, judgment, communication, value, preference.",
+            },
+        },
+        "required": ["content"],
+    },
+}
+
+MEMORY_SEARCH_SCHEMA = {
+    "name": "memory_search",
+    "description": "Search through stored memories and observations about the user.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query.",
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Max results to return. Default 5.",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
 COMPACT_SCHEMA = {
     "name": "compact",
     "description": (
@@ -957,6 +1030,9 @@ ALL_TOOLS = [
     GREP_SCHEMA,
     WEB_SEARCH_SCHEMA,
     WEB_FETCH_SCHEMA,
+    USER_PROFILE_UPDATE_SCHEMA,
+    MEMORY_WRITE_SCHEMA,
+    MEMORY_SEARCH_SCHEMA,
     TASK_CREATE_SCHEMA,
     TASK_UPDATE_SCHEMA,
     TASK_SUBMIT_SCHEMA,

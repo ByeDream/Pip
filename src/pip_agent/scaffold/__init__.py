@@ -9,50 +9,29 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _SCAFFOLD_DIR = Path(__file__).resolve().parent
-_SENTINEL = "<!-- pip-agent:begin -->"
-_SENTINEL_END = "<!-- pip-agent:end -->"
 
 
-def ensure_workspace(workdir: Path) -> None:
+def ensure_workspace(workdir: Path, *, default_agent_id: str = "pip-boy") -> None:
     """Idempotent workspace initialization. Safe to call on every startup."""
-    _ensure_dirs(workdir)
-    _ensure_agents_md(workdir)
+    _ensure_dirs(workdir, default_agent_id=default_agent_id)
     _ensure_copy(workdir / ".pip" / "models.json", "models.json")
     _ensure_copy(workdir / ".pip" / "agents" / "pip-boy.md", "pip-boy.md")
+    _ensure_copy(workdir / ".pip" / "user.md", "user.md")
     _ensure_copy(workdir / ".env", "env.example")
     _ensure_gitignore(workdir)
     _check_git(workdir)
 
 
-def _ensure_dirs(workdir: Path) -> None:
-    for rel in (".pip", ".pip/team", ".pip/skills", ".pip/agents"):
+def _ensure_dirs(workdir: Path, *, default_agent_id: str = "pip-boy") -> None:
+    dirs = [
+        ".pip", ".pip/team", ".pip/skills", ".pip/agents",
+        f".pip/memory/{default_agent_id}",
+        f".pip/memory/{default_agent_id}/observations",
+    ]
+    for rel in dirs:
         d = workdir / rel
         d.mkdir(parents=True, exist_ok=True)
         logger.debug("Directory ensured: %s", d)
-
-
-def _ensure_agents_md(workdir: Path) -> None:
-    src = _SCAFFOLD_DIR / "agents.md"
-    if not src.is_file():
-        logger.warning("Scaffold template missing: %s", src)
-        return
-    template = src.read_text(encoding="utf-8")
-    block = f"{_SENTINEL}\n{template}\n{_SENTINEL_END}\n"
-    target = workdir / "AGENTS.md"
-
-    if not target.exists():
-        target.write_text(block, encoding="utf-8")
-        logger.info("Created %s", target)
-        return
-
-    existing = target.read_text(encoding="utf-8")
-    if _SENTINEL in existing:
-        logger.debug("Sentinel found in %s, skipping", target)
-        return
-
-    separator = "" if existing.endswith("\n\n") else "\n" if existing.endswith("\n") else "\n\n"
-    target.write_text(existing + separator + block, encoding="utf-8")
-    logger.info("Appended working guide to %s", target)
 
 
 def _ensure_copy(target: Path, scaffold_name: str) -> None:
