@@ -449,7 +449,10 @@ def _cmd_update(ctx: CommandContext, args: str) -> CommandResult:
         capture_output=True,
         text=True,
     )
+
     if result.returncode != 0:
+        if sys.platform == "win32" and "WinError 32" in result.stderr:
+            return _update_via_launcher(current_ver)
         return CommandResult(
             handled=True,
             response=f"Update failed:\n{result.stderr.strip()}",
@@ -466,6 +469,54 @@ def _cmd_update(ctx: CommandContext, args: str) -> CommandResult:
 
     print(f"  [system] Updated to v{new_ver}. Restarting...")
     os.execv(sys.executable, [sys.executable, "-m", "pip_agent"] + sys.argv[1:])
+
+
+def _update_via_launcher(current_ver: str) -> CommandResult:
+    """Windows fallback: spawn a helper script that upgrades after we exit."""
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    python = sys.executable
+    pid = os.getpid()
+    cwd = os.getcwd()
+
+    script_path = os.path.join(tempfile.gettempdir(), "pip_boy_update.cmd")
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(f"@echo off\n")
+        f.write(f"title pip-boy updater\n")
+        f.write(f"echo [pip-boy] Waiting for current process (PID {pid}) to exit...\n")
+        f.write(f":wait\n")
+        f.write(f'tasklist /FI "PID eq {pid}" 2>NUL | find /I "{pid}" >NUL\n')
+        f.write(f"if not errorlevel 1 (\n")
+        f.write(f"    timeout /t 1 /nobreak >NUL\n")
+        f.write(f"    goto wait\n")
+        f.write(f")\n")
+        f.write(f"echo [pip-boy] Upgrading pip-boy...\n")
+        f.write(f'"{python}" -m pip install --upgrade pip-boy\n')
+        f.write(f"if errorlevel 1 (\n")
+        f.write(f"    echo [pip-boy] Update failed. Press any key to close.\n")
+        f.write(f"    pause >NUL\n")
+        f.write(f"    exit /b 1\n")
+        f.write(f")\n")
+        f.write(f"echo [pip-boy] Restarting pip-boy...\n")
+        f.write(f'cd /d "{cwd}"\n')
+        f.write(f'"{python}" -m pip_agent\n')
+
+    subprocess.Popen(
+        ["cmd", "/c", script_path],
+        creationflags=subprocess.CREATE_NEW_CONSOLE,
+    )
+
+    print("  [system] Windows file lock detected.")
+    print("  [system] Launched updater in a new window.")
+    print("  [system] pip-boy will restart there after the upgrade completes.")
+    return CommandResult(
+        handled=True,
+        exit_requested=True,
+        response=f"Upgrading from v{current_ver}... pip-boy will restart in the new window.",
+    )
 
 
 # ---------------------------------------------------------------------------
