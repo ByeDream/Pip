@@ -19,7 +19,7 @@ _MANIFEST_NAME = ".scaffold_manifest.json"
 _SCAFFOLD_FILES: list[tuple[str, str]] = [
     (".pip/models.json", "models.json"),
     (".pip/agents/pip-boy.md", "pip-boy.md"),
-    (".pip/user.md", "user.md"),
+    (".pip/owner.md", "owner.md"),
     (".env", "env.example"),
 ]
 
@@ -118,7 +118,7 @@ def ensure_workspace(workdir: Path, *, default_agent_id: str = "pip-boy") -> Non
 
 def _ensure_dirs(workdir: Path, *, default_agent_id: str = "pip-boy") -> None:
     dirs = [
-        ".pip", ".pip/team", ".pip/skills", ".pip/agents",
+        ".pip", ".pip/team", ".pip/skills", ".pip/agents", ".pip/users",
         f".pip/memory/{default_agent_id}",
         f".pip/memory/{default_agent_id}/observations",
     ]

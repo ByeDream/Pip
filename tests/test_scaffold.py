@@ -31,7 +31,8 @@ def test_fresh_init(tmp_path: Path) -> None:
     assert any(m["id"] == "claude-sonnet-4-6" for m in data)
 
     assert (tmp_path / ".env").exists()
-    assert (tmp_path / ".pip" / "user.md").exists()
+    assert (tmp_path / ".pip" / "owner.md").exists()
+    assert (tmp_path / ".pip" / "users").is_dir()
 
     gitignore = tmp_path / ".gitignore"
     assert gitignore.exists()
@@ -128,13 +129,13 @@ def test_scaffold_migration_skips_modified(tmp_path: Path, caplog: pytest.LogCap
     (tmp_path / ".git").mkdir()
     ensure_workspace(tmp_path)
 
-    user_md = tmp_path / ".pip" / "user.md"
-    user_md.write_text("# Custom user profile\n", encoding="utf-8")
+    owner_md = tmp_path / ".pip" / "owner.md"
+    owner_md.write_text("# Custom owner profile\n", encoding="utf-8")
 
     with caplog.at_level(logging.WARNING, logger="pip_agent.scaffold"):
         ensure_workspace(tmp_path)
 
-    assert user_md.read_text(encoding="utf-8") == "# Custom user profile\n"
+    assert owner_md.read_text(encoding="utf-8") == "# Custom owner profile\n"
 
 
 def test_no_git_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:

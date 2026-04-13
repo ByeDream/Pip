@@ -93,7 +93,7 @@ _TOOL_KEY_PARAM: dict[str, str] = {
     "claim_task": "task_id",
     "task_board_overview": "",
     "task_board_detail": "task_id",
-    "user_profile_update": "name",
+    "remember_user": "name",
     "memory_write": "content",
     "memory_search": "query",
 }
@@ -368,10 +368,26 @@ def _process_inbound(
         )
 
     user_input: str | list = inbound.text
+
+    sender_status = "unverified"
+    if memory_store and inbound.sender_id:
+        _profile = memory_store.find_profile_by_sender(
+            inbound.channel, inbound.sender_id,
+        )
+        if _profile:
+            _name = memory_store.extract_profile_name(_profile)
+            sender_status = f"verified:{_name}" if _name else "verified"
+
     if inbound.is_group:
         user_input = (
-            f'<group-message from="{inbound.sender_id}">'
+            f'<group-message from="{inbound.sender_id}" status="{sender_status}">'
             f"\n{inbound.text}\n</group-message>"
+        )
+    elif inbound.sender_id:
+        user_input = (
+            f'<message from="{inbound.channel}:{inbound.sender_id}"'
+            f' status="{sender_status}">'
+            f"\n{inbound.text}\n</message>"
         )
 
     if inbound.attachments:

@@ -361,12 +361,13 @@ def _handle_task_board_overview(ctx: ToolContext, _inp: dict) -> DispatchResult:
     return DispatchResult(content=ctx.plan_manager.render(None))
 
 
-def _handle_user_profile_update(ctx: ToolContext, inp: dict) -> DispatchResult:
+def _handle_remember_user(ctx: ToolContext, inp: dict) -> DispatchResult:
     if ctx.memory_store is None:
-        return DispatchResult(content="Unknown tool: user_profile_update")
+        return DispatchResult(content="Unknown tool: remember_user")
     ch_name = ctx.channel.name if ctx.channel else "cli"
+    sid = inp.get("sender_id") or ctx.sender_id
     result = ctx.memory_store.update_user_profile(
-        sender_id=ctx.sender_id,
+        sender_id=sid,
         channel=ch_name,
         name=inp.get("name", ""),
         call_me=inp.get("call_me", ""),
@@ -435,7 +436,7 @@ _TOOL_REGISTRY: dict[str, Callable[[ToolContext, dict], DispatchResult]] = {
     "claim_task": _handle_claim_task,
     "task_board_overview": _handle_task_board_overview,
     "task_board_detail": _handle_task_board_detail,
-    "user_profile_update": _handle_user_profile_update,
+    "remember_user": _handle_remember_user,
     "memory_write": _handle_memory_write,
     "memory_search": _handle_memory_search,
     "read": lambda ctx, inp: DispatchResult(

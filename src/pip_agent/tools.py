@@ -584,16 +584,21 @@ CHECK_BACKGROUND_SCHEMA = {
     },
 }
 
-USER_PROFILE_UPDATE_SCHEMA = {
-    "name": "user_profile_update",
+REMEMBER_USER_SCHEMA = {
+    "name": "remember_user",
     "description": (
-        "Update the user's profile. Use this when you learn the user's name, "
-        "preferred name, timezone, or other personal context. "
-        "Only set fields you have learned — omit fields you don't know."
+        "Remember or update a user's identity. Use this when an unverified "
+        "user reveals who they are, or when you want to update a verified "
+        "user's info. Only set fields you have learned — omit fields you "
+        "don't know."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
+            "sender_id": {
+                "type": "string",
+                "description": "The target user's sender_id (from message tag).",
+            },
             "name": {
                 "type": "string",
                 "description": "The user's real name.",
@@ -1030,7 +1035,7 @@ ALL_TOOLS = [
     GREP_SCHEMA,
     WEB_SEARCH_SCHEMA,
     WEB_FETCH_SCHEMA,
-    USER_PROFILE_UPDATE_SCHEMA,
+    REMEMBER_USER_SCHEMA,
     MEMORY_WRITE_SCHEMA,
     MEMORY_SEARCH_SCHEMA,
     TASK_CREATE_SCHEMA,

@@ -6,7 +6,8 @@ Storage layout:
         observations/<date>.jsonl
         memories.json
         axioms.md
-    .pip/user.md              (global, cross-agent)
+    .pip/owner.md             (owner profile, read-only by tools)
+    .pip/users/<name>.md      (other user profiles, tool-managed)
 """
 
 from __future__ import annotations
@@ -132,24 +133,110 @@ class MemoryStore:
         path.write_text(text, encoding="utf-8")
 
     # ------------------------------------------------------------------
-    # User profile (global)
+    # User profiles (owner.md read-only + users/*.md tool-managed)
     # ------------------------------------------------------------------
 
+    _FIELD_MAP: dict[str, str] = {
+        "name": "Name",
+        "call_me": "What to call them",
+        "timezone": "Timezone",
+        "notes": "Notes",
+    }
+
     def load_user_profile(self) -> str:
-        path = self.pip_dir / "user.md"
+        """Load the owner profile (read-only, never modified by tools)."""
+        path = self.pip_dir / "owner.md"
         if not path.is_file():
             return ""
         try:
-            text = path.read_text(encoding="utf-8").strip()
-            if not any(
-                line.strip().startswith("- **") and not line.strip().endswith("**")
-                for line in text.splitlines()
-                if ":" in line
-            ):
-                return ""
-            return text
+            return path.read_text(encoding="utf-8").strip()
         except OSError:
             return ""
+
+    def _all_profile_paths(self) -> list[Path]:
+        """Return owner.md + all users/*.md paths."""
+        paths: list[Path] = []
+        owner = self.pip_dir / "owner.md"
+        if owner.is_file():
+            paths.append(owner)
+        users_dir = self.pip_dir / "users"
+        if users_dir.is_dir():
+            paths.extend(sorted(users_dir.glob("*.md")))
+        return paths
+
+    def find_profile_by_sender(
+        self, channel: str, sender_id: str,
+    ) -> Path | None:
+        """Find which profile file contains this channel:sender_id."""
+        if not sender_id:
+            return None
+        target = f"{channel}:{sender_id}"
+        for path in self._all_profile_paths():
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    if line.strip() == f"- `{target}`":
+                        return path
+            except OSError:
+                continue
+        return None
+
+    def _find_in_users(
+        self, channel: str, sender_id: str,
+    ) -> Path | None:
+        """Find a sender_id only within users/*.md (excludes owner.md)."""
+        if not sender_id:
+            return None
+        target = f"{channel}:{sender_id}"
+        users_dir = self.pip_dir / "users"
+        if not users_dir.is_dir():
+            return None
+        for path in sorted(users_dir.glob("*.md")):
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    if line.strip() == f"- `{target}`":
+                        return path
+            except OSError:
+                continue
+        return None
+
+    def _find_user_by_name(self, name: str) -> Path | None:
+        """Find a users/*.md profile whose Name or What to call them matches."""
+        if not name:
+            return None
+        users_dir = self.pip_dir / "users"
+        if not users_dir.is_dir():
+            return None
+        target_lower = name.strip().lower()
+        for path in sorted(users_dir.glob("*.md")):
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    stripped = line.strip()
+                    for prefix in ("- **Name:**", "- **What to call them:**"):
+                        if stripped.startswith(prefix):
+                            val = stripped[len(prefix):].strip().lower()
+                            if val and val == target_lower:
+                                return path
+            except OSError:
+                continue
+        return None
+
+    @staticmethod
+    def extract_profile_name(path: Path) -> str:
+        """Read 'What to call them' or 'Name' from a profile file."""
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if stripped.startswith("- **What to call them:**"):
+                    val = stripped[len("- **What to call them:**"):].strip()
+                    if val:
+                        return val
+                if stripped.startswith("- **Name:**"):
+                    val = stripped[len("- **Name:**"):].strip()
+                    if val:
+                        return val
+        except OSError:
+            pass
+        return ""
 
     def update_user_profile(
         self,
@@ -158,28 +245,37 @@ class MemoryStore:
         channel: str = "",
         **fields: str,
     ) -> str:
-        """Update specific fields in user.md. Returns confirmation message.
+        """Create or update a user profile in users/. Returns confirmation.
 
-        Supported fields: name, call_me, timezone, notes.
-        sender_id + channel are auto-captured from the conversation context
-        and stored as identifiers for cross-session user recognition.
+        Only operates on .pip/users/ — never touches owner.md.
+        A registered sender is locked to their own profile.
+        An unregistered sender may join an existing profile by name or create new.
         """
-        path = self.pip_dir / "user.md"
-        field_map = {
-            "name": "Name",
-            "call_me": "What to call them",
-            "timezone": "Timezone",
-            "notes": "Notes",
-        }
+        new_id = f"{channel}:{sender_id}" if sender_id and channel else ""
+        users_dir = self.pip_dir / "users"
+        users_dir.mkdir(parents=True, exist_ok=True)
+
+        registered_path = self._find_in_users(channel, sender_id) if new_id else None
+
+        if registered_path:
+            target_path = registered_path
+        else:
+            name = fields.get("name") or fields.get("call_me") or ""
+            existing = self._find_user_by_name(name) if name else None
+            if existing:
+                target_path = existing
+            else:
+                safe = _sanitize_filename(name or sender_id or "unknown")
+                target_path = users_dir / f"{safe}.md"
 
         current: dict[str, str] = {}
         current_ids: list[str] = []
-        if path.is_file():
+        if target_path.is_file():
             try:
                 in_ids = False
-                for line in path.read_text(encoding="utf-8").splitlines():
+                for line in target_path.read_text(encoding="utf-8").splitlines():
                     stripped = line.strip()
-                    for key, label in field_map.items():
+                    for key, label in self._FIELD_MAP.items():
                         prefix = f"- **{label}:**"
                         if stripped.startswith(prefix):
                             current[key] = stripped[len(prefix):].strip()
@@ -196,7 +292,7 @@ class MemoryStore:
 
         updated_keys: list[str] = []
         for key, value in fields.items():
-            if key not in field_map or not value:
+            if key not in self._FIELD_MAP or not value:
                 continue
             if key == "notes" and current.get("notes"):
                 current[key] = current[key] + "; " + value
@@ -204,17 +300,19 @@ class MemoryStore:
                 current[key] = value
             updated_keys.append(key)
 
-        if sender_id and channel:
-            new_id = f"{channel}:{sender_id}"
-            if new_id not in current_ids:
-                current_ids.append(new_id)
-                updated_keys.append("identifier")
+        if new_id and new_id not in current_ids:
+            current_ids.append(new_id)
+            updated_keys.append("identifier")
 
         if not updated_keys:
             return "No fields to update."
 
-        lines = ["# About Your Human", "", "_Learn about the person you're helping. Update this as you go._", ""]
-        for key, label in field_map.items():
+        display = current.get("call_me") or current.get("name") or "User"
+        lines = [
+            f"# {display}", "",
+            "_Profile managed by Pip._", "",
+        ]
+        for key, label in self._FIELD_MAP.items():
             val = current.get(key, "")
             lines.append(f"- **{label}:** {val}")
         if current_ids:
@@ -223,9 +321,9 @@ class MemoryStore:
                 lines.append(f"  - `{ident}`")
         lines.append("")
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(lines), encoding="utf-8")
-        return f"Updated user profile: {', '.join(updated_keys)}"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text("\n".join(lines), encoding="utf-8")
+        return f"Updated user profile ({target_path.name}): {', '.join(updated_keys)}"
 
     # ------------------------------------------------------------------
     # Search / Recall
@@ -274,16 +372,29 @@ class MemoryStore:
         """Inject dynamic context into the system prompt.
 
         Layers (injected in order):
-          1. ## User — global user profile (only if sender matches or no identifiers yet)
+          1. ## User — owner profile + all known user profiles
           2. ## Judgment Principles — per-agent axioms
           3. ## Recalled Context — TF-IDF matched memories
           4. ## Context — runtime metadata
           5. ## Channel — channel hints
         """
-        user_profile = self.load_user_profile()
-        if user_profile and self._sender_matches(user_profile, channel, sender_id):
+        sections: list[str] = []
+        owner_text = self.load_user_profile()
+        if owner_text:
+            sections.append(owner_text)
+        users_dir = self.pip_dir / "users"
+        if users_dir.is_dir():
+            for path in sorted(users_dir.glob("*.md")):
+                try:
+                    text = path.read_text(encoding="utf-8").strip()
+                    if text:
+                        sections.append(text)
+                except OSError:
+                    continue
+        if sections:
             system_prompt = _insert_after_identity(
-                system_prompt, f"## User\n\n{user_profile}",
+                system_prompt,
+                "## User\n\n" + "\n\n---\n\n".join(sections),
             )
 
         axioms = self.load_axioms()
@@ -312,30 +423,6 @@ class MemoryStore:
 
         return system_prompt
 
-    @staticmethod
-    def _sender_matches(profile_text: str, channel: str, sender_id: str) -> bool:
-        """Check if the current sender matches a known identifier.
-
-        Returns True (inject profile) when:
-        - No identifiers stored yet (cold start — assume it's the owner)
-        - Current channel:sender_id matches a stored identifier
-        Returns False when identifiers exist but none match.
-        """
-        stored_ids: list[str] = []
-        for line in profile_text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("- `") and stripped.endswith("`"):
-                stored_ids.append(stripped[3:-1])
-
-        if not stored_ids:
-            return True
-
-        if not sender_id:
-            return True
-
-        current = f"{channel}:{sender_id}"
-        return current in stored_ids
-
     # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------
@@ -354,6 +441,20 @@ class MemoryStore:
             "last_reflect_at": state.get("last_reflect_at"),
             "last_consolidate_at": state.get("last_consolidate_at"),
         }
+
+
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
+
+_SAFE_RE = re.compile(r"[^a-zA-Z0-9_\-]")
+
+
+def _sanitize_filename(name: str) -> str:
+    """Turn a display name into a safe filename stem (no extension)."""
+    s = _SAFE_RE.sub("_", name.strip().lower())
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "unknown"
 
 
 # ----------------------------------------------------------------------
