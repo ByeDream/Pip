@@ -55,7 +55,6 @@ BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 USER_SKILLS_DIR = WORKDIR / ".pip" / "skills"
 
 BUILTIN_TEAM_DIR = Path(__file__).resolve().parent / "team"
-USER_TEAM_DIR = WORKDIR / ".pip" / "team"
 
 try:
     import readline  # noqa: F401 — enables input() history and line editing
@@ -311,13 +310,12 @@ def _process_inbound(
     channel_mgr: ChannelManager,
     client: anthropic.Anthropic,
     profiler: Profiler,
-    plan_manager: PlanManager,
+    plan_managers: dict[str, PlanManager],
     *,
     registry: AgentRegistry,
     binding_table: BindingTable,
     tools: list[dict],
     skill_registry: SkillRegistry | None = None,
-    transcripts_dir: Path | None = None,
     bg_manager: BackgroundTaskManager | None = None,
     team_manager: TeamManager | None = None,
     worktree_manager: WorktreeManager | None = None,
@@ -338,6 +336,18 @@ def _process_inbound(
         agent_cfg = registry.default_agent()
 
     effective = resolve_effective_config(agent_cfg, binding)
+
+    per_agent_transcripts = AGENTS_DIR / effective.id / "transcripts"
+    per_agent_transcripts.mkdir(parents=True, exist_ok=True)
+
+    if effective.id not in plan_managers:
+        plan_managers[effective.id] = PlanManager(AGENTS_DIR / effective.id / "tasks")
+    plan_manager = plan_managers[effective.id]
+
+    if team_manager is not None:
+        agent_team_dir = AGENTS_DIR / effective.id / "team"
+        team_manager.set_user_dir(agent_team_dir)
+        team_manager._plan_manager = plan_manager
 
     if settings.verbose:
         print(
@@ -457,7 +467,7 @@ def _process_inbound(
             compact_threshold=effective.effective_compact_threshold,
             compact_micro_age=effective.effective_compact_micro_age,
             skill_registry=skill_registry,
-            transcripts_dir=transcripts_dir,
+            transcripts_dir=per_agent_transcripts,
             bg_manager=bg_manager,
             team_manager=team_manager,
             worktree_manager=worktree_manager,
@@ -534,23 +544,27 @@ def run(mode: str = "auto") -> None:
     client = anthropic.Anthropic(**client_kwargs)
     profiler = Profiler()
     bg_manager = BackgroundTaskManager()
-    plan_manager = PlanManager(WORKDIR / ".pip" / "tasks")
+    plan_manager = PlanManager(AGENTS_DIR / default_agent.id / "tasks")
+    plan_managers: dict[str, PlanManager] = {default_agent.id: plan_manager}
     skill_registry = SkillRegistry(BUILTIN_SKILLS_DIR, USER_SKILLS_DIR)
 
     worktree_manager = WorktreeManager(WORKDIR)
-    transcripts_dir = WORKDIR / ".pip" / "transcripts"
+    transcripts_dir = AGENTS_DIR / default_agent.id / "transcripts"
     memory_store = MemoryStore(
-        base_dir=WORKDIR / ".pip" / "memory",
+        base_dir=AGENTS_DIR,
         agent_id=default_agent.id,
     )
+    default_team_dir = AGENTS_DIR / default_agent.id / "team"
+    default_team_dir.mkdir(parents=True, exist_ok=True)
     team_manager = TeamManager(
         BUILTIN_TEAM_DIR,
-        USER_TEAM_DIR,
+        default_team_dir,
         client,
         profiler,
         skill_registry=skill_registry,
         plan_manager=plan_manager,
         worktree_manager=worktree_manager,
+        pip_dir=WORKDIR / ".pip",
     )
 
     tools: list[dict] = tools_for_role("lead")
@@ -656,7 +670,6 @@ def run(mode: str = "auto") -> None:
         binding_table=binding_table,
         tools=tools,
         skill_registry=skill_registry,
-        transcripts_dir=transcripts_dir,
         bg_manager=bg_manager,
         team_manager=team_manager,
         worktree_manager=worktree_manager,
@@ -730,7 +743,7 @@ def run(mode: str = "auto") -> None:
                     try:
                         _process_inbound(
                             inbound, conversations, channel_mgr, client, profiler,
-                            plan_manager, **common_kwargs,
+                            plan_managers, **common_kwargs,
                         )
                     finally:
                         poll_pause.clear()
@@ -776,7 +789,7 @@ def run(mode: str = "auto") -> None:
                         )
                         _process_inbound(
                             combined, conversations, channel_mgr, client, profiler,
-                            plan_manager, **common_kwargs,
+                            plan_managers, **common_kwargs,
                         )
                 finally:
                     poll_pause.clear()

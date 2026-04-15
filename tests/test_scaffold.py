@@ -18,9 +18,14 @@ def test_fresh_init(tmp_path: Path) -> None:
     ensure_workspace(tmp_path)
 
     assert (tmp_path / ".pip").is_dir()
-    assert (tmp_path / ".pip" / "team").is_dir()
     assert (tmp_path / ".pip" / "skills").is_dir()
-    assert (tmp_path / ".pip" / "memory" / "pip-boy").is_dir()
+    assert (tmp_path / ".pip" / "agents" / "pip-boy").is_dir()
+    assert (tmp_path / ".pip" / "agents" / "pip-boy" / "observations").is_dir()
+    assert (tmp_path / ".pip" / "agents" / "pip-boy" / "users").is_dir()
+    assert (tmp_path / ".pip" / "agents" / "pip-boy" / "transcripts").is_dir()
+    assert (tmp_path / ".pip" / "agents" / "pip-boy" / "tasks").is_dir()
+    assert (tmp_path / ".pip" / "agents" / "pip-boy" / "team").is_dir()
+    assert (tmp_path / ".pip" / "agents" / "pip-boy" / "team" / "inbox").is_dir()
 
     assert not (tmp_path / "AGENTS.md").exists()
 
@@ -32,7 +37,6 @@ def test_fresh_init(tmp_path: Path) -> None:
 
     assert (tmp_path / ".env").exists()
     assert (tmp_path / ".pip" / "owner.md").exists()
-    assert (tmp_path / ".pip" / "users").is_dir()
 
     gitignore = tmp_path / ".gitignore"
     assert gitignore.exists()
@@ -44,6 +48,7 @@ def test_fresh_init(tmp_path: Path) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert "version" in manifest
     assert ".pip/models.json" in manifest["files"]
+    assert ".pip/agents/pip-boy/persona.md" in manifest["files"]
 
 
 def test_idempotent(tmp_path: Path) -> None:

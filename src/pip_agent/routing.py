@@ -117,8 +117,13 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
 def agent_config_from_file(path: Path) -> AgentConfig:
     text = path.read_text(encoding="utf-8")
     meta, body = _parse_frontmatter(text)
+    # For <agents_dir>/<id>/persona.md, derive id from parent dir name
+    if path.name == "persona.md":
+        default_id = path.parent.name
+    else:
+        default_id = path.stem
     return AgentConfig(
-        id=normalize_agent_id(meta.get("id", path.stem)),
+        id=normalize_agent_id(meta.get("id", default_id)),
         name=meta.get("name", ""),
         system_body=body,
         model=meta.get("model", ""),
@@ -316,11 +321,21 @@ class AgentRegistry:
     def _load_dir(self, agents_dir: Path) -> None:
         if not agents_dir.is_dir():
             return
+        # New layout: <agents_dir>/<agent-id>/persona.md
+        for persona in sorted(agents_dir.glob("*/persona.md")):
+            try:
+                cfg = agent_config_from_file(persona)
+                self._agents[cfg.id] = cfg
+                log.debug("Loaded agent config: %s from %s", cfg.id, persona)
+            except Exception as exc:
+                log.warning("Failed to load agent config %s: %s", persona, exc)
+        # Legacy layout: <agents_dir>/<agent-id>.md (flat files)
         for path in sorted(agents_dir.glob("*.md")):
             try:
                 cfg = agent_config_from_file(path)
-                self._agents[cfg.id] = cfg
-                log.debug("Loaded agent config: %s from %s", cfg.id, path)
+                if cfg.id not in self._agents:
+                    self._agents[cfg.id] = cfg
+                    log.debug("Loaded legacy agent config: %s from %s", cfg.id, path)
             except Exception as exc:
                 log.warning("Failed to load agent config %s: %s", path, exc)
 
@@ -331,15 +346,20 @@ class AgentRegistry:
         self._agents[cfg.id] = cfg
 
     def remove_agent(self, agent_id: str, *, delete_file: bool = False) -> bool:
-        """Remove an agent from the registry. Optionally delete its .md file."""
+        """Remove an agent from the registry and optionally delete its data."""
+        import shutil
+
         if agent_id == DEFAULT_AGENT_ID:
             return False
         if agent_id not in self._agents:
             return False
         del self._agents[agent_id]
         if delete_file and self._agents_dir:
-            md_path = self._agents_dir / f"{agent_id}.md"
-            md_path.unlink(missing_ok=True)
+            agent_subtree = self._agents_dir / agent_id
+            if agent_subtree.is_dir():
+                shutil.rmtree(agent_subtree, ignore_errors=True)
+            legacy_md = self._agents_dir / f"{agent_id}.md"
+            legacy_md.unlink(missing_ok=True)
         return True
 
     def list_agents(self) -> list[AgentConfig]:

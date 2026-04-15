@@ -284,7 +284,9 @@ class TestAgentRegistry:
     def test_load_from_dir(self, tmp_path):
         agents_dir = tmp_path / "agents"
         agents_dir.mkdir()
-        (agents_dir / "test-bot.md").write_text(
+        bot_dir = agents_dir / "test-bot"
+        bot_dir.mkdir()
+        (bot_dir / "persona.md").write_text(
             "---\nname: TestBot\nmodel: gpt-4\n---\nBody.\n",
             encoding="utf-8",
         )
@@ -299,7 +301,9 @@ class TestAgentRegistry:
     def test_get_agent_normalizes(self, tmp_path):
         agents_dir = tmp_path / "agents"
         agents_dir.mkdir()
-        (agents_dir / "my-bot.md").write_text(
+        bot_dir = agents_dir / "my-bot"
+        bot_dir.mkdir()
+        (bot_dir / "persona.md").write_text(
             "---\nname: MyBot\n---\nHello.\n",
             encoding="utf-8",
         )

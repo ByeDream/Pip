@@ -709,6 +709,7 @@ class TeamManager:
         skill_registry: SkillRegistry | None = None,
         plan_manager: PlanManager | None = None,
         worktree_manager: WorktreeManager | None = None,
+        pip_dir: Path | None = None,
     ) -> None:
         self._client = client
         self._profiler = profiler
@@ -722,8 +723,20 @@ class TeamManager:
         self._protocol = ProtocolTracker()
         self._builtin_dir = builtin_dir
         self._user_dir = user_dir
+        self._pip_dir = pip_dir or user_dir.parent
 
         self._scan_dir(builtin_dir)
+        self._scan_dir(user_dir)
+
+    def set_user_dir(self, user_dir: Path) -> None:
+        """Switch persistent paths (roster + inbox) for a different agent."""
+        if user_dir == self._user_dir:
+            return
+        self._user_dir = user_dir
+        user_dir.mkdir(parents=True, exist_ok=True)
+        self._bus = Bus(user_dir / "inbox")
+        self._roster.clear()
+        self._scan_dir(self._builtin_dir)
         self._scan_dir(user_dir)
 
     def _scan_dir(self, directory: Path) -> None:
@@ -780,7 +793,7 @@ class TeamManager:
                 break
 
     def _valid_models(self) -> set[str]:
-        path = self._user_dir.parent / "models.json"
+        path = self._pip_dir / "models.json"
         if not path.is_file():
             return set()
         try:
@@ -910,7 +923,7 @@ class TeamManager:
         return f"Deleted teammate '{name}'."
 
     def list_models(self) -> str:
-        path = self._user_dir.parent / "models.json"
+        path = self._pip_dir / "models.json"
         if not path.is_file():
             return "[error] No models.json found in .pip/"
         try:

@@ -6,7 +6,7 @@ receives the current message context and returns a response string
 (or None to signal no reply needed).
 
 All commands are flat (single-level):
-  /help, /bind, /name, /unbind, /clear, /status, /update, /exit
+  /help, /bind, /name, /unbind, /clean, /reset, /status, /admin, /update, /exit
 """
 
 from __future__ import annotations
@@ -70,11 +70,13 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
         "/bind": _cmd_bind,
         "/name": _cmd_name,
         "/unbind": _cmd_unbind,
-        "/clear": _cmd_clear,
+        "/clean": _cmd_clean,
+        "/reset": _cmd_reset,
         "/status": _cmd_status,
         "/memory": _cmd_memory,
         "/axioms": _cmd_axioms,
         "/recall": _cmd_recall,
+        "/admin": _cmd_admin,
         "/update": _cmd_update,
         "/exit": _cmd_exit,
     }
@@ -82,6 +84,22 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
     handler = handlers.get(cmd)
     if handler is None:
         return CommandResult(handled=False)
+
+    # --- ACL gate ---
+    ms = ctx.memory_store
+    ch, sid = ctx.inbound.channel, ctx.inbound.sender_id
+    owner = ms.is_owner(ch, sid) if ms else (ch == "cli")
+
+    _OWNER_ONLY: set[str] = {"/admin"}
+    if cmd in _OWNER_ONLY and not owner:
+        return CommandResult(handled=True, response="Permission denied: owner only.")
+    if not owner:
+        admin = ms.is_admin(ch, sid) if ms else False
+        if not admin:
+            return CommandResult(
+                handled=True,
+                response="Permission denied: admin privileges required.",
+            )
 
     return handler(ctx, args)
 
@@ -91,17 +109,19 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
 # ---------------------------------------------------------------------------
 
 _HELP_TEXT = """\
-Available commands:
+Available commands (require admin or owner privileges):
 
   /help                          Show this help
   /bind <agent-id> [options]     Bind current chat to an agent (auto-creates if needed)
   /name <display_name>           Set display name for the current agent
   /unbind                        Remove current chat's routing binding
-  /clear                         Remove binding and delete the agent config
+  /clean                         Remove binding and delete the agent + all its data
+  /reset                         Factory-reset agent memory (keep binding and persona)
   /status                        Show current routing info
   /memory                        Show memory statistics for the current agent
   /axioms                        Show current judgment principles
   /recall <query>                Search through stored memories
+  /admin grant|revoke|list       Manage admin privileges (owner only)
   /update                        Upgrade pip-boy to latest version and restart
   /exit                          Quit Pip-Boy (CLI only)
 
@@ -111,6 +131,9 @@ Available commands:
   --max-tokens <n>               Override max tokens
   --compact-threshold <n>        Override compact threshold
   --compact-micro-age <n>        Override compact micro age
+
+Permissions: owner (CLI or owner.md Identifiers) can use all commands.
+Admin users can use all commands except /admin. Others cannot use commands.
 
 In a group chat, /bind creates a guild-level (T2) binding.
 In a private chat, /bind creates a peer-level (T1) binding.
@@ -126,11 +149,12 @@ def _cmd_help(ctx: CommandContext, args: str) -> CommandResult:
 # ---------------------------------------------------------------------------
 
 def _persist_agent_md(cfg: AgentConfig, agents_dir: Path | None) -> None:
-    """Write an AgentConfig to its .md file."""
+    """Write an AgentConfig to its persona.md inside the agent subdirectory."""
     if not agents_dir:
         return
-    agents_dir.mkdir(parents=True, exist_ok=True)
-    md_path = agents_dir / f"{cfg.id}.md"
+    agent_subdir = agents_dir / cfg.id
+    agent_subdir.mkdir(parents=True, exist_ok=True)
+    md_path = agent_subdir / "persona.md"
     frontmatter = (
         f"---\n"
         f"name: {cfg.name}\n"
@@ -233,7 +257,7 @@ def _cmd_bind(ctx: CommandContext, args: str) -> CommandResult:
         agents_dir = ctx.registry.agents_dir
         lines.append(f"Created new agent '{agent_id}' (cloned from default)")
         if agents_dir:
-            lines.append(f"  config: {agents_dir / (agent_id + '.md')}")
+            lines.append(f"  config: {agents_dir / agent_id / 'persona.md'}")
     lines.extend([
         f"Bound to **{display_name}** ({agent_id})",
         f"  scope: {scope} | model: {model}",
@@ -294,10 +318,10 @@ def _cmd_unbind(ctx: CommandContext, args: str) -> CommandResult:
 
 
 # ---------------------------------------------------------------------------
-# /clear
+# /clean
 # ---------------------------------------------------------------------------
 
-def _cmd_clear(ctx: CommandContext, args: str) -> CommandResult:
+def _cmd_clean(ctx: CommandContext, args: str) -> CommandResult:
     """Remove current chat's binding and delete its bound agent (except default)."""
     inbound = ctx.inbound
     if inbound.is_group and inbound.guild_id:
@@ -331,6 +355,50 @@ def _cmd_clear(ctx: CommandContext, args: str) -> CommandResult:
 
     lines.append("Falling back to default agent.")
     return CommandResult(handled=True, response="\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# /reset
+# ---------------------------------------------------------------------------
+
+def _resolve_effective_agent(ctx: CommandContext) -> AgentConfig:
+    """Resolve the effective agent for the current context."""
+    inbound = ctx.inbound
+    agent_id, binding = ctx.bindings.resolve(
+        channel=inbound.channel,
+        account_id=inbound.account_id,
+        guild_id=inbound.guild_id,
+        peer_id=inbound.peer_id,
+    )
+    if not agent_id:
+        agent_id = ctx.registry.default_agent().id
+    agent_cfg = ctx.registry.get_agent(agent_id)
+    if not agent_cfg:
+        agent_cfg = ctx.registry.default_agent()
+    return resolve_effective_config(agent_cfg, binding)
+
+
+def _cmd_reset(ctx: CommandContext, args: str) -> CommandResult:
+    """Factory-reset memory for the routed agent; keep binding and persona."""
+    from pip_agent.memory import MemoryStore
+
+    eff = _resolve_effective_agent(ctx)
+    agents_dir = ctx.registry.agents_dir
+    if not agents_dir:
+        return CommandResult(
+            handled=True,
+            response="[error] agents directory not configured.",
+        )
+    store = MemoryStore(agents_dir, eff.id)
+    store.factory_reset()
+    return CommandResult(
+        handled=True,
+        response=(
+            f"Memory factory-reset for agent `{eff.id}` "
+            "(observations, memories.json, axioms.md, state.json). "
+            "Bindings and persona are unchanged."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +495,42 @@ def _cmd_recall(ctx: CommandContext, args: str) -> CommandResult:
         return CommandResult(handled=True, response="(no matching memories)")
     lines = [f"- {r.get('text', '')} (score: {r.get('score', 0)})" for r in results]
     return CommandResult(handled=True, response="\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# /admin
+# ---------------------------------------------------------------------------
+
+def _cmd_admin(ctx: CommandContext, args: str) -> CommandResult:
+    """Manage admin privileges (owner only)."""
+    parts = args.strip().split(None, 1)
+    if not parts:
+        return CommandResult(
+            handled=True,
+            response="Usage: /admin grant|revoke|list [name]",
+        )
+    sub = parts[0].lower()
+    name = parts[1].strip() if len(parts) > 1 else ""
+
+    ms = ctx.memory_store
+    if not ms:
+        return CommandResult(handled=True, response="Memory store unavailable.")
+
+    if sub == "list":
+        admins = ms.list_admins()
+        if not admins:
+            return CommandResult(handled=True, response="No admin users.")
+        return CommandResult(
+            handled=True,
+            response="Admin users:\n" + "\n".join(f"  - {a}" for a in admins),
+        )
+    if sub in ("grant", "revoke") and name:
+        result = ms.set_admin(name, grant=(sub == "grant"))
+        return CommandResult(handled=True, response=result)
+    return CommandResult(
+        handled=True,
+        response="Usage: /admin grant|revoke <name> | /admin list",
+    )
 
 
 # ---------------------------------------------------------------------------

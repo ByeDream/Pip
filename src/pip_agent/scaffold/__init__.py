@@ -18,7 +18,7 @@ _MANIFEST_NAME = ".scaffold_manifest.json"
 
 _SCAFFOLD_FILES: list[tuple[str, str]] = [
     (".pip/models.json", "models.json"),
-    (".pip/agents/pip-boy.md", "pip-boy.md"),
+    (".pip/agents/pip-boy/persona.md", "pip-boy.md"),
     (".pip/owner.md", "owner.md"),
     (".env", "env.example"),
 ]
@@ -112,20 +112,117 @@ def ensure_workspace(workdir: Path, *, default_agent_id: str = "pip-boy") -> Non
     manifest["files"] = files_meta
     _save_manifest(workdir, manifest)
 
+    _migrate_legacy_layout(workdir, default_agent_id=default_agent_id)
     _ensure_gitignore(workdir)
     _check_git(workdir)
 
 
 def _ensure_dirs(workdir: Path, *, default_agent_id: str = "pip-boy") -> None:
     dirs = [
-        ".pip", ".pip/team", ".pip/skills", ".pip/agents", ".pip/users",
-        f".pip/memory/{default_agent_id}",
-        f".pip/memory/{default_agent_id}/observations",
+        ".pip",
+        ".pip/skills",
+        ".pip/agents",
+        f".pip/agents/{default_agent_id}",
+        f".pip/agents/{default_agent_id}/observations",
+        f".pip/agents/{default_agent_id}/users",
+        f".pip/agents/{default_agent_id}/transcripts",
+        f".pip/agents/{default_agent_id}/tasks",
+        f".pip/agents/{default_agent_id}/team",
+        f".pip/agents/{default_agent_id}/team/inbox",
     ]
     for rel in dirs:
         d = workdir / rel
         d.mkdir(parents=True, exist_ok=True)
         logger.debug("Directory ensured: %s", d)
+
+
+def _migrate_legacy_layout(
+    workdir: Path, *, default_agent_id: str = "pip-boy",
+) -> None:
+    """One-time migration from old flat layout to per-agent subdirectories."""
+    pip = workdir / ".pip"
+    agents = pip / "agents"
+    default_dir = agents / default_agent_id
+
+    # Legacy flat agent .md → per-agent persona.md
+    for md in sorted(agents.glob("*.md")):
+        if md.name == "bindings.json":
+            continue
+        agent_id = md.stem
+        persona = agents / agent_id / "persona.md"
+        if not persona.exists():
+            persona.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(md, persona)
+            logger.info("Migrated %s → %s", md, persona)
+
+    # Legacy .pip/memory/<id>/ → .pip/agents/<id>/
+    legacy_memory = pip / "memory"
+    if legacy_memory.is_dir():
+        for sub in sorted(legacy_memory.iterdir()):
+            if not sub.is_dir():
+                continue
+            target = agents / sub.name
+            target.mkdir(parents=True, exist_ok=True)
+            for item in sub.iterdir():
+                dest = target / item.name
+                if not dest.exists():
+                    if item.is_dir():
+                        shutil.copytree(item, dest)
+                    else:
+                        shutil.copy2(item, dest)
+            logger.info("Migrated memory/%s → agents/%s", sub.name, sub.name)
+
+    # Legacy .pip/users/ → default agent's users/
+    legacy_users = pip / "users"
+    if legacy_users.is_dir() and any(legacy_users.glob("*.md")):
+        target_users = default_dir / "users"
+        target_users.mkdir(parents=True, exist_ok=True)
+        for md in sorted(legacy_users.glob("*.md")):
+            dest = target_users / md.name
+            if not dest.exists():
+                shutil.copy2(md, dest)
+        logger.info("Migrated .pip/users/ → agents/%s/users/", default_agent_id)
+
+    # Legacy .pip/tasks/ → default agent's tasks/
+    legacy_tasks = pip / "tasks"
+    if legacy_tasks.is_dir() and any(legacy_tasks.iterdir()):
+        target_tasks = default_dir / "tasks"
+        target_tasks.mkdir(parents=True, exist_ok=True)
+        for item in legacy_tasks.iterdir():
+            dest = target_tasks / item.name
+            if not dest.exists():
+                if item.is_dir():
+                    shutil.copytree(item, dest)
+                else:
+                    shutil.copy2(item, dest)
+        logger.info("Migrated .pip/tasks/ → agents/%s/tasks/", default_agent_id)
+
+    # Legacy .pip/team/ → default agent's team/
+    legacy_team = pip / "team"
+    if legacy_team.is_dir() and any(legacy_team.iterdir()):
+        target_team = default_dir / "team"
+        target_team.mkdir(parents=True, exist_ok=True)
+        for item in legacy_team.iterdir():
+            dest = target_team / item.name
+            if not dest.exists():
+                if item.is_dir():
+                    shutil.copytree(item, dest)
+                else:
+                    shutil.copy2(item, dest)
+        logger.info("Migrated .pip/team/ → agents/%s/team/", default_agent_id)
+
+    # Legacy .pip/transcripts/ → default agent's transcripts/
+    legacy_transcripts = pip / "transcripts"
+    if legacy_transcripts.is_dir() and any(legacy_transcripts.glob("*.json")):
+        target_transcripts = default_dir / "transcripts"
+        target_transcripts.mkdir(parents=True, exist_ok=True)
+        for f in legacy_transcripts.glob("*.json"):
+            dest = target_transcripts / f.name
+            if not dest.exists():
+                shutil.copy2(f, dest)
+        logger.info(
+            "Migrated .pip/transcripts/ → agents/%s/transcripts/", default_agent_id,
+        )
 
 
 def _ensure_gitignore(workdir: Path) -> None:

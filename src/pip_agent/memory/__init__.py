@@ -1,13 +1,13 @@
 """Memory subsystem: per-agent behavioral memory with three-tier pipeline.
 
 Storage layout:
-    .pip/memory/<agent-id>/
+    .pip/agents/<agent-id>/
         state.json
         observations/<date>.jsonl
         memories.json
         axioms.md
+        users/<name>.md       (per-agent user profiles, tool-managed)
     .pip/owner.md             (owner profile, read-only by tools)
-    .pip/users/<name>.md      (other user profiles, tool-managed)
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ class MemoryStore:
         self.pip_dir = base_dir.parent  # .pip/
         self.agent_dir.mkdir(parents=True, exist_ok=True)
         (self.agent_dir / "observations").mkdir(exist_ok=True)
+        (self.agent_dir / "users").mkdir(exist_ok=True)
 
     # ------------------------------------------------------------------
     # State
@@ -154,12 +155,12 @@ class MemoryStore:
             return ""
 
     def _all_profile_paths(self) -> list[Path]:
-        """Return owner.md + all users/*.md paths."""
+        """Return owner.md + all per-agent users/*.md paths."""
         paths: list[Path] = []
         owner = self.pip_dir / "owner.md"
         if owner.is_file():
             paths.append(owner)
-        users_dir = self.pip_dir / "users"
+        users_dir = self.agent_dir / "users"
         if users_dir.is_dir():
             paths.extend(sorted(users_dir.glob("*.md")))
         return paths
@@ -183,11 +184,11 @@ class MemoryStore:
     def _find_in_users(
         self, channel: str, sender_id: str,
     ) -> Path | None:
-        """Find a sender_id only within users/*.md (excludes owner.md)."""
+        """Find a sender_id only within per-agent users/*.md (excludes owner.md)."""
         if not sender_id:
             return None
         target = f"{channel}:{sender_id}"
-        users_dir = self.pip_dir / "users"
+        users_dir = self.agent_dir / "users"
         if not users_dir.is_dir():
             return None
         for path in sorted(users_dir.glob("*.md")):
@@ -200,10 +201,10 @@ class MemoryStore:
         return None
 
     def _find_user_by_name(self, name: str) -> Path | None:
-        """Find a users/*.md profile whose Name or What to call them matches."""
+        """Find a per-agent users/*.md profile whose Name or What to call them matches."""
         if not name:
             return None
-        users_dir = self.pip_dir / "users"
+        users_dir = self.agent_dir / "users"
         if not users_dir.is_dir():
             return None
         target_lower = name.strip().lower()
@@ -252,7 +253,7 @@ class MemoryStore:
         An unregistered sender may join an existing profile by name or create new.
         """
         new_id = f"{channel}:{sender_id}" if sender_id and channel else ""
-        users_dir = self.pip_dir / "users"
+        users_dir = self.agent_dir / "users"
         users_dir.mkdir(parents=True, exist_ok=True)
 
         registered_path = self._find_in_users(channel, sender_id) if new_id else None
@@ -270,6 +271,7 @@ class MemoryStore:
 
         current: dict[str, str] = {}
         current_ids: list[str] = []
+        current_admin: str | None = None
         if target_path.is_file():
             try:
                 in_ids = False
@@ -279,6 +281,8 @@ class MemoryStore:
                         prefix = f"- **{label}:**"
                         if stripped.startswith(prefix):
                             current[key] = stripped[len(prefix):].strip()
+                    if stripped.startswith("- **Admin:**"):
+                        current_admin = stripped[len("- **Admin:**"):].strip()
                     if stripped == "- **Identifiers:**":
                         in_ids = True
                         continue
@@ -315,6 +319,8 @@ class MemoryStore:
         for key, label in self._FIELD_MAP.items():
             val = current.get(key, "")
             lines.append(f"- **{label}:** {val}")
+        if current_admin is not None:
+            lines.append(f"- **Admin:** {current_admin}")
         if current_ids:
             lines.append("- **Identifiers:**")
             for ident in current_ids:
@@ -324,6 +330,103 @@ class MemoryStore:
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_text("\n".join(lines), encoding="utf-8")
         return f"Updated user profile ({target_path.name}): {', '.join(updated_keys)}"
+
+    # ------------------------------------------------------------------
+    # ACL: owner / admin
+    # ------------------------------------------------------------------
+
+    def is_owner(self, channel: str, sender_id: str) -> bool:
+        """Check if sender is the owner (CLI always True; otherwise match owner.md)."""
+        if channel == "cli":
+            return True
+        if not sender_id:
+            return False
+        target = f"{channel}:{sender_id}"
+        owner_path = self.pip_dir / "owner.md"
+        if not owner_path.is_file():
+            return False
+        try:
+            for line in owner_path.read_text(encoding="utf-8").splitlines():
+                if line.strip() == f"- `{target}`":
+                    return True
+        except OSError:
+            pass
+        return False
+
+    def is_admin(self, channel: str, sender_id: str) -> bool:
+        """Check if sender has admin privileges in their user profile."""
+        if not sender_id:
+            return False
+        profile = self._find_in_users(channel, sender_id)
+        if not profile:
+            return False
+        try:
+            for line in profile.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if stripped.startswith("- **Admin:**"):
+                    val = stripped[len("- **Admin:**"):].strip().lower()
+                    return val == "yes"
+        except OSError:
+            pass
+        return False
+
+    def set_admin(self, name: str, *, grant: bool) -> str:
+        """Grant or revoke admin for a user identified by name."""
+        profile = self._find_user_by_name(name)
+        if not profile:
+            return f"[error] User profile not found for '{name}'."
+        try:
+            content = profile.read_text(encoding="utf-8")
+        except OSError:
+            return f"[error] Cannot read profile for '{name}'."
+
+        lines = content.splitlines()
+        new_val = "yes" if grant else "no"
+        found = False
+        for i, line in enumerate(lines):
+            if line.strip().startswith("- **Admin:**"):
+                lines[i] = f"- **Admin:** {new_val}"
+                found = True
+                break
+
+        if not found:
+            insert_idx = len(lines)
+            for i, line in enumerate(lines):
+                if line.strip() == "- **Identifiers:**":
+                    insert_idx = i
+                    break
+            lines.insert(insert_idx, f"- **Admin:** {new_val}")
+
+        profile.write_text("\n".join(lines), encoding="utf-8")
+        action = "Granted" if grant else "Revoked"
+        return f"{action} admin for '{name}'."
+
+    def list_admins(self) -> list[str]:
+        """Return names of all users with admin privileges."""
+        admins: list[str] = []
+        users_dir = self.agent_dir / "users"
+        if not users_dir.is_dir():
+            return admins
+        for path in sorted(users_dir.glob("*.md")):
+            try:
+                is_admin = False
+                name = ""
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("- **Admin:**"):
+                        val = stripped[len("- **Admin:**"):].strip().lower()
+                        is_admin = val == "yes"
+                    if not name:
+                        for prefix in ("- **What to call them:**", "- **Name:**"):
+                            if stripped.startswith(prefix):
+                                val = stripped[len(prefix):].strip()
+                                if val:
+                                    name = val
+                if is_admin and name:
+                    admins.append(name)
+            except OSError:
+                continue
+        return admins
 
     # ------------------------------------------------------------------
     # Search / Recall
@@ -382,7 +485,7 @@ class MemoryStore:
         owner_text = self.load_user_profile()
         if owner_text:
             sections.append(owner_text)
-        users_dir = self.pip_dir / "users"
+        users_dir = self.agent_dir / "users"
         if users_dir.is_dir():
             for path in sorted(users_dir.glob("*.md")):
                 try:
@@ -422,6 +525,23 @@ class MemoryStore:
             system_prompt += f"\n\n## Channel\n\n{hints[channel]}"
 
         return system_prompt
+
+    # ------------------------------------------------------------------
+    # Factory reset
+    # ------------------------------------------------------------------
+
+    def factory_reset(self) -> None:
+        """Remove L1/L2/L3 files and scheduler state for this agent.
+
+        Does not touch persona.md, users/, owner.md, or bindings.
+        """
+        obs_dir = self.agent_dir / "observations"
+        if obs_dir.is_dir():
+            for fp in obs_dir.glob("*.jsonl"):
+                fp.unlink(missing_ok=True)
+        for name in ("memories.json", "axioms.md", "state.json"):
+            p = self.agent_dir / name
+            p.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
     # Stats
