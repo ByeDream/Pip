@@ -1,9 +1,16 @@
 """Git worktree manager for subagent task isolation.
 
-Each subagent gets its own worktree at ``.pip/.worktrees/{name}/``
-with a feature branch ``wt/{name}``.  The manager handles creation,
-syncing (merge main into feature), integration (merge feature into
-main), and cleanup.
+Each subagent gets its own worktree with a feature branch.  When
+``agent_id`` is provided the layout is per-agent:
+
+    .pip/agents/{agent_id}/worktrees/{name}/   branch wt/{agent_id}/{name}
+
+Without ``agent_id`` (legacy):
+
+    .pip/.worktrees/{name}/                    branch wt/{name}
+
+The manager handles creation, syncing (merge main into feature),
+integration (merge feature into main), and cleanup.
 """
 
 from __future__ import annotations
@@ -35,9 +42,13 @@ class MergeResult:
 class WorktreeManager:
     """Manages git worktrees for subagent isolation."""
 
-    def __init__(self, workdir: Path) -> None:
+    def __init__(self, workdir: Path, agent_id: str = "") -> None:
         self._workdir = workdir
-        self._worktrees_root = workdir / ".pip" / ".worktrees"
+        self._agent_id = agent_id
+        if agent_id:
+            self._worktrees_root = workdir / ".pip" / "agents" / agent_id / "worktrees"
+        else:
+            self._worktrees_root = workdir / ".pip" / ".worktrees"
         self._lock = threading.RLock()
 
     @property
@@ -75,6 +86,8 @@ class WorktreeManager:
         return self._worktrees_root / name
 
     def branch_name(self, name: str) -> str:
+        if self._agent_id:
+            return f"wt/{self._agent_id}/{name}"
         return f"wt/{name}"
 
     def exists(self, name: str) -> bool:

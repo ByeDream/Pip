@@ -728,17 +728,6 @@ class TeamManager:
         self._scan_dir(builtin_dir)
         self._scan_dir(user_dir)
 
-    def set_user_dir(self, user_dir: Path) -> None:
-        """Switch persistent paths (roster + inbox) for a different agent."""
-        if user_dir == self._user_dir:
-            return
-        self._user_dir = user_dir
-        user_dir.mkdir(parents=True, exist_ok=True)
-        self._bus = Bus(user_dir / "inbox")
-        self._roster.clear()
-        self._scan_dir(self._builtin_dir)
-        self._scan_dir(user_dir)
-
     def _scan_dir(self, directory: Path) -> None:
         if not directory.is_dir():
             return

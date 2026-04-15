@@ -317,8 +317,8 @@ def _process_inbound(
     tools: list[dict],
     skill_registry: SkillRegistry | None = None,
     bg_manager: BackgroundTaskManager | None = None,
-    team_manager: TeamManager | None = None,
-    worktree_manager: WorktreeManager | None = None,
+    team_managers: dict[str, TeamManager] | None = None,
+    worktree_managers: dict[str, WorktreeManager] | None = None,
     memory_store: MemoryStore | None = None,
 ) -> None:
     """Run agent_loop for one InboundMessage and route the reply."""
@@ -344,10 +344,29 @@ def _process_inbound(
         plan_managers[effective.id] = PlanManager(AGENTS_DIR / effective.id / "tasks")
     plan_manager = plan_managers[effective.id]
 
-    if team_manager is not None:
-        agent_team_dir = AGENTS_DIR / effective.id / "team"
-        team_manager.set_user_dir(agent_team_dir)
-        team_manager._plan_manager = plan_manager
+    worktree_manager: WorktreeManager | None = None
+    if worktree_managers is not None:
+        if effective.id not in worktree_managers:
+            worktree_managers[effective.id] = WorktreeManager(WORKDIR, agent_id=effective.id)
+        worktree_manager = worktree_managers[effective.id]
+
+    team_manager: TeamManager | None = None
+    if team_managers is not None:
+        if effective.id not in team_managers:
+            agent_team_dir = AGENTS_DIR / effective.id / "team"
+            agent_team_dir.mkdir(parents=True, exist_ok=True)
+            team_managers[effective.id] = TeamManager(
+                BUILTIN_TEAM_DIR,
+                agent_team_dir,
+                client,
+                profiler,
+                skill_registry=skill_registry,
+                plan_manager=plan_manager,
+                worktree_manager=worktree_manager,
+                pip_dir=WORKDIR / ".pip",
+            )
+            team_managers[effective.id].patch_model_enum(tools)
+        team_manager = team_managers[effective.id]
 
     if settings.verbose:
         print(
@@ -548,7 +567,9 @@ def run(mode: str = "auto") -> None:
     plan_managers: dict[str, PlanManager] = {default_agent.id: plan_manager}
     skill_registry = SkillRegistry(BUILTIN_SKILLS_DIR, USER_SKILLS_DIR)
 
-    worktree_manager = WorktreeManager(WORKDIR)
+    worktree_managers: dict[str, WorktreeManager] = {}
+    worktree_managers[default_agent.id] = WorktreeManager(WORKDIR, agent_id=default_agent.id)
+
     transcripts_dir = AGENTS_DIR / default_agent.id / "transcripts"
     memory_store = MemoryStore(
         base_dir=AGENTS_DIR,
@@ -556,19 +577,21 @@ def run(mode: str = "auto") -> None:
     )
     default_team_dir = AGENTS_DIR / default_agent.id / "team"
     default_team_dir.mkdir(parents=True, exist_ok=True)
-    team_manager = TeamManager(
+
+    team_managers: dict[str, TeamManager] = {}
+    team_managers[default_agent.id] = TeamManager(
         BUILTIN_TEAM_DIR,
         default_team_dir,
         client,
         profiler,
         skill_registry=skill_registry,
         plan_manager=plan_manager,
-        worktree_manager=worktree_manager,
+        worktree_manager=worktree_managers[default_agent.id],
         pip_dir=WORKDIR / ".pip",
     )
 
     tools: list[dict] = tools_for_role("lead")
-    team_manager.patch_model_enum(tools)
+    team_managers[default_agent.id].patch_model_enum(tools)
     if skill_registry.available:
         tools.append(skill_registry.tool_schema())
 
@@ -671,8 +694,8 @@ def run(mode: str = "auto") -> None:
         tools=tools,
         skill_registry=skill_registry,
         bg_manager=bg_manager,
-        team_manager=team_manager,
-        worktree_manager=worktree_manager,
+        team_managers=team_managers,
+        worktree_managers=worktree_managers,
         memory_store=memory_store,
     )
 
@@ -725,10 +748,10 @@ def run(mode: str = "auto") -> None:
                         stop_event.set()
                         break
                     if inbound.text == "/team":
-                        print(team_manager.status())
+                        print(team_managers[default_agent.id].status())
                         continue
                     if inbound.text == "/inbox":
-                        inbox = team_manager.peek_inbox()
+                        inbox = team_managers[default_agent.id].peek_inbox()
                         print(json.dumps(inbox, indent=2) if inbox else "(no messages)")
                         continue
                     if inbound.text == "/channels":
@@ -829,6 +852,8 @@ def run(mode: str = "auto") -> None:
                 time.sleep(0.3)
     else:
         # CLI-only mode: original blocking REPL (preserves readline, etc.)
+        default_tm = team_managers[default_agent.id]
+        default_wm = worktree_managers[default_agent.id]
         messages = conversations[cli_session_key]
         cli_system_prompt_base = default_agent.system_prompt(workdir=str(WORKDIR))
         if skill_registry.available:
@@ -839,7 +864,8 @@ def run(mode: str = "auto") -> None:
                 user_input = input("> ").strip()
             except (EOFError, KeyboardInterrupt):
                 print()
-                team_manager.deactivate_all()
+                for tm in team_managers.values():
+                    tm.deactivate_all()
                 break
 
             if not user_input:
@@ -866,20 +892,22 @@ def run(mode: str = "auto") -> None:
                     if result.response:
                         print(result.response)
                     if result.exit_requested:
-                        team_manager.deactivate_all()
+                        for tm in team_managers.values():
+                            tm.deactivate_all()
                         break
                     continue
 
             # -- Legacy bare 'exit' compat --
             if user_input.lower() == "exit":
-                team_manager.deactivate_all()
+                for tm in team_managers.values():
+                    tm.deactivate_all()
                 break
 
             if user_input == "/team":
-                print(team_manager.status())
+                print(default_tm.status())
                 continue
             if user_input == "/inbox":
-                inbox = team_manager.peek_inbox()
+                inbox = default_tm.peek_inbox()
                 print(json.dumps(inbox, indent=2) if inbox else "(no messages)")
                 continue
 
@@ -910,8 +938,8 @@ def run(mode: str = "auto") -> None:
                     skill_registry=skill_registry,
                     transcripts_dir=transcripts_dir,
                     bg_manager=bg_manager,
-                    team_manager=team_manager,
-                    worktree_manager=worktree_manager,
+                    team_manager=default_tm,
+                    worktree_manager=default_wm,
                     memory_store=memory_store,
                 )
             except KeyboardInterrupt:
@@ -957,7 +985,8 @@ def run(mode: str = "auto") -> None:
 
     # -- Cleanup --
     stop_event.set()
-    team_manager.deactivate_all()
+    for tm in team_managers.values():
+        tm.deactivate_all()
     channel_mgr.close_all()
     for t in bg_threads:
         t.join(timeout=5.0)

@@ -175,6 +175,58 @@ class TestWorktreeManager:
         mgr = WorktreeManager(repo)
         assert mgr.worktrees_root == repo / ".pip" / ".worktrees"
 
+    def test_agent_id_scopes_root(self, tmp_path: Path):
+        repo = _init_repo(tmp_path / "repo")
+        mgr = WorktreeManager(repo, agent_id="pip-boy")
+        assert mgr.worktrees_root == repo / ".pip" / "agents" / "pip-boy" / "worktrees"
+
+    def test_agent_id_scopes_branch_name(self, tmp_path: Path):
+        repo = _init_repo(tmp_path / "repo")
+        mgr = WorktreeManager(repo, agent_id="pip-boy")
+        assert mgr.branch_name("coder") == "wt/pip-boy/coder"
+
+    def test_two_agents_same_teammate_no_collision(self, tmp_path: Path):
+        repo = _init_repo(tmp_path / "repo")
+        mgr_a = WorktreeManager(repo, agent_id="agent-a")
+        mgr_b = WorktreeManager(repo, agent_id="agent-b")
+
+        wt_a = mgr_a.create("coder")
+        wt_b = mgr_b.create("coder")
+
+        assert wt_a != wt_b
+        assert wt_a.is_dir()
+        assert wt_b.is_dir()
+        assert mgr_a.exists("coder")
+        assert mgr_b.exists("coder")
+
+        r = _git(["branch", "--list", "wt/agent-a/coder"], cwd=repo)
+        assert "wt/agent-a/coder" in r.stdout
+        r = _git(["branch", "--list", "wt/agent-b/coder"], cwd=repo)
+        assert "wt/agent-b/coder" in r.stdout
+
+        mgr_a.remove("coder")
+        assert not mgr_a.exists("coder")
+        assert mgr_b.exists("coder")
+        mgr_b.remove("coder")
+
+    def test_agent_id_full_lifecycle(self, tmp_path: Path):
+        """Create -> work -> sync -> integrate -> remove with agent_id."""
+        repo = _init_repo(tmp_path / "repo")
+        mgr = WorktreeManager(repo, agent_id="my-agent")
+
+        wt = mgr.create("coder")
+        assert wt == repo / ".pip" / "agents" / "my-agent" / "worktrees" / "coder"
+        (wt / "new_feature.py").write_text("def hello(): pass\n")
+        _git(["add", "."], cwd=wt)
+        _git(["commit", "-m", "add feature"], cwd=wt)
+
+        assert mgr.sync("coder").ok
+        assert mgr.integrate("coder").ok
+        assert (repo / "new_feature.py").is_file()
+
+        mgr.remove("coder")
+        assert not mgr.exists("coder")
+
     def test_full_lifecycle(self, tmp_path: Path):
         """Create -> work -> sync -> integrate -> remove."""
         repo = _init_repo(tmp_path / "repo")
