@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+log = logging.getLogger(__name__)
 
 from pip_agent.tools import (
     run_bash,
@@ -83,6 +86,9 @@ def _wrap_simple(
         return run(inp, workdir=workdir) if workdir else run(inp)
     except ValueError as e:
         return f"[blocked] {e}"
+    except OSError as e:
+        log.warning("Tool raised critical OS error: %s", e)
+        return f"[critical_error] {e}"
     except Exception as e:
         return f"[error] {e}"
 

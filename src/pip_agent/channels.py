@@ -145,9 +145,6 @@ class CLIChannel(Channel):
 # WeChatChannel — iLink Bot long-poll protocol
 # ---------------------------------------------------------------------------
 
-import httpx as _httpx
-
-
 def _random_wechat_uin() -> str:
     """Generate X-WECHAT-UIN: random uint32 → decimal string → base64."""
     val = random.randint(0, 0xFFFFFFFF)
@@ -163,11 +160,13 @@ class WeChatChannel(Channel):
     MAX_TEXT_LEN = 2000
 
     def __init__(self, state_dir: Path) -> None:
+        import httpx
+
         self._state_dir = state_dir
         self._state_dir.mkdir(parents=True, exist_ok=True)
         self._cred_path = state_dir / "wechat_session.json"
 
-        self._http = _httpx.Client(timeout=40.0)
+        self._http = httpx.Client(timeout=40.0)
         self._bot_token: str = ""
         self._base_url: str = self.ILINK_BASE
         self._account_id: str = ""
@@ -191,8 +190,8 @@ class WeChatChannel(Channel):
             self._account_id = data.get("accountId", "")
             self._user_id = data.get("userId", "")
             self._get_updates_buf = data.get("get_updates_buf", "")
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError, KeyError) as exc:
+            log.debug("wechat: failed to load credentials: %s", exc)
 
     def _save_creds(self) -> None:
         data = {
@@ -494,8 +493,8 @@ class WeChatChannel(Channel):
                 },
                 timeout=5.0,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("wechat: send_typing failed: %s", exc)
 
     def _split_text(self, text: str) -> list[str]:
         if len(text) <= self.MAX_TEXT_LEN:
@@ -946,8 +945,8 @@ class ChannelManager:
         for ch in self.channels.values():
             try:
                 ch.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("error closing channel %s: %s", ch.name, exc)
 
 
 # ---------------------------------------------------------------------------

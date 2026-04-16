@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = "claude-opus-4-6"
-DEFAULT_MAX_TOKENS = 8096
+DEFAULT_MAX_TOKENS = 8192
 DEFAULT_DM_SCOPE = "per-guild"
 DEFAULT_COMPACT_THRESHOLD = 50_000
 DEFAULT_COMPACT_MICRO_AGE = 3

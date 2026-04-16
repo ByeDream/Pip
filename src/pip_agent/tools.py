@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
+import socket
 import subprocess
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pip_agent.config import settings
 
@@ -808,12 +812,121 @@ _TEAMMATE_ONLY = frozenset({
 })
 
 # ---------------------------------------------------------------------------
+# Security helpers
+# ---------------------------------------------------------------------------
+
+_DANGEROUS_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)?(-[a-zA-Z]*r[a-zA-Z]*\s+)*/",
+        r"rm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?(-[a-zA-Z]*f[a-zA-Z]*\s+)*/",
+        r"\bmkfs\b",
+        r"\bdd\s+if=",
+        r":\(\)\s*\{\s*:\|:\s*&\s*\}\s*;",
+        r"\bshutdown\b",
+        r"\breboot\b",
+        r"\bformat\s+[A-Za-z]:",
+        r"\b(curl|wget)\b.*\|\s*(ba)?sh",
+        r">\s*/dev/sd[a-z]",
+        r"\binit\s+0\b",
+        r"\bhalt\b",
+    ]
+]
+
+
+def _check_dangerous_command(command: str) -> str | None:
+    """Return a block message if *command* matches a dangerous pattern."""
+    for pat in _DANGEROUS_PATTERNS:
+        if pat.search(command):
+            return (
+                f"[blocked] Command refused by safety filter: "
+                f"matched dangerous pattern {pat.pattern!r}. "
+                f"If this is intentional, run it manually in your terminal."
+            )
+    return None
+
+
+_PRIVATE_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
+
+def _validate_fetch_url(url: str) -> str | None:
+    """Return an error message if *url* should be blocked (SSRF prevention)."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return f"[blocked] Only http/https URLs are allowed, got {parsed.scheme!r}"
+    hostname = parsed.hostname
+    if not hostname:
+        return "[blocked] URL has no hostname"
+    try:
+        infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except socket.gaierror:
+        return f"[blocked] Could not resolve hostname: {hostname}"
+    for _family, _type, _proto, _canonname, sockaddr in infos:
+        addr = ipaddress.ip_address(sockaddr[0])
+        for net in _PRIVATE_NETWORKS:
+            if addr in net:
+                return (
+                    f"[blocked] URL resolves to private/loopback address "
+                    f"({addr}); request denied for security."
+                )
+    return None
+
+
+class _HTMLTextExtractor(HTMLParser):
+    """Extract visible text from HTML, skipping script/style content."""
+
+    _SKIP_TAGS = frozenset({"script", "style"})
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pieces: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() in self._SKIP_TAGS:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in self._SKIP_TAGS and self._skip_depth > 0:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth == 0:
+            self._pieces.append(data)
+
+    def get_text(self) -> str:
+        return re.sub(r"\s+", " ", " ".join(self._pieces)).strip()
+
+
+def _strip_html(raw: str) -> str:
+    """Strip HTML tags and return visible text."""
+    extractor = _HTMLTextExtractor()
+    try:
+        extractor.feed(raw)
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", raw)
+    return extractor.get_text()
+
+
+# ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
 
 
 def run_bash(tool_input: dict, *, workdir: Path | None = None) -> str:
     command = tool_input["command"]
+    blocked = _check_dangerous_command(command)
+    if blocked:
+        return blocked
     timeout = tool_input.get("timeout", 120)
     cwd = workdir or WORKDIR
     try:
@@ -1001,6 +1114,10 @@ def run_web_fetch(tool_input: dict) -> str:
     import httpx
 
     url = tool_input["url"]
+    blocked = _validate_fetch_url(url)
+    if blocked:
+        return blocked
+
     max_chars = 8000
     try:
         resp = httpx.get(url, follow_redirects=True, timeout=30)
@@ -1012,10 +1129,7 @@ def run_web_fetch(tool_input: dict) -> str:
     text = resp.text
 
     if "html" in content_type:
-        text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL)
-        text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL)
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = re.sub(r"\s+", " ", text).strip()
+        text = _strip_html(text)
 
     if len(text) > max_chars:
         text = text[:max_chars] + f"\n\n[truncated at {max_chars} chars]"

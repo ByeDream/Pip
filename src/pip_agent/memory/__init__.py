@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from pip_agent.types import Memory, Observation
+
 log = logging.getLogger(__name__)
 
 
@@ -61,7 +63,7 @@ class MemoryStore:
     # Observations (L1)
     # ------------------------------------------------------------------
 
-    def write_observations(self, observations: list[dict[str, Any]]) -> None:
+    def write_observations(self, observations: list[Observation]) -> None:
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         path = self.agent_dir / "observations" / f"{date_str}.jsonl"
         with path.open("a", encoding="utf-8") as f:
@@ -80,11 +82,11 @@ class MemoryStore:
         }
         self.write_observations([obs])
 
-    def load_all_observations(self) -> list[dict[str, Any]]:
+    def load_all_observations(self) -> list[Observation]:
         obs_dir = self.agent_dir / "observations"
         if not obs_dir.is_dir():
             return []
-        result: list[dict[str, Any]] = []
+        result: list[Observation] = []
         for fp in sorted(obs_dir.glob("*.jsonl")):
             try:
                 for line in fp.read_text(encoding="utf-8").splitlines():
@@ -99,7 +101,7 @@ class MemoryStore:
     # Memories (L2)
     # ------------------------------------------------------------------
 
-    def load_memories(self) -> list[dict[str, Any]]:
+    def load_memories(self) -> list[Memory]:
         path = self.agent_dir / "memories.json"
         if not path.is_file():
             return []
@@ -109,7 +111,7 @@ class MemoryStore:
         except (json.JSONDecodeError, OSError):
             return []
 
-    def save_memories(self, memories: list[dict[str, Any]]) -> None:
+    def save_memories(self, memories: list[Memory]) -> None:
         path = self.agent_dir / "memories.json"
         path.write_text(
             json.dumps(memories, indent=2, ensure_ascii=False, default=str),

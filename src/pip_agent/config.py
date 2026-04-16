@@ -1,7 +1,9 @@
-import sys
-
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ConfigError(Exception):
+    """Raised when required configuration is missing or invalid."""
 
 
 class Settings(BaseSettings):
@@ -25,7 +27,7 @@ class Settings(BaseSettings):
     # Legacy fields kept for backward compat with existing .env files.
     # These are now configured per-agent in .pip/agents/*.md.
     model: str = Field(default="claude-opus-4-6")
-    max_tokens: int = Field(default=8096)
+    max_tokens: int = Field(default=8192)
     compact_threshold: int = Field(default=50_000)
     compact_micro_age: int = Field(default=3)
 
@@ -34,9 +36,7 @@ class Settings(BaseSettings):
         if not self.anthropic_api_key:
             errors.append("ANTHROPIC_API_KEY is not set")
         if errors:
-            for e in errors:
-                print(f"  [config error] {e}", file=sys.stderr)
-            sys.exit(1)
+            raise ConfigError("; ".join(errors))
 
 
 settings = Settings()

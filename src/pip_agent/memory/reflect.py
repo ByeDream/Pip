@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from pip_agent.types import Observation
+
 import anthropic
 
 log = logging.getLogger(__name__)
@@ -113,7 +115,7 @@ def reflect(
     since: float,
     *,
     model: str = "",
-) -> list[dict[str, Any]]:
+) -> list[Observation]:
     """Run L1 reflection on recent transcripts.
 
     Returns list of observation dicts: [{text, category}, ...].
@@ -167,7 +169,7 @@ def reflect(
         return []
 
     now = time.time()
-    valid: list[dict[str, Any]] = []
+    valid: list[Observation] = []
     for obs in observations:
         if isinstance(obs, dict) and obs.get("text"):
             valid.append({

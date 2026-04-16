@@ -26,6 +26,13 @@ dependencies = [
     "qrcode>=7",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-cov",
+    "ruff",
+]
+
 [project.scripts]
 pip-boy = "pip_agent.__main__:main"
 
@@ -38,3 +45,13 @@ where = ["src"]
 [tool.setuptools.package-data]
 "pip_agent.skills" = ["**/*.md"]
 "pip_agent.scaffold" = ["*.md", "*.json", "*.txt", "env.example"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

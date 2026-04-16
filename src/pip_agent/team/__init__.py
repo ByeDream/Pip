@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 from pip_agent.config import settings
 from pip_agent.profiler import Profiler
 from pip_agent.tool_dispatch import TeammateToolSurface, ToolContext, dispatch_tool
-from pip_agent.tools import VALID_MSG_TYPES, WORKDIR, tools_for_role
+from pip_agent.tools import VALID_MSG_TYPES, WORKDIR as _DEFAULT_WORKDIR, tools_for_role
 
 if TYPE_CHECKING:
     import anthropic
@@ -305,6 +305,7 @@ class Teammate:
         done_fn: callable | None = None,
         plan_manager: PlanManager | None = None,
         worktree_manager: WorktreeManager | None = None,
+        workdir: Path | None = None,
     ) -> None:
         self.spec = spec
         self._model = model
@@ -317,6 +318,7 @@ class Teammate:
         self._done_fn = done_fn
         self._plan_manager = plan_manager
         self._worktree_manager = worktree_manager
+        self._workdir = workdir or _DEFAULT_WORKDIR
         self._max_turns = max_turns
         self._status = "working"
         self._shutdown = threading.Event()
@@ -670,7 +672,7 @@ class Teammate:
         if wt is not None and wt.exists(self.spec.name):
             workdir = str(wt.worktree_path(self.spec.name))
         else:
-            workdir = str(WORKDIR)
+            workdir = str(self._workdir)
 
         base = (
             f"You are '{self.spec.name}', a subagent in an agent team.\n"
@@ -710,12 +712,14 @@ class TeamManager:
         plan_manager: PlanManager | None = None,
         worktree_manager: WorktreeManager | None = None,
         pip_dir: Path | None = None,
+        workdir: Path | None = None,
     ) -> None:
         self._client = client
         self._profiler = profiler
         self._skill_registry = skill_registry
         self._plan_manager = plan_manager
         self._worktree_manager = worktree_manager
+        self._workdir = workdir or _DEFAULT_WORKDIR
         self._roster: dict[str, TeammateSpec] = {}
         self._active: dict[str, Teammate] = {}
         self._active_lock = threading.Lock()
@@ -763,6 +767,7 @@ class TeamManager:
             done_fn=self._on_done,
             plan_manager=self._plan_manager,
             worktree_manager=self._worktree_manager,
+            workdir=self._workdir,
         )
 
     # -- Public API (called from agent_loop) --------------------------------
@@ -877,7 +882,7 @@ class TeamManager:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(spec.to_frontmatter(), encoding="utf-8")
         self._roster[name] = spec
-        return f"Created teammate '{name}' at {path.relative_to(WORKDIR)}"
+        return f"Created teammate '{name}' at {path.relative_to(self._workdir)}"
 
     def edit_teammate(self, name: str, **updates: str) -> str:
         _validate_name(name)

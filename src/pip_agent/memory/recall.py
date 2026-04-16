@@ -11,6 +11,8 @@ import re
 import time
 from typing import Any
 
+from pip_agent.types import Memory
+
 _CJK_RE = re.compile(
     r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff"
     r"\U00020000-\U0002a6df\U0002a700-\U0002ebef]"
@@ -67,12 +69,12 @@ def temporal_decay(ts: float, half_life_days: float = 30.0) -> float:
 
 def search_memories(
     query: str,
-    memories: list[dict[str, Any]],
+    memories: list[Memory],
     *,
     top_k: int = 5,
     time_weight: float = 0.3,
     half_life_days: float = 30.0,
-) -> list[dict[str, Any]]:
+) -> list[Memory]:
     """Search memories by TF-IDF cosine similarity with optional time decay.
 
     Each memory dict must have at least ``text`` and ``last_reinforced`` (epoch).
@@ -111,7 +113,7 @@ def search_memories(
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    results: list[dict[str, Any]] = []
+    results: list[Memory] = []
     for score, idx in scored[:top_k]:
         entry = dict(memories[idx])
         entry["score"] = round(score, 4)

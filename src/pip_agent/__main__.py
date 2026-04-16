@@ -2,6 +2,7 @@ import argparse
 import sys
 
 from pip_agent.agent import run
+from pip_agent.config import ConfigError
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -17,12 +18,16 @@ def main(argv: list[str] | None = None) -> None:
         print(f"pip-boy {__version__}")
         return
 
-    if args.cli:
-        run(mode="cli")
-    elif args.scan:
-        run(mode="scan")
-    else:
-        run(mode="auto")
+    try:
+        if args.cli:
+            run(mode="cli")
+        elif args.scan:
+            run(mode="scan")
+        else:
+            run(mode="auto")
+    except ConfigError as exc:
+        print(f"  [config error] {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

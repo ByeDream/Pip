@@ -13,6 +13,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from pip_agent.types import Memory, Observation
+
 import anthropic
 
 log = logging.getLogger(__name__)
@@ -56,12 +58,12 @@ AXIOM_SYSTEM = (
 
 def consolidate(
     client: anthropic.Anthropic,
-    observations: list[dict[str, Any]],
-    memories: list[dict[str, Any]],
+    observations: list[Observation],
+    memories: list[Memory],
     cycle_count: int,
     *,
     model: str = "",
-) -> list[dict[str, Any]]:
+) -> list[Memory]:
     """L2: merge observations into memories. Returns updated memory list."""
     from pip_agent.config import settings
     if not model:
@@ -126,7 +128,7 @@ def consolidate(
 
 def distill_axioms(
     client: anthropic.Anthropic,
-    memories: list[dict[str, Any]],
+    memories: list[Memory],
     *,
     model: str = "",
 ) -> str:

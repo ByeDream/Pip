@@ -7,6 +7,7 @@ import re
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import anthropic
@@ -102,6 +103,18 @@ _TOOL_KEY_PARAM: dict[str, str] = {
 _LEADING_AT_RE = re.compile(r"^@\S*\s*")
 
 
+@dataclass
+class RuntimeContext:
+    """Shared service objects threaded through agent_loop / _process_inbound."""
+
+    client: anthropic.Anthropic
+    profiler: Profiler
+    tools: list[dict]
+    skill_registry: SkillRegistry | None = None
+    bg_manager: BackgroundTaskManager | None = None
+    memory_store: MemoryStore | None = None
+
+
 def _tool_summary(name: str, inputs: dict) -> str:
     key = _TOOL_KEY_PARAM.get(name)
     if key and key in inputs:
@@ -113,24 +126,19 @@ def _tool_summary(name: str, inputs: dict) -> str:
 
 
 def agent_loop(
-    client: anthropic.Anthropic,
+    ctx: RuntimeContext,
     messages: list[dict],
     user_input: str | list,
-    profiler: Profiler,
     plan_manager: PlanManager,
     *,
-    tools: list[dict],
     system_prompt: str,
     model: str = "",
     max_tokens: int = 0,
     compact_threshold: int = 0,
     compact_micro_age: int = 0,
-    skill_registry: SkillRegistry | None = None,
     transcripts_dir: Path | None = None,
-    bg_manager: BackgroundTaskManager | None = None,
     team_manager: TeamManager | None = None,
     worktree_manager: WorktreeManager | None = None,
-    memory_store: MemoryStore | None = None,
     channel: Channel | None = None,
     peer_id: str = "",
     sender_id: str = "",
@@ -150,8 +158,8 @@ def agent_loop(
     while True:
         micro_compact(messages, max_age=compact_micro_age or None)
 
-        if bg_manager is not None:
-            notifications = bg_manager.drain()
+        if ctx.bg_manager is not None:
+            notifications = ctx.bg_manager.drain()
             if notifications:
                 last_msg = messages[-1]
                 if last_msg["role"] == "user":
@@ -169,7 +177,7 @@ def agent_loop(
                                 f"\n{n.result}\n</background-result>"
                             ),
                         })
-                        profiler.record("bg:bash", n.elapsed_ms)
+                        ctx.profiler.record("bg:bash", n.elapsed_ms)
 
         if team_manager is not None:
             inbox = team_manager.read_inbox()
@@ -203,33 +211,33 @@ def agent_loop(
                 isinstance(b, dict) and b.get("type") not in ("text", "tool_result")
                 for b in current_input
             )
-            auto_compact(client, messages, system_prompt, transcripts_dir, profiler)
+            auto_compact(ctx.client, messages, system_prompt, transcripts_dir, ctx.profiler)
             if has_media and current_input is not None:
                 summary_text = messages[0]["content"]
                 blocks: list[dict] = [{"type": "text", "text": summary_text}]
                 blocks.extend(current_input)
                 messages[0]["content"] = blocks
 
-        profiler.start("api")
+        ctx.profiler.start("api")
         try:
-            response = client.messages.create(
+            response = ctx.client.messages.create(
                 model=effective_model,
                 max_tokens=effective_max_tokens,
                 system=system_prompt,
-                tools=tools,
+                tools=ctx.tools,
                 messages=messages,
             )
         except KeyboardInterrupt:
-            profiler.stop()
+            ctx.profiler.stop()
             print("\n  [interrupted] API call cancelled.")
             break
         except anthropic.APIError as exc:
-            profiler.stop()
+            ctx.profiler.stop()
             print(f"\n  [api_error] {exc}")
             break
         usage = response.usage
         last_input_tokens = usage.input_tokens
-        profiler.stop(
+        ctx.profiler.stop(
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             stop=response.stop_reason,
@@ -243,16 +251,17 @@ def agent_loop(
             used_task_tool = False
             compact_requested = False
             tool_ctx = ToolContext(
-                profiler=profiler,
+                profiler=ctx.profiler,
                 plan_manager=plan_manager,
-                skill_registry=skill_registry,
-                bg_manager=bg_manager,
+                skill_registry=ctx.skill_registry,
+                bg_manager=ctx.bg_manager,
                 team_manager=team_manager,
                 worktree_manager=worktree_manager,
-                memory_store=memory_store,
+                memory_store=ctx.memory_store,
                 channel=channel,
                 peer_id=peer_id,
                 sender_id=sender_id,
+                workdir=WORKDIR,
             )
             for block in assistant_content:
                 if hasattr(block, "text") and block.text.strip():
@@ -293,7 +302,7 @@ def agent_loop(
                     print(f"  [context] auto_compact triggered ({reason})")
                 if transcripts_dir is not None:
                     auto_compact(
-                        client, messages, system_prompt, transcripts_dir, profiler
+                        ctx.client, messages, system_prompt, transcripts_dir, ctx.profiler
                     )
         else:
             final_text = "".join(
@@ -308,18 +317,13 @@ def _process_inbound(
     inbound: InboundMessage,
     conversations: dict[str, list[dict]],
     channel_mgr: ChannelManager,
-    client: anthropic.Anthropic,
-    profiler: Profiler,
+    ctx: RuntimeContext,
     plan_managers: dict[str, PlanManager],
     *,
     registry: AgentRegistry,
     binding_table: BindingTable,
-    tools: list[dict],
-    skill_registry: SkillRegistry | None = None,
-    bg_manager: BackgroundTaskManager | None = None,
     team_managers: dict[str, TeamManager] | None = None,
     worktree_managers: dict[str, WorktreeManager] | None = None,
-    memory_store: MemoryStore | None = None,
 ) -> None:
     """Run agent_loop for one InboundMessage and route the reply."""
     agent_id, binding = binding_table.resolve(
@@ -358,14 +362,15 @@ def _process_inbound(
             team_managers[effective.id] = TeamManager(
                 BUILTIN_TEAM_DIR,
                 agent_team_dir,
-                client,
-                profiler,
-                skill_registry=skill_registry,
+                ctx.client,
+                ctx.profiler,
+                skill_registry=ctx.skill_registry,
                 plan_manager=plan_manager,
                 worktree_manager=worktree_manager,
                 pip_dir=WORKDIR / ".pip",
+                workdir=WORKDIR,
             )
-            team_managers[effective.id].patch_model_enum(tools)
+            team_managers[effective.id].patch_model_enum(ctx.tools)
         team_manager = team_managers[effective.id]
 
     if settings.verbose:
@@ -387,8 +392,8 @@ def _process_inbound(
     messages = conversations[sk]
 
     system_prompt = effective.system_prompt(workdir=str(WORKDIR))
-    if skill_registry and skill_registry.available:
-        system_prompt += "\n\n" + skill_registry.catalog_prompt()
+    if ctx.skill_registry and ctx.skill_registry.available:
+        system_prompt += "\n\n" + ctx.skill_registry.catalog_prompt()
 
     clean_text = (
         _LEADING_AT_RE.sub("", inbound.text, count=1)
@@ -396,8 +401,8 @@ def _process_inbound(
     )
 
     user_text = clean_text if isinstance(clean_text, str) else ""
-    if memory_store:
-        system_prompt = memory_store.enrich_prompt(
+    if ctx.memory_store:
+        system_prompt = ctx.memory_store.enrich_prompt(
             system_prompt, user_text,
             channel=inbound.channel,
             agent_id=effective.id,
@@ -408,8 +413,8 @@ def _process_inbound(
     user_input: str | list = clean_text
 
     sender_status = "unverified"
-    if memory_store and inbound.sender_id:
-        _profile = memory_store.find_profile_by_sender(
+    if ctx.memory_store and inbound.sender_id:
+        _profile = ctx.memory_store.find_profile_by_sender(
             inbound.channel, inbound.sender_id,
         )
         if _profile:
@@ -474,23 +479,18 @@ def _process_inbound(
 
     try:
         reply_text = agent_loop(
-            client,
+            ctx,
             messages,
             user_input,
-            profiler,
             plan_manager,
-            tools=tools,
             system_prompt=system_prompt,
             model=effective.effective_model,
             max_tokens=effective.effective_max_tokens,
             compact_threshold=effective.effective_compact_threshold,
             compact_micro_age=effective.effective_compact_micro_age,
-            skill_registry=skill_registry,
             transcripts_dir=per_agent_transcripts,
-            bg_manager=bg_manager,
             team_manager=team_manager,
             worktree_manager=worktree_manager,
-            memory_store=memory_store,
             channel=ch,
             peer_id=reply_peer,
             sender_id=inbound.sender_id,
@@ -509,7 +509,7 @@ def _process_inbound(
                       f"printing to terminal instead:")
                 print(reply_text)
 
-    profiler.flush()
+    ctx.profiler.flush()
 
 
 def _stdin_reader_thread(
@@ -588,6 +588,7 @@ def run(mode: str = "auto") -> None:
         plan_manager=plan_manager,
         worktree_manager=worktree_managers[default_agent.id],
         pip_dir=WORKDIR / ".pip",
+        workdir=WORKDIR,
     )
 
     tools: list[dict] = tools_for_role("lead")
@@ -688,15 +689,20 @@ def run(mode: str = "auto") -> None:
     )
     conversations[cli_session_key] = []
 
-    common_kwargs = dict(
-        registry=registry,
-        binding_table=binding_table,
+    rt_ctx = RuntimeContext(
+        client=client,
+        profiler=profiler,
         tools=tools,
         skill_registry=skill_registry,
         bg_manager=bg_manager,
+        memory_store=memory_store,
+    )
+
+    common_kwargs = dict(
+        registry=registry,
+        binding_table=binding_table,
         team_managers=team_managers,
         worktree_managers=worktree_managers,
-        memory_store=memory_store,
     )
 
     if has_remote_channels:
@@ -765,7 +771,7 @@ def run(mode: str = "auto") -> None:
                     poll_pause.set()
                     try:
                         _process_inbound(
-                            inbound, conversations, channel_mgr, client, profiler,
+                            inbound, conversations, channel_mgr, rt_ctx,
                             plan_managers, **common_kwargs,
                         )
                     finally:
@@ -811,7 +817,7 @@ def run(mode: str = "auto") -> None:
                             attachments=all_atts,
                         )
                         _process_inbound(
-                            combined, conversations, channel_mgr, client, profiler,
+                            combined, conversations, channel_mgr, rt_ctx,
                             plan_managers, **common_kwargs,
                         )
                 finally:
@@ -921,12 +927,10 @@ def run(mode: str = "auto") -> None:
 
             try:
                 reply_text = agent_loop(
-                    client,
+                    rt_ctx,
                     messages,
                     user_input,
-                    profiler,
                     plan_manager,
-                    tools=tools,
                     system_prompt=cli_system_prompt,
                     model=default_agent.effective_model,
                     max_tokens=default_agent.effective_max_tokens,
@@ -935,12 +939,9 @@ def run(mode: str = "auto") -> None:
                     channel=cli_channel,
                     peer_id="cli-user",
                     sender_id="cli-user",
-                    skill_registry=skill_registry,
                     transcripts_dir=transcripts_dir,
-                    bg_manager=bg_manager,
                     team_manager=default_tm,
                     worktree_manager=default_wm,
-                    memory_store=memory_store,
                 )
             except KeyboardInterrupt:
                 print("\n  [interrupted] Returning to prompt.")

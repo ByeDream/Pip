@@ -39,7 +39,7 @@ class CommandContext:
     inbound: InboundMessage
     registry: AgentRegistry
     bindings: BindingTable
-    bindings_path: Any  # Path
+    bindings_path: Path
     workdir: str = ""
     memory_store: MemoryStore | None = None
 
