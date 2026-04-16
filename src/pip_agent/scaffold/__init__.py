@@ -47,9 +47,9 @@ def _save_manifest(workdir: Path, manifest: dict) -> None:
 def ensure_workspace(workdir: Path, *, default_agent_id: str = "pip-boy") -> None:
     """Idempotent workspace initialization with scaffold migration."""
     _ensure_dirs(workdir, default_agent_id=default_agent_id)
+    _migrate_legacy_layout(workdir, default_agent_id=default_agent_id)
 
     manifest = _load_manifest(workdir)
-    old_version = manifest.get("version", "0.0.0")
     files_meta = manifest.get("files", {})
 
     for rel_target, scaffold_name in _SCAFFOLD_FILES:
@@ -112,7 +112,6 @@ def ensure_workspace(workdir: Path, *, default_agent_id: str = "pip-boy") -> Non
     manifest["files"] = files_meta
     _save_manifest(workdir, manifest)
 
-    _migrate_legacy_layout(workdir, default_agent_id=default_agent_id)
     _ensure_gitignore(workdir)
     _check_git(workdir)
 
@@ -146,8 +145,6 @@ def _migrate_legacy_layout(
 
     # Legacy flat agent .md → per-agent persona.md
     for md in sorted(agents.glob("*.md")):
-        if md.name == "bindings.json":
-            continue
         agent_id = md.stem
         persona = agents / agent_id / "persona.md"
         if not persona.exists():
@@ -170,6 +167,13 @@ def _migrate_legacy_layout(
                         shutil.copytree(item, dest)
                     else:
                         shutil.copy2(item, dest)
+                elif item.is_dir() and dest.is_dir():
+                    for child in item.rglob("*"):
+                        if child.is_file():
+                            child_dest = dest / child.relative_to(item)
+                            if not child_dest.exists():
+                                child_dest.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(child, child_dest)
             logger.info("Migrated memory/%s → agents/%s", sub.name, sub.name)
 
     # Legacy .pip/users/ → default agent's users/

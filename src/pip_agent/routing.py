@@ -34,7 +34,7 @@ DEFAULT_MODEL = "claude-opus-4-6"
 DEFAULT_MAX_TOKENS = 8192
 DEFAULT_DM_SCOPE = "per-guild"
 DEFAULT_COMPACT_THRESHOLD = 50_000
-DEFAULT_COMPACT_MICRO_AGE = 3
+DEFAULT_COMPACT_MICRO_AGE = 8
 DEFAULT_AGENT_ID = "pip-boy"
 
 # ---------------------------------------------------------------------------
@@ -92,7 +92,9 @@ class AgentConfig:
         return self.compact_micro_age or DEFAULT_COMPACT_MICRO_AGE
 
     def system_prompt(self, workdir: str = "") -> str:
-        body = self.system_body.replace("{workdir}", workdir) if self.system_body else ""
+        body = self.system_body if self.system_body else ""
+        body = body.replace("{workdir}", workdir)
+        body = body.replace("{model_name}", self.effective_model)
         return body
 
 

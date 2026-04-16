@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 MAX_TOOL_OUTPUT = 50_000
 
 TASK_BOARD_HINT = (
-    "<task-board-hint>Review the task board.</task-board-hint>"
+    "<task_notification>Review the task board.</task_notification>"
 )
 
 IDLE_POLL_INTERVAL = 5

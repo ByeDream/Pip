@@ -292,7 +292,7 @@ def agent_loop(
             rounds_since_todo = 0 if used_task_tool else rounds_since_todo + 1
             if plan_manager.has_tasks() and rounds_since_todo >= NAG_THRESHOLD:
                 tool_results.append(
-                    {"type": "text", "text": "<reminder>Update your tasks.</reminder>"}
+                    {"type": "text", "text": "<system_reminder>Update your tasks.</system_reminder>"}
                 )
             messages.append({"role": "user", "content": tool_results})
 
@@ -423,15 +423,17 @@ def _process_inbound(
 
     if inbound.is_group:
         user_input = (
-            f'<group-message from="{inbound.sender_id}" status="{sender_status}">'
-            f"\n{clean_text}\n</group-message>"
+            f'<user_query from="{inbound.sender_id}" status="{sender_status}" group="true">'
+            f"\n{clean_text}\n</user_query>"
         )
     elif inbound.sender_id:
         user_input = (
-            f'<message from="{inbound.channel}:{inbound.sender_id}"'
+            f'<user_query from="{inbound.channel}:{inbound.sender_id}"'
             f' status="{sender_status}">'
-            f"\n{clean_text}\n</message>"
+            f"\n{clean_text}\n</user_query>"
         )
+    else:
+        user_input = f"<user_query>\n{clean_text}\n</user_query>"
 
     if inbound.attachments:
         content_blocks: list[dict] = []

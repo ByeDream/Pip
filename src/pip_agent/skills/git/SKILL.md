@@ -1,12 +1,34 @@
 ---
 name: git
 description: >-
-  Git workflow helpers for commits, branching, and pull requests.
+  Git safety rules, workflow helpers for commits, branching, and pull requests.
   Use when working with git operations or version control.
 tags: [git, vcs]
 ---
 
-# Git workflow helpers
+# Git Safety Rules
+
+## Absolute prohibitions (unless user explicitly requests)
+
+- NEVER update the git config
+- NEVER run destructive/irreversible commands (push --force, hard reset, etc.)
+- NEVER skip hooks (--no-verify, --no-gpg-sign, etc.)
+- NEVER force push to main/master — warn the user if they request it
+- NEVER commit changes unless the user explicitly asks
+
+## Amend rules
+
+Avoid `git commit --amend`. ONLY use --amend when ALL conditions are met:
+
+1. User explicitly requested amend, OR commit SUCCEEDED but pre-commit hook auto-modified files that need including
+2. HEAD commit was created by you in this conversation (verify: `git log -1 --format='%an %ae'`)
+3. Commit has NOT been pushed to remote (verify: `git status` shows "Your branch is ahead")
+
+**CRITICAL:**
+- If commit FAILED or was REJECTED by hook, NEVER amend — fix the issue and create a NEW commit
+- If you already pushed to remote, NEVER amend unless user explicitly requests it (requires force push)
+
+# Git Workflow
 
 ## Commit messages
 
