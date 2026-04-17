@@ -128,11 +128,20 @@ def _load_transcripts(
         if not text.strip():
             continue
 
-        has_agent_content = any(
-            isinstance(m.get("content"), str) and m.get("content", "").strip()
-            for m in messages
-            if m.get("role") == "assistant"
-        )
+        has_agent_content = False
+        for m in messages:
+            if m.get("role") != "assistant":
+                continue
+            c = m.get("content", "")
+            if isinstance(c, str) and c.strip():
+                has_agent_content = True
+                break
+            if isinstance(c, list) and any(
+                isinstance(b, dict) and b.get("text", "").strip()
+                for b in c
+            ):
+                has_agent_content = True
+                break
         if not has_agent_content:
             continue
 
