@@ -692,6 +692,119 @@ COMPACT_SCHEMA = {
 }
 
 # ---------------------------------------------------------------------------
+# Cron (scheduled tasks) tool schemas
+# ---------------------------------------------------------------------------
+
+CRON_ADD_SCHEMA = {
+    "name": "cron_add",
+    "description": (
+        "Create a scheduled background task. "
+        "Use schedule_kind 'at' for one-time tasks, "
+        "'every' for fixed-interval repeats, "
+        "'cron' for cron-expression schedules (e.g. daily, weekly)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Short English name for this task (used as ID slug).",
+            },
+            "schedule_kind": {
+                "type": "string",
+                "enum": ["at", "every", "cron"],
+                "description": (
+                    "'at': one-time at a specific ISO datetime. "
+                    "'every': repeat every N seconds. "
+                    "'cron': 5-field cron expression."
+                ),
+            },
+            "schedule_config": {
+                "type": "object",
+                "description": (
+                    "Schedule parameters. "
+                    "For 'at': {\"at\": \"2026-04-18T15:00:00\"}. "
+                    "For 'every': {\"every_seconds\": 3600}. "
+                    "For 'cron': {\"expr\": \"0 9 * * *\"}."
+                ),
+            },
+            "message": {
+                "type": "string",
+                "description": "The prompt/instruction to execute when the task fires. Always write in English.",
+            },
+        },
+        "required": ["name", "schedule_kind", "schedule_config", "message"],
+    },
+}
+
+CRON_REMOVE_SCHEMA = {
+    "name": "cron_remove",
+    "description": "Remove a scheduled task by its ID. Use cron_list to find IDs.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "job_id": {
+                "type": "string",
+                "description": "The job ID to remove.",
+            },
+        },
+        "required": ["job_id"],
+    },
+}
+
+CRON_UPDATE_SCHEMA = {
+    "name": "cron_update",
+    "description": (
+        "Modify a scheduled task. Only provided fields are updated. "
+        "Use to enable/disable, change schedule, or update the message."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "job_id": {
+                "type": "string",
+                "description": "The job ID to update.",
+            },
+            "enabled": {
+                "type": "boolean",
+                "description": "Enable or disable the job.",
+            },
+            "name": {
+                "type": "string",
+                "description": "New display name.",
+            },
+            "schedule_kind": {
+                "type": "string",
+                "enum": ["at", "every", "cron"],
+                "description": "New schedule type.",
+            },
+            "schedule_config": {
+                "type": "object",
+                "description": "New schedule parameters.",
+            },
+            "message": {
+                "type": "string",
+                "description": "New prompt/instruction.",
+            },
+        },
+        "required": ["job_id"],
+    },
+}
+
+CRON_LIST_SCHEMA = {
+    "name": "cron_list",
+    "description": "List all scheduled tasks with their status, schedule, and next run time.",
+    "input_schema": {
+        "type": "object",
+        "properties": {},
+    },
+}
+
+CRON_TOOL_NAMES = frozenset({
+    "cron_add", "cron_remove", "cron_update", "cron_list",
+})
+
+# ---------------------------------------------------------------------------
 # Communication & task board tool schemas
 # ---------------------------------------------------------------------------
 
@@ -815,6 +928,7 @@ _LEAD_ONLY = frozenset({
     "team_spawn", "team_send", "team_status", "team_read_inbox",
     "team_list_models", "team_create", "team_edit", "team_delete",
     "check_background", "compact",
+    "cron_add", "cron_remove", "cron_update", "cron_list",
 })
 
 _TEAMMATE_ONLY = frozenset({
@@ -1181,6 +1295,10 @@ ALL_TOOLS = [
     TEAM_EDIT_SCHEMA,
     TEAM_DELETE_SCHEMA,
     COMPACT_SCHEMA,
+    CRON_ADD_SCHEMA,
+    CRON_REMOVE_SCHEMA,
+    CRON_UPDATE_SCHEMA,
+    CRON_LIST_SCHEMA,
     SEND_SCHEMA,
     READ_INBOX_SCHEMA,
     IDLE_SCHEMA,

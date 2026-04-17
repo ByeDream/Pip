@@ -19,6 +19,7 @@ _MANIFEST_NAME = ".scaffold_manifest.json"
 _SCAFFOLD_FILES: list[tuple[str, str]] = [
     (".pip/models.json", "models.json"),
     (".pip/agents/pip-boy/persona.md", "pip-boy.md"),
+    (".pip/agents/pip-boy/HEARTBEAT.md", "heartbeat.md"),
     (".pip/owner.md", "owner.md"),
     (".env", "env.example"),
 ]

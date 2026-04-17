@@ -33,8 +33,18 @@ from pip_agent.compact import (
 )
 from pip_agent.config import settings
 from pip_agent.memory import MemoryStore
-from pip_agent.memory.scheduler import MemoryScheduler
 from pip_agent.profiler import Profiler
+from pip_agent.scheduler import (
+    CRON_SENDER,
+    HEARTBEAT_SENDER,
+    BackgroundScheduler,
+    CronService,
+    DreamJob,
+    HeartbeatJob,
+    ReflectJob,
+)
+
+_BG_SENDERS = frozenset({HEARTBEAT_SENDER, CRON_SENDER})
 from pip_agent.routing import (
     AgentRegistry,
     BindingTable,
@@ -114,6 +124,8 @@ class RuntimeContext:
     skill_registry: SkillRegistry | None = None
     bg_manager: BackgroundTaskManager | None = None
     memory_store: MemoryStore | None = None
+    scheduler: BackgroundScheduler | None = None
+    lane_lock: threading.Lock | None = None
 
 
 def _tool_summary(name: str, inputs: dict) -> str:
@@ -271,6 +283,7 @@ def agent_loop(
                 client=ctx.client,
                 transcripts_dir=transcripts_dir,
                 messages=messages,
+                scheduler=ctx.scheduler,
             )
             for block in assistant_content:
                 if hasattr(block, "text") and block.text.strip():
@@ -398,14 +411,18 @@ def _process_inbound(
             f" binding={binding!r}"
         )
 
-    sk = build_session_key(
-        agent_id=effective.id,
-        channel=inbound.channel,
-        peer_id=inbound.peer_id,
-        guild_id=inbound.guild_id,
-        is_group=inbound.is_group,
-        dm_scope=effective.effective_dm_scope,
-    )
+    is_bg = inbound.sender_id in _BG_SENDERS
+    if is_bg:
+        sk = f"bg:{inbound.sender_id}:{effective.id}"
+    else:
+        sk = build_session_key(
+            agent_id=effective.id,
+            channel=inbound.channel,
+            peer_id=inbound.peer_id,
+            guild_id=inbound.guild_id,
+            is_group=inbound.is_group,
+            dm_scope=effective.effective_dm_scope,
+        )
     if sk not in conversations:
         conversations[sk] = []
     messages = conversations[sk]
@@ -524,7 +541,14 @@ def _process_inbound(
         return
 
     if reply_text:
-        if ch:
+        if inbound.sender_id == HEARTBEAT_SENDER and "HEARTBEAT_OK" in reply_text:
+            if settings.verbose:
+                print("  [heartbeat] HEARTBEAT_OK — suppressed")
+        elif ch:
+            if inbound.sender_id == HEARTBEAT_SENDER:
+                reply_text = f"[heartbeat] {reply_text}"
+            elif inbound.sender_id == CRON_SENDER:
+                reply_text = f"[cron] {reply_text}"
             if not ch.send(reply_peer, reply_text):
                 print(f"  [warning] Failed to send reply via {inbound.channel}, "
                       f"printing to terminal instead:")
@@ -623,21 +647,27 @@ def run(mode: str = "auto") -> None:
     channel_mgr.register(cli_channel)
 
     stop_event = threading.Event()
-    agent_active_event = threading.Event()
-    poll_pause = threading.Event()
+    lane_lock = threading.Lock()
     msg_queue: list[InboundMessage] = []
     q_lock = threading.Lock()
     bg_threads: list[threading.Thread] = []
     has_remote_channels = False
 
-    memory_scheduler = MemoryScheduler(
-        memory_store, client, transcripts_dir, stop_event,
-        model=settings.model,
-        active_event=agent_active_event,
-    )
-    mem_thread = threading.Thread(target=memory_scheduler.run, daemon=True)
-    mem_thread.start()
-    bg_threads.append(mem_thread)
+    bg_scheduler = BackgroundScheduler(lane_lock, stop_event)
+    bg_scheduler.register(ReflectJob(
+        memory_store, client, transcripts_dir, model=settings.model,
+    ))
+    bg_scheduler.register(DreamJob(
+        memory_store, client, transcripts_dir, model=settings.model,
+    ))
+    agent_dir = AGENTS_DIR / default_agent.id
+    bg_scheduler.register(HeartbeatJob(
+        agent_dir, msg_queue=msg_queue, q_lock=q_lock,
+    ))
+    bg_scheduler.register(CronService(
+        agent_dir / "CRON.json", msg_queue=msg_queue, q_lock=q_lock,
+    ))
+    bg_scheduler.start()
 
     state_dir = WORKDIR / ".pip"
 
@@ -659,7 +689,7 @@ def run(mode: str = "auto") -> None:
                 channel_mgr.register(wechat_channel)
                 t = threading.Thread(
                     target=wechat_poll_loop, daemon=True,
-                    args=(wechat_channel, msg_queue, q_lock, stop_event, poll_pause),
+                    args=(wechat_channel, msg_queue, q_lock, stop_event),
                 )
                 t.start()
                 bg_threads.append(t)
@@ -719,6 +749,8 @@ def run(mode: str = "auto") -> None:
         skill_registry=skill_registry,
         bg_manager=bg_manager,
         memory_store=memory_store,
+        scheduler=bg_scheduler,
+        lane_lock=lane_lock,
     )
 
     common_kwargs = dict(
@@ -755,6 +787,7 @@ def run(mode: str = "auto") -> None:
                     bindings_path=BINDINGS_PATH,
                     workdir=str(WORKDIR),
                     memory_store=memory_store,
+                    scheduler=bg_scheduler,
                 )
                 result = dispatch_command(cmd_ctx)
                 if settings.verbose:
@@ -773,6 +806,20 @@ def run(mode: str = "auto") -> None:
                                 print(f"  [dispatch] send to={target!r} ok={ok}")
                     if result.exit_requested:
                         stop_event.set()
+                    continue
+
+                # -- Background messages (heartbeat/cron): process immediately --
+                if inbound.sender_id in _BG_SENDERS:
+                    if settings.verbose:
+                        print(f"  [{inbound.sender_id}] processing")
+                    lane_lock.acquire()
+                    try:
+                        _process_inbound(
+                            inbound, conversations, channel_mgr, rt_ctx,
+                            plan_managers, **common_kwargs,
+                        )
+                    finally:
+                        lane_lock.release()
                     continue
 
                 # -- Legacy CLI-only commands --
@@ -795,14 +842,14 @@ def run(mode: str = "auto") -> None:
                     if settings.verbose:
                         print(f"\n  [cli] {inbound.text[:80]}")
 
-                    poll_pause.set()
+                    lane_lock.acquire()
                     try:
                         _process_inbound(
                             inbound, conversations, channel_mgr, rt_ctx,
                             plan_managers, **common_kwargs,
                         )
                     finally:
-                        poll_pause.clear()
+                        lane_lock.release()
                 else:
                     buf_key = f"{inbound.channel}:{inbound.guild_id or inbound.peer_id}"
                     remote_buffers.setdefault(buf_key, []).append(inbound)
@@ -823,7 +870,7 @@ def run(mode: str = "auto") -> None:
                 ready.append(sk)
 
             if ready:
-                poll_pause.set()
+                lane_lock.acquire()
                 try:
                     for sk in ready:
                         msgs = remote_buffers[sk]
@@ -848,7 +895,15 @@ def run(mode: str = "auto") -> None:
                             plan_managers, **common_kwargs,
                         )
                 finally:
-                    poll_pause.clear()
+                    lane_lock.release()
+
+            # drain scheduler output
+            for out_msg in bg_scheduler.drain_output():
+                if settings.verbose:
+                    print(f"  [scheduler] {out_msg[:120]}")
+                cli_ch = channel_mgr.get("cli")
+                if cli_ch:
+                    cli_ch.send("cli-user", out_msg)
 
             # drain background tasks for CLI session
             cli_messages = conversations.get(cli_session_key, [])
@@ -919,6 +974,7 @@ def run(mode: str = "auto") -> None:
                     bindings_path=BINDINGS_PATH,
                     workdir=str(WORKDIR),
                     memory_store=memory_store,
+                    scheduler=bg_scheduler,
                 )
                 result = dispatch_command(cmd_ctx)
                 if result.handled:
@@ -952,6 +1008,7 @@ def run(mode: str = "auto") -> None:
                 sender_id="cli-user",
             )
 
+            lane_lock.acquire()
             try:
                 reply_text = agent_loop(
                     rt_ctx,
@@ -976,9 +1033,31 @@ def run(mode: str = "auto") -> None:
             except anthropic.APIError as exc:
                 print(f"\n  [api_error] {exc}")
                 continue
+            finally:
+                lane_lock.release()
 
             if reply_text:
                 cli_channel.send("cli-user", reply_text)
+
+            # drain scheduler output (cron, etc.)
+            for out_msg in bg_scheduler.drain_output():
+                if settings.verbose:
+                    print(f"  [scheduler] {out_msg[:120]}")
+                cli_channel.send("cli-user", out_msg)
+
+            # process background messages queued by HeartbeatJob / CronService
+            with q_lock:
+                bg_batch = [m for m in msg_queue if m.sender_id in _BG_SENDERS]
+                msg_queue[:] = [m for m in msg_queue if m.sender_id not in _BG_SENDERS]
+            for bg_msg in bg_batch:
+                lane_lock.acquire()
+                try:
+                    _process_inbound(
+                        bg_msg, conversations, channel_mgr, rt_ctx,
+                        plan_managers, **common_kwargs,
+                    )
+                finally:
+                    lane_lock.release()
 
             while bg_manager.has_pending():
                 if settings.verbose:
@@ -1013,6 +1092,7 @@ def run(mode: str = "auto") -> None:
 
     # -- Cleanup --
     stop_event.set()
+    bg_scheduler.stop()
     for tm in team_managers.values():
         tm.deactivate_all()
     channel_mgr.close_all()

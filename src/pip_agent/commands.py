@@ -15,6 +15,7 @@ import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
+import json
 from typing import TYPE_CHECKING, Any
 
 from pip_agent.channels import InboundMessage
@@ -40,6 +41,7 @@ class CommandContext:
     bindings_path: Path
     workdir: str = ""
     memory_store: MemoryStore | None = None
+    scheduler: Any | None = None
 
 
 @dataclass
@@ -77,6 +79,11 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
         "/admin": _cmd_admin,
         "/update": _cmd_update,
         "/exit": _cmd_exit,
+        "/scheduler": _cmd_scheduler,
+        "/heartbeat": _cmd_heartbeat,
+        "/trigger": _cmd_trigger,
+        "/cron": _cmd_cron,
+        "/cron-trigger": _cmd_cron_trigger,
     }
 
     handler = handlers.get(cmd)
@@ -120,6 +127,11 @@ Available commands (require admin or owner privileges):
   /axioms                        Show current judgment principles
   /recall <query>                Search through stored memories
   /admin grant|revoke|list       Manage admin privileges (owner only)
+  /scheduler                     Show background scheduler status
+  /heartbeat                     Show heartbeat status and configuration
+  /trigger                       Manually fire the heartbeat now
+  /cron                          List all scheduled cron jobs
+  /cron-trigger <id>             Manually fire a specific cron job
   /update                        Upgrade pip-boy to latest version and restart
   /exit                          Quit Pip-Boy (CLI only)
 
@@ -171,6 +183,7 @@ def _auto_create_agent(
     registry: AgentRegistry, agent_id: str,
 ) -> tuple[AgentConfig | None, str | None]:
     """Clone the default agent with a new id/name, persist to disk, register."""
+    import shutil
     from dataclasses import replace
 
     agents_dir = registry.agents_dir
@@ -187,6 +200,13 @@ def _auto_create_agent(
     cfg = replace(default, id=agent_id, name=agent_id, system_body=body)
 
     _persist_agent_md(cfg, agents_dir)
+
+    default_heartbeat = agents_dir / default.id / "HEARTBEAT.md"
+    new_heartbeat = agents_dir / agent_id / "HEARTBEAT.md"
+    if default_heartbeat.is_file() and not new_heartbeat.exists():
+        new_heartbeat.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(default_heartbeat, new_heartbeat)
+
     registry.register_agent(cfg)
     return cfg, None
 
@@ -538,6 +558,67 @@ def _cmd_admin(ctx: CommandContext, args: str) -> CommandResult:
         handled=True,
         response="Usage: /admin grant|revoke <name> | /admin list",
     )
+
+
+# ---------------------------------------------------------------------------
+# /scheduler, /heartbeat, /trigger, /cron, /cron-trigger
+# ---------------------------------------------------------------------------
+
+def _cmd_scheduler(ctx: CommandContext, _args: str) -> CommandResult:
+    if not ctx.scheduler:
+        return CommandResult(handled=True, response="Scheduler not running.")
+    info = ctx.scheduler.status()
+    lines = [
+        "**Scheduler Status**",
+        f"  Running: {info['running']}",
+        f"  Jobs: {info['job_count']} ({', '.join(info['jobs'])})",
+        f"  Lane lock held: {info['lane_lock_held']}",
+        f"  Tick interval: {info['tick_interval']}",
+    ]
+    return CommandResult(handled=True, response="\n".join(lines))
+
+
+def _cmd_heartbeat(ctx: CommandContext, _args: str) -> CommandResult:
+    if not ctx.scheduler:
+        return CommandResult(handled=True, response="Scheduler not running.")
+    info = ctx.scheduler.heartbeat_status()
+    lines = ["**Heartbeat Status**"]
+    for k, v in info.items():
+        lines.append(f"  {k}: {v}")
+    return CommandResult(handled=True, response="\n".join(lines))
+
+
+def _cmd_trigger(ctx: CommandContext, _args: str) -> CommandResult:
+    if not ctx.scheduler:
+        return CommandResult(handled=True, response="Scheduler not running.")
+    result = ctx.scheduler.trigger_heartbeat()
+    return CommandResult(handled=True, response=f"Heartbeat trigger: {result}")
+
+
+def _cmd_cron(ctx: CommandContext, _args: str) -> CommandResult:
+    if not ctx.scheduler:
+        return CommandResult(handled=True, response="Scheduler not running.")
+    jobs = ctx.scheduler.list_cron_jobs()
+    if not jobs:
+        return CommandResult(handled=True, response="No cron jobs configured.")
+    lines = ["**Cron Jobs**"]
+    for j in jobs:
+        status = "enabled" if j["enabled"] else "DISABLED"
+        lines.append(
+            f"  [{j['id']}] {j['name']} ({j['kind']}, {status}) "
+            f"errors={j['errors']} next={j.get('next_run', 'n/a')}"
+        )
+    return CommandResult(handled=True, response="\n".join(lines))
+
+
+def _cmd_cron_trigger(ctx: CommandContext, args: str) -> CommandResult:
+    if not ctx.scheduler:
+        return CommandResult(handled=True, response="Scheduler not running.")
+    job_id = args.strip()
+    if not job_id:
+        return CommandResult(handled=True, response="Usage: /cron-trigger <job_id>")
+    result = ctx.scheduler.trigger_cron_job(job_id)
+    return CommandResult(handled=True, response=f"Cron trigger: {result}")
 
 
 # ---------------------------------------------------------------------------

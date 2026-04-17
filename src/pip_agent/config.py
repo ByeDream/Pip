@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     dream_min_observations: int = Field(default=20)
     dream_inactive_minutes: int = Field(default=30)
 
+    # Heartbeat settings.
+    heartbeat_interval: int = Field(default=1800)
+    heartbeat_active_start: int = Field(default=9)
+    heartbeat_active_end: int = Field(default=22)
+
     def check_required(self) -> None:
         errors: list[str] = []
         if not self.anthropic_api_key:

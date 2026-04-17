@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +70,7 @@ class ToolContext:
     client: anthropic.Anthropic | None = None
     transcripts_dir: Path | None = None
     messages: list[dict] | None = None
+    scheduler: Any | None = None
 
 
 def _handle_plan_tool(name: str, inputs: dict, pm: PlanManager) -> str:
@@ -464,6 +465,58 @@ def _handle_task_board_detail(ctx: ToolContext, inp: dict) -> DispatchResult:
     return DispatchResult(content=text)
 
 
+def _handle_cron_add(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if not ctx.scheduler:
+        return DispatchResult(content="Scheduler not available.")
+    cs = ctx.scheduler.get_cron_service()
+    if cs is None:
+        return DispatchResult(content="Cron service not available.")
+    result = cs.add_job(
+        name=inp.get("name", ""),
+        schedule_kind=inp.get("schedule_kind", ""),
+        schedule_config=inp.get("schedule_config", {}),
+        message=inp.get("message", ""),
+        channel=ctx.channel.name if ctx.channel else "cli",
+        peer_id=ctx.peer_id or "cli-user",
+        sender_id=ctx.sender_id,
+    )
+    return DispatchResult(content=result)
+
+
+def _handle_cron_remove(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if not ctx.scheduler:
+        return DispatchResult(content="Scheduler not available.")
+    cs = ctx.scheduler.get_cron_service()
+    if cs is None:
+        return DispatchResult(content="Cron service not available.")
+    return DispatchResult(content=cs.remove_job(inp.get("job_id", "")))
+
+
+def _handle_cron_update(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if not ctx.scheduler:
+        return DispatchResult(content="Scheduler not available.")
+    cs = ctx.scheduler.get_cron_service()
+    if cs is None:
+        return DispatchResult(content="Cron service not available.")
+    job_id = inp.pop("job_id", "")
+    if not job_id:
+        return DispatchResult(content="[error] job_id is required.")
+    return DispatchResult(content=cs.update_job(job_id, **inp))
+
+
+def _handle_cron_list(ctx: ToolContext, _inp: dict) -> DispatchResult:
+    if not ctx.scheduler:
+        return DispatchResult(content="Scheduler not available.")
+    cs = ctx.scheduler.get_cron_service()
+    if cs is None:
+        return DispatchResult(content="No scheduled tasks.")
+    import json
+    jobs = cs.list_jobs()
+    if not jobs:
+        return DispatchResult(content="No scheduled tasks.")
+    return DispatchResult(content=json.dumps(jobs, indent=2, ensure_ascii=False))
+
+
 _TOOL_REGISTRY: dict[str, Callable[[ToolContext, dict], DispatchResult]] = {
     "compact": _handle_compact,
     "task_create": _make_task_handler("task_create"),
@@ -491,6 +544,10 @@ _TOOL_REGISTRY: dict[str, Callable[[ToolContext, dict], DispatchResult]] = {
     "remember_user": _handle_remember_user,
     "reflect": _handle_reflect,
     "memory_search": _handle_memory_search,
+    "cron_add": _handle_cron_add,
+    "cron_remove": _handle_cron_remove,
+    "cron_update": _handle_cron_update,
+    "cron_list": _handle_cron_list,
     "read": lambda ctx, inp: DispatchResult(
         content=_wrap_simple(run_read, inp, workdir=ctx.workdir),
     ),
