@@ -228,6 +228,12 @@ def _migrate_legacy_layout(
             "Migrated .pip/transcripts/ → agents/%s/transcripts/", default_agent_id,
         )
 
+    # Remove legacy directories after migration
+    for legacy in (legacy_memory, legacy_users, legacy_tasks, legacy_team, legacy_transcripts):
+        if legacy.is_dir():
+            shutil.rmtree(legacy, ignore_errors=True)
+            logger.info("Removed legacy directory: %s", legacy)
+
 
 def _ensure_gitignore(workdir: Path) -> None:
     src = _SCAFFOLD_DIR / "gitignore_entries.txt"
