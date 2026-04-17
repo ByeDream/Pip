@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,7 @@ class MemoryStore:
         self.agent_id = agent_id
         self.agent_dir = base_dir / agent_id
         self.pip_dir = base_dir.parent  # .pip/
+        self._io_lock = threading.Lock()
         self.agent_dir.mkdir(parents=True, exist_ok=True)
         (self.agent_dir / "observations").mkdir(exist_ok=True)
         (self.agent_dir / "users").mkdir(exist_ok=True)
@@ -44,31 +46,34 @@ class MemoryStore:
     # ------------------------------------------------------------------
 
     def load_state(self) -> dict[str, Any]:
-        path = self.agent_dir / "state.json"
-        if not path.is_file():
-            return {}
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return {}
+        with self._io_lock:
+            path = self.agent_dir / "state.json"
+            if not path.is_file():
+                return {}
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                return {}
 
     def save_state(self, state: dict[str, Any]) -> None:
-        path = self.agent_dir / "state.json"
-        path.write_text(
-            json.dumps(state, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        with self._io_lock:
+            path = self.agent_dir / "state.json"
+            path.write_text(
+                json.dumps(state, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
 
     # ------------------------------------------------------------------
     # Observations (L1)
     # ------------------------------------------------------------------
 
     def write_observations(self, observations: list[Observation]) -> None:
-        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        path = self.agent_dir / "observations" / f"{date_str}.jsonl"
-        with path.open("a", encoding="utf-8") as f:
-            for obs in observations:
-                f.write(json.dumps(obs, ensure_ascii=False) + "\n")
+        with self._io_lock:
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            path = self.agent_dir / "observations" / f"{date_str}.jsonl"
+            with path.open("a", encoding="utf-8") as f:
+                for obs in observations:
+                    f.write(json.dumps(obs, ensure_ascii=False) + "\n")
 
     def write_single(
         self, text: str, category: str = "observation", source: str = "user",
@@ -89,12 +94,17 @@ class MemoryStore:
         result: list[Observation] = []
         for fp in sorted(obs_dir.glob("*.jsonl")):
             try:
-                for line in fp.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if line:
-                        result.append(json.loads(line))
-            except (json.JSONDecodeError, OSError):
+                lines = fp.read_text(encoding="utf-8").splitlines()
+            except OSError:
                 continue
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    result.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
         return result
 
     # ------------------------------------------------------------------
@@ -112,11 +122,12 @@ class MemoryStore:
             return []
 
     def save_memories(self, memories: list[Memory]) -> None:
-        path = self.agent_dir / "memories.json"
-        path.write_text(
-            json.dumps(memories, indent=2, ensure_ascii=False, default=str),
-            encoding="utf-8",
-        )
+        with self._io_lock:
+            path = self.agent_dir / "memories.json"
+            path.write_text(
+                json.dumps(memories, indent=2, ensure_ascii=False, default=str),
+                encoding="utf-8",
+            )
 
     # ------------------------------------------------------------------
     # Axioms (L3)
@@ -132,8 +143,9 @@ class MemoryStore:
             return ""
 
     def save_axioms(self, text: str) -> None:
-        path = self.agent_dir / "axioms.md"
-        path.write_text(text, encoding="utf-8")
+        with self._io_lock:
+            path = self.agent_dir / "axioms.md"
+            path.write_text(text, encoding="utf-8")
 
     # ------------------------------------------------------------------
     # User profiles (owner.md read-only + users/*.md tool-managed)
@@ -441,8 +453,15 @@ class MemoryStore:
             observations = self.load_all_observations()
             if not observations:
                 return []
-            search_pool = [
-                {"text": o.get("text", ""), "last_reinforced": o.get("ts", 0)}
+            search_pool: list[Memory] = [
+                {
+                    "text": o.get("text", ""),
+                    "category": o.get("category", "observation"),
+                    "last_reinforced": o.get("ts", 0),
+                    "first_seen": o.get("ts", 0),
+                    "count": 1,
+                    "source": o.get("source", "auto"),
+                }
                 for o in observations
             ]
             return search_memories(query, search_pool, top_k=top_k)
@@ -531,6 +550,18 @@ class MemoryStore:
     # ------------------------------------------------------------------
     # Factory reset
     # ------------------------------------------------------------------
+
+    def clear_observations(self) -> int:
+        """Delete all observation files. Returns count of files removed."""
+        with self._io_lock:
+            obs_dir = self.agent_dir / "observations"
+            if not obs_dir.is_dir():
+                return 0
+            count = 0
+            for fp in obs_dir.glob("*.jsonl"):
+                fp.unlink(missing_ok=True)
+                count += 1
+            return count
 
     def factory_reset(self) -> None:
         """Remove L1/L2/L3 files and scheduler state for this agent.

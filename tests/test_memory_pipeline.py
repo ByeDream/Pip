@@ -251,8 +251,10 @@ class TestDistillAxioms:
 
 class TestMemoryScheduler:
     def test_tick_triggers_reflect(self, tmp_path):
+        from pip_agent.memory.scheduler import REFLECT_TRANSCRIPT_THRESHOLD
+
         store = MemoryStore(base_dir=tmp_path, agent_id="test-agent")
-        store.save_state({"last_reflect_at": 0})
+        store.save_state({"last_reflect_transcript_ts": 0})
 
         now = int(time.time())
         transcripts_dir = store.agent_dir / "transcripts"
@@ -261,7 +263,10 @@ class TestMemoryScheduler:
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "hi"},
         ]
-        (transcripts_dir / f"{now}.json").write_text(json.dumps(data), encoding="utf-8")
+        for i in range(REFLECT_TRANSCRIPT_THRESHOLD + 1):
+            (transcripts_dir / f"{now + i}.json").write_text(
+                json.dumps(data), encoding="utf-8",
+            )
 
         observations = [{"text": "observation one", "category": "decision"}]
         mock_client = MagicMock()
@@ -277,6 +282,7 @@ class TestMemoryScheduler:
 
         state = store.load_state()
         assert state["last_reflect_at"] > 0
+        assert state["last_reflect_transcript_ts"] > 0
         assert len(store.load_all_observations()) >= 1
 
     def test_stop_event_ends_loop(self, tmp_path):

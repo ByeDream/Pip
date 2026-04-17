@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from pip_agent.tools import (
 )
 
 if TYPE_CHECKING:
+    import anthropic
     from pip_agent.background import BackgroundTaskManager
     from pip_agent.channels import Channel
     from pip_agent.memory import MemoryStore
@@ -64,6 +66,9 @@ class ToolContext:
     channel: Channel | None = None
     peer_id: str = ""
     sender_id: str = ""
+    client: anthropic.Anthropic | None = None
+    transcripts_dir: Path | None = None
+    messages: list[dict] | None = None
 
 
 def _handle_plan_tool(name: str, inputs: dict, pm: PlanManager) -> str:
@@ -383,15 +388,55 @@ def _handle_remember_user(ctx: ToolContext, inp: dict) -> DispatchResult:
     return DispatchResult(content=result)
 
 
-def _handle_memory_write(ctx: ToolContext, inp: dict) -> DispatchResult:
-    if ctx.memory_store is None:
-        return DispatchResult(content="Unknown tool: memory_write")
-    content = inp.get("content", "").strip()
-    if not content:
-        return DispatchResult(content="[error] 'content' is required")
-    category = inp.get("category", "observation")
-    ctx.memory_store.write_single(content, category=category, source="user")
-    return DispatchResult(content=f"Remembered: {content}")
+def _handle_reflect(ctx: ToolContext, inp: dict) -> DispatchResult:
+    if ctx.memory_store is None or ctx.client is None:
+        return DispatchResult(content="[error] Reflection not available.")
+    from pip_agent.memory.reflect import reflect
+    from pip_agent.compact import save_transcript
+
+    # Save current conversation transcript first so it's included in reflection
+    if ctx.transcripts_dir is not None and ctx.messages:
+        save_transcript(ctx.messages, ctx.transcripts_dir)
+
+    state = ctx.memory_store.load_state()
+    since = state.get("last_reflect_transcript_ts", 0)
+
+    from pip_agent.config import settings
+    transcripts_dir = ctx.transcripts_dir
+    if transcripts_dir is None:
+        return DispatchResult(content="[error] No transcripts directory configured.")
+
+    observations = reflect(
+        ctx.client,
+        transcripts_dir,
+        ctx.memory_store.agent_id,
+        since,
+        model=settings.model,
+    )
+
+    if observations:
+        ctx.memory_store.write_observations(observations)
+
+    # Update state with latest transcript timestamp
+    latest = 0
+    if transcripts_dir.is_dir():
+        for fp in transcripts_dir.glob("*.json"):
+            try:
+                ts = int(fp.stem)
+            except ValueError:
+                continue
+            if ts > latest:
+                latest = ts
+    if latest > 0:
+        state["last_reflect_transcript_ts"] = latest
+    state["last_reflect_at"] = time.time()
+    ctx.memory_store.save_state(state)
+
+    if observations:
+        return DispatchResult(
+            content=f"Reflection complete: extracted {len(observations)} observations."
+        )
+    return DispatchResult(content="Reflection complete: no new observations found.")
 
 
 def _handle_memory_search(ctx: ToolContext, inp: dict) -> DispatchResult:
@@ -443,7 +488,7 @@ _TOOL_REGISTRY: dict[str, Callable[[ToolContext, dict], DispatchResult]] = {
     "task_board_overview": _handle_task_board_overview,
     "task_board_detail": _handle_task_board_detail,
     "remember_user": _handle_remember_user,
-    "memory_write": _handle_memory_write,
+    "reflect": _handle_reflect,
     "memory_search": _handle_memory_search,
     "read": lambda ctx, inp: DispatchResult(
         content=_wrap_simple(run_read, inp, workdir=ctx.workdir),

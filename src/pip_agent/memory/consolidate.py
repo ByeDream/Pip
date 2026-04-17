@@ -1,7 +1,10 @@
-"""L2 Reflector + L3 Axiom: consolidate observations into memories, distill axioms.
+"""L2 Consolidation + L3 Axiom distillation.
 
-Phase 1 (L2): merge observations into memories — reinforce, create, decay, forget.
-Phase 2 (L3): promote high-stability memories into judgment principles (axioms.md).
+L2: merge observations into memories — reinforce, create, decay, forget,
+    resolve conflicts.
+L3: promote high-stability memories into judgment principles (axioms.md).
+
+Detailed rules are loaded from ``sops/memory_pipeline_sop.md``.
 """
 
 from __future__ import annotations
@@ -23,37 +26,101 @@ MAX_MEMORIES = 200
 PROMOTE_COUNT = 5
 PROMOTE_STABILITY = 0.5
 
-CONSOLIDATE_SYSTEM = (
-    "You are a memory consolidation engine. Given a list of existing memories "
-    "and new observations, produce an updated memory list.\n\n"
-    "Rules:\n"
-    "- If a new observation matches an existing memory semantically, REINFORCE it "
-    "(increment count, update last_reinforced, add context_type to contexts).\n"
-    "- If a new observation is novel, CREATE a new memory (count=1).\n"
-    "- Existing memories NOT reinforced by any observation: DECAY (count -= 1) "
-    "UNLESS source is 'user' (user-sourced memories never decay).\n"
-    "- Memories with count <= 0 are FORGOTTEN (remove them).\n"
-    "- Calculate stability = unique_contexts / total_cycles for each memory.\n\n"
-    "Output a JSON array of memory objects with these fields:\n"
-    '  {"id": "...", "text": "...", "count": N, "category": "...", '
-    '"first_seen": epoch, "last_reinforced": epoch, '
-    '"contexts": ["ctx1", "ctx2"], "total_cycles": N, '
-    '"stability": 0.0-1.0, "source": "auto"|"user"}\n\n'
-    "Write all text in English.\n"
-    "Return ONLY the JSON array, no markdown fences or extra text."
-)
+# ---------------------------------------------------------------------------
+# SOP-driven prompts (loaded once at import time)
+# ---------------------------------------------------------------------------
 
-AXIOM_SYSTEM = (
-    "You are a judgment principle distiller. Given a list of high-stability "
-    "behavioral memories about a user, distill them into concise judgment "
-    "principles (axioms).\n\n"
-    "Each principle should describe HOW the user thinks or decides, not WHO "
-    "they are. Focus on decision heuristics, quality standards, and cognitive "
-    "patterns that are stable across contexts.\n\n"
-    "Output as a markdown list. Each item is one principle, 1-2 sentences.\n"
-    "Write all output in English.\n"
-    "Return ONLY the markdown list, no extra text or headers."
-)
+_SOP_PATH = Path(__file__).resolve().parent / "sops" / "memory_pipeline_sop.md"
+_SOP_SECTIONS: dict[str, str] = {}
+
+
+def _load_sop() -> dict[str, str]:
+    """Parse the SOP markdown into sections keyed by ``## <heading>``."""
+    global _SOP_SECTIONS
+    if _SOP_SECTIONS:
+        return _SOP_SECTIONS
+    try:
+        raw = _SOP_PATH.read_text(encoding="utf-8")
+    except OSError:
+        log.warning("SOP file not found at %s, using fallback prompts", _SOP_PATH)
+        return {}
+    current_key = ""
+    lines: list[str] = []
+    for line in raw.splitlines():
+        if line.startswith("## "):
+            if current_key:
+                _SOP_SECTIONS[current_key] = "\n".join(lines).strip()
+            current_key = line[3:].strip()
+            lines = []
+        else:
+            lines.append(line)
+    if current_key:
+        _SOP_SECTIONS[current_key] = "\n".join(lines).strip()
+    return _SOP_SECTIONS
+
+
+def _get_consolidate_system() -> str:
+    sop = _load_sop()
+    l2_rules = sop.get("L2 Consolidation Rules", "")
+    global_rules = sop.get("Global Constraints", "")
+    if l2_rules:
+        return (
+            "You are a memory consolidation engine. Given a list of existing memories "
+            "and new observations, produce an updated memory list.\n\n"
+            f"{l2_rules}\n\n"
+            f"{global_rules}\n\n"
+            "Output a JSON array of memory objects with these fields:\n"
+            '  {"id": "...", "text": "...", "count": N, "category": "...", '
+            '"first_seen": epoch, "last_reinforced": epoch, '
+            '"contexts": ["ctx1", "ctx2"], "total_cycles": N, '
+            '"stability": 0.0-1.0, "source": "auto"|"user"}\n\n'
+            "Return ONLY the JSON array, no markdown fences or extra text."
+        )
+    return (
+        "You are a memory consolidation engine. Given a list of existing memories "
+        "and new observations, produce an updated memory list.\n\n"
+        "Rules:\n"
+        "- If a new observation matches an existing memory semantically, REINFORCE it "
+        "(increment count, update last_reinforced, add context_type to contexts).\n"
+        "- If a new observation is novel, CREATE a new memory (count=1).\n"
+        "- Existing memories NOT reinforced by any observation: DECAY (count -= 1).\n"
+        "- Memories with count <= 0 are FORGOTTEN (remove them).\n"
+        "- When two memories contradict, the one with higher count wins; "
+        "equal count: newer last_reinforced wins. Loser is removed.\n"
+        "- Calculate stability = unique_contexts / total_cycles for each memory.\n\n"
+        "Output a JSON array of memory objects with these fields:\n"
+        '  {"id": "...", "text": "...", "count": N, "category": "...", '
+        '"first_seen": epoch, "last_reinforced": epoch, '
+        '"contexts": ["ctx1", "ctx2"], "total_cycles": N, '
+        '"stability": 0.0-1.0, "source": "auto"|"user"}\n\n'
+        "Write all text in English.\n"
+        "Return ONLY the JSON array, no markdown fences or extra text."
+    )
+
+
+def _get_axiom_system() -> str:
+    sop = _load_sop()
+    l3_rules = sop.get("L3 Axiom Distillation Rules", "")
+    global_rules = sop.get("Global Constraints", "")
+    if l3_rules:
+        return (
+            "You are a judgment principle distiller. Given a list of high-stability "
+            "behavioral memories about a user, distill them into concise judgment "
+            "principles (axioms).\n\n"
+            f"{l3_rules}\n\n"
+            f"{global_rules}"
+        )
+    return (
+        "You are a judgment principle distiller. Given a list of high-stability "
+        "behavioral memories about a user, distill them into concise judgment "
+        "principles (axioms).\n\n"
+        "Each principle should describe HOW the user thinks or decides, not WHO "
+        "they are. Focus on decision heuristics, quality standards, and cognitive "
+        "patterns that are stable across contexts.\n\n"
+        "Output as a markdown list. Each item is one principle, 1-2 sentences.\n"
+        "Write all output in English.\n"
+        "Return ONLY the markdown list, no extra text or headers."
+    )
 
 
 def consolidate(
@@ -94,7 +161,7 @@ def consolidate(
         response = client.messages.create(
             model=model,
             max_tokens=4096,
-            system=CONSOLIDATE_SYSTEM,
+            system=_get_consolidate_system(),
             messages=[{"role": "user", "content": prompt}],
         )
     except Exception as exc:
@@ -106,17 +173,21 @@ def consolidate(
         if hasattr(block, "text"):
             text += block.text
 
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-
-    try:
-        updated = json.loads(text)
-    except json.JSONDecodeError:
+    from pip_agent.memory.utils import extract_json_array
+    updated = extract_json_array(text)
+    if updated is None:
         log.warning("consolidate: LLM returned invalid JSON, keeping existing memories")
         return memories
 
-    if not isinstance(updated, list):
+    # ROB-2: guard against LLM returning empty or drastically reduced list
+    if memories and not updated:
+        log.warning("consolidate: LLM returned empty array with %d existing memories, preserving originals", len(memories))
+        return memories
+    if memories and len(updated) < len(memories) * 0.2:
+        log.warning(
+            "consolidate: LLM shrank memories from %d to %d (>80%% drop), preserving originals",
+            len(memories), len(updated),
+        )
         return memories
 
     for mem in updated:
@@ -161,7 +232,7 @@ def distill_axioms(
         response = client.messages.create(
             model=model,
             max_tokens=2048,
-            system=AXIOM_SYSTEM,
+            system=_get_axiom_system(),
             messages=[{"role": "user", "content": prompt}],
         )
     except Exception as exc:

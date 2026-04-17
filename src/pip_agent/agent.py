@@ -29,6 +29,7 @@ from pip_agent.compact import (
     auto_compact,
     estimate_tokens,
     micro_compact,
+    save_transcript,
 )
 from pip_agent.config import settings
 from pip_agent.profiler import Profiler
@@ -150,6 +151,11 @@ def agent_loop(
     effective_max_tokens = max_tokens or DEFAULT_MAX_TOKENS
     effective_compact_threshold = compact_threshold or DEFAULT_COMPACT_THRESHOLD
 
+    if ctx.memory_store:
+        _state = ctx.memory_store.load_state()
+        _state["last_activity_at"] = time.time()
+        ctx.memory_store.save_state(_state)
+
     messages.append({"role": "user", "content": user_input})
     rounds_since_todo = 0
     last_input_tokens = 0
@@ -262,6 +268,9 @@ def agent_loop(
                 peer_id=peer_id,
                 sender_id=sender_id,
                 workdir=WORKDIR,
+                client=ctx.client,
+                transcripts_dir=transcripts_dir,
+                messages=messages,
             )
             for block in assistant_content:
                 if hasattr(block, "text") and block.text.strip():
@@ -309,6 +318,9 @@ def agent_loop(
                 b.text for b in assistant_content if hasattr(b, "text")
             )
             break
+
+    if transcripts_dir is not None and messages:
+        save_transcript(messages, transcripts_dir)
 
     return final_text
 
@@ -418,7 +430,7 @@ def _process_inbound(
             inbound.channel, inbound.sender_id,
         )
         if _profile:
-            _name = memory_store.extract_profile_name(_profile)
+            _name = ctx.memory_store.extract_profile_name(_profile)
             sender_status = f"verified:{_name}" if _name else "verified"
 
     if inbound.is_group:
@@ -604,6 +616,7 @@ def run(mode: str = "auto") -> None:
     channel_mgr.register(cli_channel)
 
     stop_event = threading.Event()
+    agent_active_event = threading.Event()
     poll_pause = threading.Event()
     msg_queue: list[InboundMessage] = []
     q_lock = threading.Lock()
@@ -613,6 +626,7 @@ def run(mode: str = "auto") -> None:
     memory_scheduler = MemoryScheduler(
         memory_store, client, transcripts_dir, stop_event,
         model=settings.model,
+        active_event=agent_active_event,
     )
     mem_thread = threading.Thread(target=memory_scheduler.run, daemon=True)
     mem_thread.start()

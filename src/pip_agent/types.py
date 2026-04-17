@@ -6,7 +6,9 @@ that flows between the memory pipeline, routing layer, and agent loop.
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Literal, TypedDict
+
+MemorySource = Literal["auto", "user"]
 
 
 class Observation(TypedDict, total=False):
@@ -14,13 +16,18 @@ class Observation(TypedDict, total=False):
     ts: float
     text: str
     category: str
-    source: str
+    source: MemorySource
 
 
 class Memory(TypedDict, total=False):
     """Consolidated memory entry from the L2 pipeline."""
+    id: str
     text: str
     category: str
-    confidence: float
-    created_at: float
-    updated_at: float
+    count: int
+    first_seen: float
+    last_reinforced: float
+    contexts: list[str]
+    total_cycles: int
+    stability: float
+    source: MemorySource

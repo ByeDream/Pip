@@ -623,27 +623,16 @@ REMEMBER_USER_SCHEMA = {
     },
 }
 
-MEMORY_WRITE_SCHEMA = {
-    "name": "memory_write",
+REFLECT_SCHEMA = {
+    "name": "reflect",
     "description": (
-        "Save an important observation about the user's behavior, preferences, "
-        "or decision patterns. Focus on HOW the user thinks or decides, not just "
-        "WHAT they said. Patterns and judgment heuristics are more valuable than facts. "
-        "Always write the content in English regardless of conversation language."
+        "Trigger a reflection on recent conversation history to consolidate "
+        "learnings about the user's preferences, decision patterns, and working "
+        "style. Use this when a meaningful piece of work is completed."
     ),
     "input_schema": {
         "type": "object",
-        "properties": {
-            "content": {
-                "type": "string",
-                "description": "The behavioral observation in English.",
-            },
-            "category": {
-                "type": "string",
-                "description": "Category: decision, judgment, communication, value, preference.",
-            },
-        },
-        "required": ["content"],
+        "properties": {},
     },
 }
 
@@ -1150,7 +1139,7 @@ ALL_TOOLS = [
     WEB_SEARCH_SCHEMA,
     WEB_FETCH_SCHEMA,
     REMEMBER_USER_SCHEMA,
-    MEMORY_WRITE_SCHEMA,
+    REFLECT_SCHEMA,
     MEMORY_SEARCH_SCHEMA,
     TASK_CREATE_SCHEMA,
     TASK_UPDATE_SCHEMA,

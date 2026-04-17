@@ -257,7 +257,8 @@ class TestAutoCompact:
         assert msgs[0]["role"] == "user"
         assert "summary" in msgs[0]["content"].lower()
 
-    def test_saves_transcript_before_compacting(self, tmp_path: Path):
+    def test_does_not_save_transcript(self, tmp_path: Path):
+        """auto_compact no longer saves transcripts — that's agent_loop's job."""
         client = MagicMock()
         client.messages.create.return_value = SimpleNamespace(
             content=[_text_block("summary")],
@@ -272,7 +273,7 @@ class TestAutoCompact:
             auto_compact(client, msgs, "system", tmp_path)
 
         files = list(tmp_path.glob("*.json"))
-        assert len(files) == 1
+        assert len(files) == 0
 
     def test_single_message_conversation(self, tmp_path: Path):
         client = MagicMock()

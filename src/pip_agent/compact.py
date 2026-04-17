@@ -245,14 +245,10 @@ def auto_compact(
     transcripts_dir: Path,
     profiler: Profiler | None = None,
 ) -> str:
-    """Layer 2 / Layer 3: save transcript, summarize, replace messages.
+    """Summarize and replace messages in-place. Returns the summary text.
 
-    Operates on ``messages`` in-place. Returns the summary text.
+    Transcript saving is handled independently by the agent_loop.
     """
-    saved = save_transcript(messages, transcripts_dir)
-    if settings.verbose:
-        print(f"  [compact] transcript saved to {saved}")
-
     summary, in_tok, out_tok = summarize_messages(
         client, messages, system_prompt, profiler
     )

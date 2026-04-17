@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,19 +20,43 @@ import anthropic
 
 log = logging.getLogger(__name__)
 
-REFLECT_SYSTEM = (
+_REFLECT_SYSTEM_BASE = (
     "You are a behavioral analyst. Given conversation transcripts between a "
     "user and an AI assistant, extract observations about the user's decision "
     "patterns, judgment frameworks, values, and recurring preferences.\n\n"
     "Focus on HOW the user thinks and decides, not WHAT they asked for.\n"
     "Look for: decision patterns, quality standards, communication style, "
     "repeated frustrations, value trade-offs, and cognitive heuristics.\n\n"
+    "Each transcript header shows its absolute timestamp. When the conversation "
+    "contains relative time references (e.g. 'yesterday', 'last week'), convert "
+    "them to absolute dates based on the transcript timestamp and use absolute "
+    "dates in your observations.\n\n"
     "Output a JSON array of observation objects. Each object has:\n"
     '  {"text": "...", "category": "decision|judgment|communication|value|preference"}\n\n'
     "Output 3-8 observations. If there is nothing meaningful, output [].\n"
     "Output all observations in English, regardless of the transcript language.\n"
     "Return ONLY the JSON array, no markdown fences or extra text."
 )
+
+_REFLECT_SYSTEM_CACHE: str | None = None
+
+
+def _get_reflect_system() -> str:
+    global _REFLECT_SYSTEM_CACHE
+    if _REFLECT_SYSTEM_CACHE is not None:
+        return _REFLECT_SYSTEM_CACHE
+
+    from pip_agent.memory.consolidate import _load_sop
+    sop = _load_sop()
+    l1_rules = sop.get("L1 Reflection Rules", "")
+    if l1_rules:
+        _REFLECT_SYSTEM_CACHE = (
+            _REFLECT_SYSTEM_BASE + "\n\n"
+            "Detailed guidelines:\n\n" + l1_rules
+        )
+    else:
+        _REFLECT_SYSTEM_CACHE = _REFLECT_SYSTEM_BASE
+    return _REFLECT_SYSTEM_CACHE
 
 MAX_TRANSCRIPTS = 50
 MAX_TRANSCRIPT_CHARS = 3000
@@ -100,7 +125,10 @@ def _load_transcripts(
 
         if len(text) > MAX_TRANSCRIPT_CHARS:
             text = text[:MAX_TRANSCRIPT_CHARS] + "\n[truncated]"
-        formatted.append(f"--- Transcript {fp.stem} ---\n{text}")
+        abs_time = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+            "%Y-%m-%d %H:%M UTC"
+        )
+        formatted.append(f"--- Transcript at {abs_time} ---\n{text}")
 
         if len(formatted) >= MAX_TRANSCRIPTS:
             break
@@ -133,7 +161,9 @@ def reflect(
     if len(combined) > 60000:
         combined = combined[:60000] + "\n[truncated]"
 
+    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     prompt = (
+        f"Current time: {current_time}\n\n"
         f"Here are recent conversation transcripts for agent '{agent_id}':\n\n"
         f"{combined}\n\n"
         "Extract behavioral observations about the user now."
@@ -143,7 +173,7 @@ def reflect(
         response = client.messages.create(
             model=model,
             max_tokens=1024,
-            system=REFLECT_SYSTEM,
+            system=_get_reflect_system(),
             messages=[{"role": "user", "content": prompt}],
         )
     except Exception as exc:
@@ -155,17 +185,10 @@ def reflect(
         if hasattr(block, "text"):
             text += block.text
 
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-
-    try:
-        observations = json.loads(text)
-    except json.JSONDecodeError:
+    from pip_agent.memory.utils import extract_json_array
+    observations = extract_json_array(text)
+    if observations is None:
         log.warning("reflect: LLM returned invalid JSON: %.200s", text)
-        return []
-
-    if not isinstance(observations, list):
         return []
 
     now = time.time()
