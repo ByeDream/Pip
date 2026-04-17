@@ -1,8 +1,10 @@
 ## L1 Reflection Rules
 
-You are extracting behavioral observations from conversation transcripts.
+You are extracting observations from conversation transcripts. Observations fall into two groups: **user behavior** (how the user thinks and works) and **objective experience** (technical lessons learned during the work).
 
 ### What to Record
+
+**User behavior:**
 
 - **Decision patterns** — How the user weighs trade-offs (e.g. "prefers simplicity over comprehensiveness", "optimizes for maintainability first").
 - **Value systems** — What the user considers important (e.g. "values test coverage", "dislikes over-engineering").
@@ -12,11 +14,18 @@ You are extracting behavioral observations from conversation transcripts.
 - **Recurring preferences** — Consistent tool, language, framework, or pattern choices across sessions.
 - **Workflow patterns** — How the user structures their work (e.g. "plans before coding", "iterates incrementally").
 
+**Objective experience:**
+
+- **Technical lessons** — Non-obvious constraints, pitfalls, or solutions discovered during work (e.g. "monorepo build has implicit dependency ordering that must be respected", "pydantic-settings silently ignores .env without model_config").
+- **Tool/API insights** — Hidden limitations or correct usage of libraries, frameworks, or APIs (e.g. "WeChat access_token expires after 2 hours and must be cached server-side").
+- **Architectural rationale** — Why a particular design decision was made, so the reasoning can be recalled later (e.g. "memory pipeline constants are global settings, not per-agent, because they are system-level concerns").
+- **Reusable patterns** — Cross-project best practices or solution templates that proved effective.
+
 ### What NOT to Record
 
-- **One-time factual queries** — "What is the capital of France?" or "How do I use git rebase?" are not behavioral.
-- **Specific code snippets or file paths** — These are ephemeral context, not behavioral patterns.
-- **Task-specific details** — The content of what was built is not an observation; HOW it was approached is.
+- **Easily-looked-up facts** — Common knowledge or standard documentation content (e.g. "Python lists are ordered"). Only record insights that require practice to discover.
+- **Specific code snippets or file paths** — Ephemeral context. Record the lesson or design rationale behind the code, not the code itself.
+- **One-off implementation details** — "Changed line 42 of agent.py" is not useful. "The agent.py bug was caused by referencing an unqualified variable name in a method that receives context via a parameter" is a reusable lesson.
 - **Emotional reactions to isolated events** — A single frustration is not a pattern; repeated frustration with the same type of issue is.
 - **Information already stored in user profiles** — Names, timezones, identifiers belong in `users/*.md`, not observations.
 
@@ -85,7 +94,7 @@ Stability measures how consistently a pattern appears across different types of 
 
 ## L3 Axiom Distillation Rules
 
-You are distilling high-confidence behavioral memories into judgment principles (axioms).
+You are distilling high-confidence memories into judgment principles (axioms). These may come from user behavior patterns OR from objective technical experience that has been repeatedly validated.
 
 ### Promotion Criteria
 
@@ -95,10 +104,10 @@ Only memories meeting ALL of the following qualify:
 
 ### Axiom Standards
 
-- Each axiom describes HOW the user thinks or decides, not WHO they are.
-- Focus on decision heuristics, quality standards, and cognitive patterns.
+- For user behavior: each axiom describes HOW the user thinks or decides, not WHO they are. Focus on decision heuristics, quality standards, and cognitive patterns.
+- For objective experience: each axiom captures a high-confidence technical principle that has been validated across multiple situations (e.g. "Always validate external API token expiry rather than assuming indefinite validity").
 - Each axiom is 1-2 sentences, precise and actionable.
-- Axioms should be useful for an AI assistant to adjust its behavior.
+- Axioms should be useful for an AI assistant to adjust its behavior or avoid known pitfalls.
 - Maximum 20 axioms. If more qualify, keep only the highest-count ones.
 
 ### Output Format

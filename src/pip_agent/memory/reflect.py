@@ -21,19 +21,32 @@ import anthropic
 log = logging.getLogger(__name__)
 
 _REFLECT_SYSTEM_BASE = (
-    "You are a behavioral analyst. Given conversation transcripts between a "
-    "user and an AI assistant, extract observations about the user's decision "
-    "patterns, judgment frameworks, values, and recurring preferences.\n\n"
-    "Focus on HOW the user thinks and decides, not WHAT they asked for.\n"
-    "Look for: decision patterns, quality standards, communication style, "
-    "repeated frustrations, value trade-offs, and cognitive heuristics.\n\n"
+    "You are an analyst reviewing conversation transcripts between a user and "
+    "an AI assistant. Extract two kinds of observations:\n\n"
+    "1. **User behavior** — decision patterns, judgment frameworks, values, "
+    "communication style, recurring preferences, and cognitive heuristics.\n"
+    "2. **Objective experience** — technical lessons learned during the work, "
+    "non-obvious tool/API constraints, and reusable solution patterns.\n\n"
+    "For user behavior, focus on HOW the user thinks and decides.\n"
+    "For objective experience, focus on insights that are non-obvious and "
+    "would be valuable to recall in future work. Do NOT record trivial facts "
+    "that are easily looked up, or implementation details tied to a single "
+    "file or line of code.\n\n"
     "Each transcript header shows its absolute timestamp. When the conversation "
     "contains relative time references (e.g. 'yesterday', 'last week'), convert "
     "them to absolute dates based on the transcript timestamp and use absolute "
     "dates in your observations.\n\n"
     "Output a JSON array of observation objects. Each object has:\n"
-    '  {"text": "...", "category": "decision|judgment|communication|value|preference"}\n\n'
-    "Output 3-8 observations. If there is nothing meaningful, output [].\n"
+    '  {"text": "...", "category": "<category>"}\n\n'
+    "Categories:\n"
+    "  User behavior: decision, judgment, communication, value, preference\n"
+    "  Objective experience: lesson, knowledge, pattern\n\n"
+    "Examples:\n"
+    '  GOOD: {"text": "User prefers configuring via env vars + pydantic-settings over per-agent YAML for global settings", "category": "decision"}\n'
+    '  GOOD: {"text": "pydantic-settings silently ignores .env unless model_config sets env_file", "category": "lesson"}\n'
+    '  GOOD: {"text": "WeChat access_token expires after 2 hours and must be cached server-side", "category": "knowledge"}\n'
+    '  BAD:  {"text": "Fixed bug on line 42 of agent.py", "category": "lesson"} -- too specific, not reusable\n\n'
+    "Output 3-10 observations. If there is nothing meaningful, output [].\n"
     "Output all observations in English, regardless of the transcript language.\n"
     "Return ONLY the JSON array, no markdown fences or extra text."
 )
