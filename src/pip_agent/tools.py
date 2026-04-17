@@ -617,7 +617,7 @@ REMEMBER_USER_SCHEMA = {
             },
             "notes": {
                 "type": "string",
-                "description": "Additional notes about the user (append, don't overwrite).",
+                "description": "Additional notes about the user (append, don't overwrite). Always write in English.",
             },
         },
     },
