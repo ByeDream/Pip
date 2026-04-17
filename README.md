@@ -71,8 +71,19 @@ A three-tier pipeline that learns from conversations automatically:
 ### Context Management
 
 - **Micro-Compaction** — Old tool results replaced with placeholders, keeping the last N rounds intact
-- **Auto-Compaction** — When token count exceeds threshold, conversation is replaced with an LLM-generated summary
+- **Auto-Compaction** — When token count exceeds threshold, the oldest ~50% is summarised by the LLM while the recent tail (~20%, minimum 4 messages) is preserved verbatim
+- **Overflow Recovery** — On a context-overflow API error, `emergency_compact` runs a three-stage fallback (aggressive micro-compact → oversized tool_result truncation → tail-preserving summary) and retries with the same profile
 - **Transcript Persistence** — Every conversation turn saves a timestamped JSON transcript; old transcripts are cleaned up after reflection
+
+### Resilience
+
+Every `messages.create` call is wrapped in a three-layer retry onion (`pip_agent.resilience`):
+
+- **Layer 1 — Auth Rotation** — Iterate through available profiles (`.env::ANTHROPIC_API_KEY` as baseline + any extras in `.pip/keys.json`), skipping any in cooldown. Failures classify as `rate_limit` (120s), `auth` / `billing` (300s), `timeout` (60s), or `unknown` (120s).
+- **Layer 2 — Overflow Recovery** — On context overflow, `emergency_compact` mutates the message list in place and retries up to 3 times with the same profile.
+- **Layer 3 — Tool-Use Loop** — The standard `while True + stop_reason` loop; each iteration is one Layer-1 call.
+- **Fallback Models** — After all primary profiles are exhausted, Pip-Boy tries each model in `fallback_models` (per-agent YAML) before raising `ResilienceExhausted`.
+- **Simulated Failures** — `/simulate-failure <reason>` arms the next API call to fail with a given category, letting you verify the retry path without real outages.
 
 ### Built-in Skills
 
@@ -141,13 +152,16 @@ pip install --upgrade pip-boy
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `ANTHROPIC_API_KEY` | **Yes** | — | Anthropic API key |
-| `ANTHROPIC_BASE_URL` | No | *(api.anthropic.com)* | Custom API endpoint (proxy support) |
+| `ANTHROPIC_API_KEY` | Conditional | — | Primary Anthropic API key; loaded as profile `env` and always serves as the baseline |
+| `ANTHROPIC_BASE_URL` | No | *(api.anthropic.com)* | Custom API endpoint (proxy support); applied to the `env` profile and inherited by any `keys.json` profile that omits its own `base_url` |
+| `KEYS_FILE_PATH` | No | `.pip/keys.json` | Override the additional-profiles file location |
 | `SEARCH_API_KEY` | No | — | Tavily API key; falls back to DuckDuckGo |
 | `WECOM_BOT_ID` | No | — | WeCom bot ID for enterprise WeChat channel |
 | `WECOM_BOT_SECRET` | No | — | WeCom bot secret |
 | `VERBOSE` | No | `true` | Verbose output |
 | `PROFILER_ENABLED` | No | `false` | Enable performance profiling |
+
+At least one of `ANTHROPIC_API_KEY` (in `.env`) or a populated `.pip/keys.json` profile must be present.
 
 #### Memory Pipeline
 
@@ -161,7 +175,7 @@ pip install --upgrade pip-boy
 
 ### Per-Agent Configuration
 
-Model, token limits, and compaction settings are configured per-agent via YAML frontmatter in `.pip/agents/<id>/persona.md`:
+Model, token limits, compaction settings, and the fallback model chain are configured per-agent via YAML frontmatter in `.pip/agents/<id>/persona.md`:
 
 ```yaml
 ---
@@ -169,8 +183,39 @@ model: claude-sonnet-4-6
 max_tokens: 8192
 compact_threshold: 50000
 compact_micro_age: 3
+fallback_models:
+  - claude-haiku-4-5
+  - claude-sonnet-4-5
 ---
 ```
+
+`fallback_models` is optional. When set, Pip-Boy falls back through each listed model after every primary profile has failed, before giving up.
+
+### Multi-Key Profiles (`.pip/keys.json`)
+
+The `.env::ANTHROPIC_API_KEY` is always the **baseline** (loaded as profile `env`). `.pip/keys.json` is **additive** — each filled entry is appended as an extra profile for rotation:
+
+```json
+{
+  "profiles": [
+    { "name": "backup", "api_key": "sk-ant-...", "base_url": "" }
+  ]
+}
+```
+
+Pip-Boy scaffolds `.pip/keys.json` on first run with a blank `api_key` placeholder; entries with empty `api_key` are silently ignored, so the untouched template is a no-op. Fill in real keys to enable rotation. A profile that omits `base_url` inherits `.env::ANTHROPIC_BASE_URL` (convenient when all keys share the same proxy). Profiles are de-duplicated by `api_key`, so an entry that happens to equal the env key is skipped with a debug log.
+
+Rotation honours per-reason cooldowns — `rate_limit` 120s, `auth` / `billing` 300s, `timeout` 60s. The file is covered by `.gitignore`.
+
+### Slash Commands (Resilience)
+
+| Command | Description |
+|---|---|
+| `/profiles` | List all loaded API profiles, their availability, and last-good timestamp |
+| `/cooldowns` | Show profiles currently in cooldown with remaining seconds |
+| `/stats` | Print resilience runner counters (attempts, successes, rotations, compactions, fallbacks) |
+| `/simulate-failure <reason>` | Arm a fake failure (`rate_limit`, `auth`, `timeout`, `billing`, `overflow`, `unknown`) for the next API call; use `off` to disarm |
+| `/fallback` | Show the current agent's primary + fallback model chain |
 
 ### Project Directory Structure
 
@@ -178,6 +223,7 @@ compact_micro_age: 3
 .pip/
 ├── owner.md                     # Owner profile (read-only)
 ├── models.json                  # Model catalog for team spawning
+├── keys.json                    # Extra rotation profiles layered on top of .env (gitignored)
 ├── .scaffold_manifest.json      # Scaffold version tracking
 ├── agents/
 │   ├── bindings.json            # Channel → agent routing

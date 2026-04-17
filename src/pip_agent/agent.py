@@ -28,6 +28,7 @@ from pip_agent.channels import (
 from pip_agent.commands import CommandContext, dispatch_command
 from pip_agent.compact import (
     auto_compact,
+    emergency_compact,
     estimate_tokens,
     micro_compact,
     save_transcript,
@@ -35,6 +36,13 @@ from pip_agent.compact import (
 from pip_agent.config import settings
 from pip_agent.memory import MemoryStore
 from pip_agent.profiler import Profiler
+from pip_agent.resilience import (
+    ProfileManager,
+    ResilienceExhausted,
+    ResilienceRunner,
+    SimulatedFailure,
+    load_profiles,
+)
 from pip_agent.scheduler import (
     CRON_SENDER,
     HEARTBEAT_SENDER,
@@ -128,6 +136,8 @@ class RuntimeContext:
     memory_store: MemoryStore | None = None
     scheduler: BackgroundScheduler | None = None
     lane_lock: threading.Lock | None = None
+    runner: ResilienceRunner | None = None
+    sim_failure: SimulatedFailure | None = None
 
 
 def _tool_summary(name: str, inputs: dict) -> str:
@@ -151,6 +161,7 @@ def agent_loop(
     max_tokens: int = 0,
     compact_threshold: int = 0,
     compact_micro_age: int = 0,
+    fallback_models: list[str] | None = None,
     transcripts_dir: Path | None = None,
     team_manager: TeamManager | None = None,
     worktree_manager: WorktreeManager | None = None,
@@ -226,30 +237,44 @@ def agent_loop(
                         })
 
         if transcripts_dir is not None and estimate_tokens(messages) > effective_compact_threshold:
-            current_input = messages[-1]["content"] if messages[-1]["role"] == "user" else None
-            has_media = isinstance(current_input, list) and any(
-                isinstance(b, dict) and b.get("type") not in ("text", "tool_result")
-                for b in current_input
+            auto_compact(
+                ctx.client, messages, system_prompt, transcripts_dir, ctx.profiler,
+                model=effective_model,
             )
-            auto_compact(ctx.client, messages, system_prompt, transcripts_dir, ctx.profiler)
-            if has_media and current_input is not None:
-                summary_text = messages[0]["content"]
-                blocks: list[dict] = [{"type": "text", "text": summary_text}]
-                blocks.extend(current_input)
-                messages[0]["content"] = blocks
 
         ctx.profiler.start("api")
         try:
-            response = ctx.client.messages.create(
-                model=effective_model,
-                max_tokens=effective_max_tokens,
-                system=system_prompt,
-                tools=ctx.tools,
-                messages=messages,
-            )
+            if ctx.runner is not None:
+                def _compact_fn(_client: anthropic.Anthropic, _messages: list[dict]) -> None:
+                    emergency_compact(
+                        _client, _messages, system_prompt,
+                        transcripts_dir, ctx.profiler, model=effective_model,
+                    )
+
+                response, _used_client = ctx.runner.call(
+                    messages=messages,
+                    system=system_prompt,
+                    tools=ctx.tools,
+                    model=effective_model,
+                    max_tokens=effective_max_tokens,
+                    compact_fn=_compact_fn,
+                    fallback_models=fallback_models,
+                )
+            else:
+                response = ctx.client.messages.create(
+                    model=effective_model,
+                    max_tokens=effective_max_tokens,
+                    system=system_prompt,
+                    tools=ctx.tools,
+                    messages=messages,
+                )
         except KeyboardInterrupt:
             ctx.profiler.stop()
             print("\n  [interrupted] API call cancelled.")
+            break
+        except ResilienceExhausted as exc:
+            ctx.profiler.stop()
+            print(f"\n  [resilience] {exc}")
             break
         except anthropic.APIError as exc:
             ctx.profiler.stop()
@@ -286,6 +311,7 @@ def agent_loop(
                 transcripts_dir=transcripts_dir,
                 messages=messages,
                 scheduler=ctx.scheduler,
+                model=effective_model,
             )
             for block in assistant_content:
                 if hasattr(block, "text") and block.text.strip():
@@ -333,7 +359,8 @@ def agent_loop(
                     print(f"  [context] auto_compact triggered ({reason})")
                 if transcripts_dir is not None:
                     auto_compact(
-                        ctx.client, messages, system_prompt, transcripts_dir, ctx.profiler
+                        ctx.client, messages, system_prompt, transcripts_dir, ctx.profiler,
+                        model=effective_model,
                     )
         else:
             final_text = "".join(
@@ -398,6 +425,7 @@ def _process_inbound(
                 agent_team_dir,
                 ctx.client,
                 ctx.profiler,
+                max_tokens=effective.effective_max_tokens,
                 skill_registry=ctx.skill_registry,
                 plan_manager=plan_manager,
                 worktree_manager=worktree_manager,
@@ -535,6 +563,7 @@ def _process_inbound(
             max_tokens=effective.effective_max_tokens,
             compact_threshold=effective.effective_compact_threshold,
             compact_micro_age=effective.effective_compact_micro_age,
+            fallback_models=effective.fallback_models,
             transcripts_dir=per_agent_transcripts,
             team_manager=team_manager,
             worktree_manager=worktree_manager,
@@ -544,6 +573,10 @@ def _process_inbound(
         )
     except KeyboardInterrupt:
         print("\n  [interrupted] Returning to prompt.")
+        cron_ok = False
+        reply_text = None
+    except ResilienceExhausted as exc:
+        print(f"\n  [resilience] {exc}")
         cron_ok = False
         reply_text = None
     except anthropic.APIError as exc:
@@ -615,14 +648,34 @@ def run(mode: str = "auto") -> None:
 
     default_agent = registry.default_agent()
 
-    client_kwargs: dict = {"api_key": settings.anthropic_api_key}
+    keys_path = Path(settings.keys_file_path)
+    keys_file = keys_path if keys_path.is_absolute() else WORKDIR / keys_path
+    profiles = load_profiles(
+        keys_file=keys_file,
+        env_api_key=settings.anthropic_api_key,
+        env_base_url=settings.anthropic_base_url,
+    )
+    if not profiles:
+        from pip_agent.config import ConfigError
+
+        raise ConfigError(
+            "No Anthropic credentials available: set ANTHROPIC_API_KEY in .env "
+            f"or add a profile with a non-empty api_key to {keys_file}."
+        )
     if settings.anthropic_base_url:
-        client_kwargs["base_url"] = settings.anthropic_base_url
-        client_kwargs["default_headers"] = {
-            "Authorization": f"Bearer {settings.anthropic_api_key}",
-        }
         os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-    client = anthropic.Anthropic(**client_kwargs)
+
+    profile_manager = ProfileManager(profiles)
+    sim_failure = SimulatedFailure()
+    runner = ResilienceRunner(
+        profile_manager=profile_manager,
+        simulated_failure=sim_failure,
+        verbose=settings.verbose,
+    )
+    client = profile_manager.client_for(profiles[0])
+    if settings.verbose:
+        names = ", ".join(p.name for p in profiles)
+        print(f"  [resilience] loaded {len(profiles)} profile(s): {names}")
     profiler = Profiler()
     bg_manager = BackgroundTaskManager()
     plan_manager = PlanManager(AGENTS_DIR / default_agent.id / "tasks")
@@ -646,6 +699,7 @@ def run(mode: str = "auto") -> None:
         default_team_dir,
         client,
         profiler,
+        max_tokens=default_agent.effective_max_tokens,
         skill_registry=skill_registry,
         plan_manager=plan_manager,
         worktree_manager=worktree_managers[default_agent.id],
@@ -672,10 +726,12 @@ def run(mode: str = "auto") -> None:
 
     bg_scheduler = BackgroundScheduler(lane_lock, stop_event)
     bg_scheduler.register(ReflectJob(
-        memory_store, client, transcripts_dir, model=settings.model,
+        memory_store, client, transcripts_dir,
+        model=default_agent.effective_model,
     ))
     bg_scheduler.register(DreamJob(
-        memory_store, client, transcripts_dir, model=settings.model,
+        memory_store, client, transcripts_dir,
+        model=default_agent.effective_model,
     ))
     agent_dir = AGENTS_DIR / default_agent.id
     bg_scheduler.register(HeartbeatJob(
@@ -768,6 +824,8 @@ def run(mode: str = "auto") -> None:
         memory_store=memory_store,
         scheduler=bg_scheduler,
         lane_lock=lane_lock,
+        runner=runner,
+        sim_failure=sim_failure,
     )
 
     common_kwargs = dict(
@@ -805,6 +863,8 @@ def run(mode: str = "auto") -> None:
                     workdir=str(WORKDIR),
                     memory_store=memory_store,
                     scheduler=bg_scheduler,
+                    runner=runner,
+                    sim_failure=sim_failure,
                 )
                 result = dispatch_command(cmd_ctx)
                 if settings.verbose:
@@ -992,6 +1052,8 @@ def run(mode: str = "auto") -> None:
                     workdir=str(WORKDIR),
                     memory_store=memory_store,
                     scheduler=bg_scheduler,
+                    runner=runner,
+                    sim_failure=sim_failure,
                 )
                 result = dispatch_command(cmd_ctx)
                 if result.handled:
@@ -1037,6 +1099,7 @@ def run(mode: str = "auto") -> None:
                     max_tokens=default_agent.effective_max_tokens,
                     compact_threshold=default_agent.effective_compact_threshold,
                     compact_micro_age=default_agent.effective_compact_micro_age,
+                    fallback_models=default_agent.fallback_models,
                     channel=cli_channel,
                     peer_id="cli-user",
                     sender_id="cli-user",
@@ -1046,6 +1109,9 @@ def run(mode: str = "auto") -> None:
                 )
             except KeyboardInterrupt:
                 print("\n  [interrupted] Returning to prompt.")
+                continue
+            except ResilienceExhausted as exc:
+                print(f"\n  [resilience] {exc}")
                 continue
             except anthropic.APIError as exc:
                 print(f"\n  [api_error] {exc}")

@@ -269,7 +269,9 @@ class HeartbeatJob(BackgroundJob):
         self.heartbeat_path = agent_dir / "HEARTBEAT.md"
         self.msg_queue = msg_queue
         self.q_lock = q_lock
-        self.last_run_at: float = 0.0
+        # Seed with startup time so the first heartbeat fires after a full
+        # interval, not immediately after launch.
+        self.last_run_at: float = time.time()
 
     def should_run(self, now: float) -> tuple[bool, str]:
         from pip_agent.config import settings

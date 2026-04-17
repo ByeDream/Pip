@@ -71,6 +71,7 @@ class ToolContext:
     transcripts_dir: Path | None = None
     messages: list[dict] | None = None
     scheduler: Any | None = None
+    model: str = ""
 
 
 def _handle_plan_tool(name: str, inputs: dict, pm: PlanManager) -> str:
@@ -403,7 +404,6 @@ def _handle_reflect(ctx: ToolContext, inp: dict) -> DispatchResult:
     state = ctx.memory_store.load_state()
     since = state.get("last_reflect_transcript_ts", 0)
 
-    from pip_agent.config import settings
     transcripts_dir = ctx.transcripts_dir
     if transcripts_dir is None:
         return DispatchResult(content="[error] No transcripts directory configured.")
@@ -413,7 +413,7 @@ def _handle_reflect(ctx: ToolContext, inp: dict) -> DispatchResult:
         transcripts_dir,
         ctx.memory_store.agent_id,
         since,
-        model=settings.model,
+        model=ctx.model,
     )
 
     if observations:

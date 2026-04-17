@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pip-boy"
-version = "0.2.0"
+version = "0.3.0"
 description = "Personal assistant agent with persistent memory and configurable persona"
 readme = "README.md"
 license = "MIT"
@@ -44,7 +44,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "pip_agent.skills" = ["**/*.md"]
-"pip_agent.scaffold" = ["*.md", "*.json", "*.txt", "env.example"]
+"pip_agent.scaffold" = ["*.md", "*.json", "*.txt", "*.example"]
 "pip_agent.memory" = ["sops/*.md"]
 
 [tool.ruff]

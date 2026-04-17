@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import anthropic
 
 from pip_agent.config import settings
+from pip_agent.routing import DEFAULT_COMPACT_MICRO_AGE, DEFAULT_MODEL
 from pip_agent.tools import COMPACT_SCHEMA  # noqa: F401 — re-exported
 
 if TYPE_CHECKING:
@@ -108,6 +109,8 @@ def _find_tool_name(messages: list[dict], tool_use_id: str) -> str:
 PRESERVE_RESULT_TOOLS = {"read"}
 PRESERVE_RESULT_PREFIXES = ("task_",)
 
+OVERSIZED_TOOL_RESULT_CHARS = 20_000
+
 
 _IMAGE_TOKEN_ESTIMATE = 1600  # Anthropic bills images by pixel area, not base64 size
 
@@ -137,6 +140,57 @@ def estimate_tokens(messages: list[dict]) -> int:
     return len(text) // 4 + image_count * _IMAGE_TOKEN_ESTIMATE
 
 
+def truncate_oversized_tool_results(
+    messages: list[dict],
+    max_chars: int = OVERSIZED_TOOL_RESULT_CHARS,
+) -> int:
+    """Size-based truncation of tool_result content blocks.
+
+    Unlike `micro_compact` which folds old results by age, this pass only
+    touches results whose content exceeds `max_chars`. Short results are
+    preserved unchanged. Intended as Stage 1 of overflow recovery.
+
+    Operates in-place. Returns the number of truncations made.
+    """
+    replaced = 0
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            body = block.get("content")
+            if isinstance(body, str) and len(body) > max_chars:
+                original_len = len(body)
+                block["content"] = (
+                    body[:max_chars]
+                    + f"\n\n[... truncated ({original_len} chars total, "
+                    f"showing first {max_chars}) ...]"
+                )
+                replaced += 1
+            elif isinstance(body, list):
+                for sub in body:
+                    if not isinstance(sub, dict):
+                        continue
+                    if sub.get("type") == "text":
+                        text = sub.get("text", "")
+                        if isinstance(text, str) and len(text) > max_chars:
+                            original_len = len(text)
+                            sub["text"] = (
+                                text[:max_chars]
+                                + f"\n\n[... truncated ({original_len} chars total, "
+                                f"showing first {max_chars}) ...]"
+                            )
+                            replaced += 1
+    if replaced and settings.verbose:
+        print(
+            f"  [truncate_tool_results] truncated {replaced} oversized "
+            f"block(s) (>{max_chars} chars)"
+        )
+    return replaced
+
+
 def micro_compact(messages: list[dict], *, max_age: int | None = None) -> int:
     """Layer 1: replace old tool_result content with short placeholders.
 
@@ -144,7 +198,7 @@ def micro_compact(messages: list[dict], *, max_age: int | None = None) -> int:
     A 'round' is one assistant+user message pair within the list.
     """
     if max_age is None:
-        max_age = settings.compact_micro_age
+        max_age = DEFAULT_COMPACT_MICRO_AGE
 
     round_indices: list[int] = []
     for i, msg in enumerate(messages):
@@ -205,7 +259,7 @@ def summarize_messages(
     Returns (summary_text, input_tokens, output_tokens).
     """
     if not model:
-        model = settings.model
+        model = DEFAULT_MODEL
     transcript = _format_for_summary(messages)
     prompt = (
         f"Here is the conversation transcript to summarize:\n\n"
@@ -238,28 +292,107 @@ def summarize_messages(
     return summary, usage.input_tokens, usage.output_tokens
 
 
+def _tail_keep_count(total: int, ratio: float = 0.2, minimum: int = 4) -> int:
+    """Compute how many tail messages to preserve."""
+    return max(minimum, int(total * ratio))
+
+
 def auto_compact(
     client: anthropic.Anthropic,
     messages: list[dict],
     system_prompt: str,
     transcripts_dir: Path,
     profiler: Profiler | None = None,
+    *,
+    model: str = "",
 ) -> str:
-    """Summarize and replace messages in-place. Returns the summary text.
+    """Compact older messages via LLM summary while preserving the tail.
 
-    Transcript saving is handled independently by the agent_loop.
+    Summarizes the first ~50% of messages into a synthetic user/assistant
+    pair at the head, then appends the preserved tail (~20%, min 4). The
+    tail alignment is fixed up so it starts with a `user` role, keeping
+    the Anthropic alternation contract intact.
+
+    Transcript saving is handled independently by the agent_loop. If the
+    summary LLM call fails, the old portion is dropped and only the tail
+    is retained -- a last-ditch safety net.
     """
-    summary, in_tok, out_tok = summarize_messages(
-        client, messages, system_prompt, profiler
-    )
+    total = len(messages)
+    if total <= 4:
+        return ""
 
-    messages.clear()
-    messages.append({"role": "user", "content": f"<context>\n{summary}\n</context>"})
+    keep_count = _tail_keep_count(total)
+    compress_count = max(2, int(total * 0.5))
+    compress_count = min(compress_count, total - keep_count)
+    if compress_count < 2:
+        return ""
+
+    while compress_count < total and messages[compress_count]["role"] != "user":
+        compress_count += 1
+    if compress_count >= total:
+        return ""
+
+    old_messages = messages[:compress_count]
+    tail = messages[compress_count:]
+    if not tail:
+        return ""
+
+    try:
+        summary, in_tok, out_tok = summarize_messages(
+            client, old_messages, system_prompt, profiler, model=model,
+        )
+    except Exception as exc:
+        if settings.verbose:
+            print(f"  [compact] summary failed ({exc}); dropping old messages")
+        messages[:] = tail
+        return ""
+
+    compacted: list[dict] = [
+        {"role": "user", "content": f"<context>\n{summary}\n</context>"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Understood. Continuing from the context above."},
+            ],
+        },
+    ]
+    compacted.extend(tail)
+    messages[:] = compacted
 
     if settings.verbose:
         print(
-            f"  [compact] conversation compacted "
-            f"(summary {out_tok} tokens, was {in_tok} input tokens)"
+            f"  [compact] compacted {len(old_messages)} old msg(s) -> summary "
+            f"({out_tok} out tokens, was {in_tok} in tokens); kept {len(tail)} tail msg(s)"
         )
 
     return summary
+
+
+def emergency_compact(
+    client: anthropic.Anthropic,
+    messages: list[dict],
+    system_prompt: str,
+    transcripts_dir: Path | None = None,
+    profiler: Profiler | None = None,
+    *,
+    model: str = "",
+) -> str:
+    """Aggressive compaction for overflow recovery.
+
+    Stage 1: aggressive micro_compact (max_age=1) — fold nearly all old tool
+    results to placeholders regardless of the normal age threshold.
+    Stage 2: truncate_oversized_tool_results — trim any remaining huge blocks.
+    Stage 3: auto_compact — LLM-summarize the first half, keep the tail.
+
+    Each stage mutates `messages` in place. Returns the summary text from
+    Stage 3 (or empty string if Stage 3 was skipped / failed).
+    """
+    if settings.verbose:
+        print("  [emergency_compact] running three-stage overflow recovery")
+    micro_compact(messages, max_age=1)
+    truncate_oversized_tool_results(messages)
+    if transcripts_dir is None:
+        transcripts_dir = Path(".")
+    return auto_compact(
+        client, messages, system_prompt, transcripts_dir, profiler, model=model,
+    )

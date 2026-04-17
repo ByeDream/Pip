@@ -21,6 +21,7 @@ _SCAFFOLD_FILES: list[tuple[str, str]] = [
     (".pip/agents/pip-boy/persona.md", "pip-boy.md"),
     (".pip/agents/pip-boy/HEARTBEAT.md", "heartbeat.md"),
     (".pip/owner.md", "owner.md"),
+    (".pip/keys.json", "keys.json"),
     (".env", "env.example"),
 ]
 

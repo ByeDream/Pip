@@ -2,3 +2,4 @@
 .env
 .env.*
 .pip/wechat_session.json
+.pip/keys.json

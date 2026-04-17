@@ -70,6 +70,7 @@ class AgentConfig:
     dm_scope: str = ""
     compact_threshold: int = 0
     compact_micro_age: int = 0
+    fallback_models: list[str] = field(default_factory=list)
 
     @property
     def effective_model(self) -> str:
@@ -124,6 +125,14 @@ def agent_config_from_file(path: Path) -> AgentConfig:
         default_id = path.parent.name
     else:
         default_id = path.stem
+    fb_raw = meta.get("fallback_models") or []
+    if isinstance(fb_raw, str):
+        fallback_models = [s.strip() for s in fb_raw.split(",") if s.strip()]
+    elif isinstance(fb_raw, list):
+        fallback_models = [str(s).strip() for s in fb_raw if str(s).strip()]
+    else:
+        fallback_models = []
+
     return AgentConfig(
         id=normalize_agent_id(meta.get("id", default_id)),
         name=meta.get("name", ""),
@@ -133,6 +142,7 @@ def agent_config_from_file(path: Path) -> AgentConfig:
         dm_scope=meta.get("dm_scope", ""),
         compact_threshold=int(meta["compact_threshold"]) if "compact_threshold" in meta else 0,
         compact_micro_age=int(meta["compact_micro_age"]) if "compact_micro_age" in meta else 0,
+        fallback_models=fallback_models,
     )
 
 
@@ -392,4 +402,10 @@ def resolve_effective_config(
         kwargs["compact_threshold"] = int(ov["compact_threshold"])
     if "compact_micro_age" in ov:
         kwargs["compact_micro_age"] = int(ov["compact_micro_age"])
+    if "fallback_models" in ov:
+        raw = ov["fallback_models"]
+        if isinstance(raw, str):
+            kwargs["fallback_models"] = [s.strip() for s in raw.split(",") if s.strip()]
+        elif isinstance(raw, list):
+            kwargs["fallback_models"] = [str(s).strip() for s in raw if str(s).strip()]
     return replace(agent, **kwargs) if kwargs else agent

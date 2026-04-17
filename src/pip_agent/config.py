@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -16,6 +18,8 @@ class Settings(BaseSettings):
     anthropic_api_key: str = Field(default="")
     anthropic_base_url: str = Field(default="")
 
+    keys_file_path: str = Field(default=".pip/keys.json")
+
     profiler_enabled: bool = Field(default=False)
     verbose: bool = Field(default=True)
 
@@ -23,13 +27,6 @@ class Settings(BaseSettings):
 
     wecom_bot_id: str = Field(default="")
     wecom_bot_secret: str = Field(default="")
-
-    # Legacy fields kept for backward compat with existing .env files.
-    # These are now configured per-agent in .pip/agents/*.md.
-    model: str = Field(default="claude-opus-4-6")
-    max_tokens: int = Field(default=8192)
-    compact_threshold: int = Field(default=50_000)
-    compact_micro_age: int = Field(default=3)
 
     # Memory pipeline settings (global, not per-agent).
     reflect_transcript_threshold: int = Field(default=10)
@@ -46,7 +43,14 @@ class Settings(BaseSettings):
     def check_required(self) -> None:
         errors: list[str] = []
         if not self.anthropic_api_key:
-            errors.append("ANTHROPIC_API_KEY is not set")
+            keys_path = Path(self.keys_file_path)
+            if not keys_path.is_absolute():
+                keys_path = Path.cwd() / keys_path
+            if not keys_path.is_file():
+                errors.append(
+                    "No Anthropic credentials found: set ANTHROPIC_API_KEY in .env "
+                    f"or populate {self.keys_file_path}"
+                )
         if errors:
             raise ConfigError("; ".join(errors))
 

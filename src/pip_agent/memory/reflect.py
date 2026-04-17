@@ -173,9 +173,9 @@ def reflect(
 
     Returns list of observation dicts: [{text, category}, ...].
     """
-    from pip_agent.config import settings
+    from pip_agent.routing import DEFAULT_MODEL
     if not model:
-        model = settings.model
+        model = DEFAULT_MODEL
 
     transcripts = _load_transcripts(transcripts_dir, agent_id, since)
     if not transcripts:

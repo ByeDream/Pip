@@ -238,6 +238,10 @@ class TestSummarizeMessages:
 
 class TestAutoCompact:
     def test_replaces_messages_with_summary(self, tmp_path: Path):
+        """With tail-preserving compaction, the head is summarized but recent
+        turns survive untouched. The new structure is:
+            [user(summary), assistant(ack), ...tail...]
+        """
         client = MagicMock()
         client.messages.create.return_value = SimpleNamespace(
             content=[_text_block("Here is the summary.")],
@@ -245,17 +249,17 @@ class TestAutoCompact:
         )
         msgs = _make_messages_with_tool_rounds(5)
         original_len = len(msgs)
-        assert original_len > 1
+        assert original_len > 4
 
         with patch("pip_agent.compact.settings") as mock_settings:
             mock_settings.verbose = False
-            mock_settings.model = "test"
-            mock_settings.compact_micro_age = 3
-            auto_compact(client, msgs, "system", tmp_path)
+            auto_compact(client, msgs, "system", tmp_path, model="test")
 
-        assert len(msgs) == 1
+        assert len(msgs) < original_len
         assert msgs[0]["role"] == "user"
         assert "summary" in msgs[0]["content"].lower()
+        assert msgs[1]["role"] == "assistant"
+        assert len(msgs) >= 4
 
     def test_does_not_save_transcript(self, tmp_path: Path):
         """auto_compact no longer saves transcripts — that's agent_loop's job."""
@@ -264,18 +268,17 @@ class TestAutoCompact:
             content=[_text_block("summary")],
             usage=SimpleNamespace(input_tokens=100, output_tokens=20),
         )
-        msgs = [{"role": "user", "content": "hello"}]
+        msgs = _make_messages_with_tool_rounds(5)
 
         with patch("pip_agent.compact.settings") as mock_settings:
             mock_settings.verbose = False
-            mock_settings.model = "test"
-            mock_settings.compact_micro_age = 3
-            auto_compact(client, msgs, "system", tmp_path)
+            auto_compact(client, msgs, "system", tmp_path, model="test")
 
         files = list(tmp_path.glob("*.json"))
         assert len(files) == 0
 
-    def test_single_message_conversation(self, tmp_path: Path):
+    def test_single_message_skipped(self, tmp_path: Path):
+        """Small conversations (<=4 messages) are skipped entirely."""
         client = MagicMock()
         client.messages.create.return_value = SimpleNamespace(
             content=[_text_block("nothing to summarize")],
@@ -285,9 +288,8 @@ class TestAutoCompact:
 
         with patch("pip_agent.compact.settings") as mock_settings:
             mock_settings.verbose = False
-            mock_settings.model = "test"
-            mock_settings.compact_micro_age = 3
-            auto_compact(client, msgs, "system", tmp_path)
+            auto_compact(client, msgs, "system", tmp_path, model="test")
 
         assert len(msgs) == 1
-        assert "<context>" in msgs[0]["content"]
+        assert msgs[0]["content"] == "hi"
+        client.messages.create.assert_not_called()

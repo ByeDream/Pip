@@ -31,6 +31,7 @@ from pip_agent.routing import (
 
 if TYPE_CHECKING:
     from pip_agent.memory import MemoryStore
+    from pip_agent.resilience import ResilienceRunner, SimulatedFailure
 
 
 @dataclass
@@ -42,6 +43,8 @@ class CommandContext:
     workdir: str = ""
     memory_store: MemoryStore | None = None
     scheduler: Any | None = None
+    runner: ResilienceRunner | None = None
+    sim_failure: SimulatedFailure | None = None
 
 
 @dataclass
@@ -84,6 +87,12 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
         "/trigger": _cmd_trigger,
         "/cron": _cmd_cron,
         "/cron-trigger": _cmd_cron_trigger,
+        "/profiles": _cmd_profiles,
+        "/cooldowns": _cmd_cooldowns,
+        "/stats": _cmd_stats,
+        "/simulate-failure": _cmd_simulate_failure,
+        "/fallback": _cmd_fallback,
+        "/model": _cmd_model,
     }
 
     handler = handlers.get(cmd)
@@ -132,6 +141,12 @@ Available commands (require admin or owner privileges):
   /trigger                       Manually fire the heartbeat now
   /cron                          List all scheduled cron jobs
   /cron-trigger <id>             Manually fire a specific cron job
+  /profiles                      List Anthropic API profiles and their status
+  /cooldowns                     Show profiles currently in cooldown
+  /stats                         Show resilience runner statistics
+  /simulate-failure <reason>     Arm a simulated failure for the next API call
+  /fallback                      Show the fallback model chain
+  /model                         Show the current agent's full model configuration
   /update                        Upgrade pip-boy to latest version and restart
   /exit                          Quit Pip-Boy (CLI only)
 
@@ -165,16 +180,20 @@ def _persist_agent_md(cfg: AgentConfig, agents_dir: Path | None) -> None:
     agent_subdir = agents_dir / cfg.id
     agent_subdir.mkdir(parents=True, exist_ok=True)
     md_path = agent_subdir / "persona.md"
-    frontmatter = (
-        f"---\n"
-        f"name: {cfg.name}\n"
-        f"model: {cfg.effective_model}\n"
-        f"max_tokens: {cfg.effective_max_tokens}\n"
-        f"dm_scope: {cfg.effective_dm_scope}\n"
-        f"compact_threshold: {cfg.effective_compact_threshold}\n"
-        f"compact_micro_age: {cfg.effective_compact_micro_age}\n"
-        f"---\n"
-    )
+    lines = [
+        "---",
+        f"name: {cfg.name}",
+        f"model: {cfg.effective_model}",
+        f"max_tokens: {cfg.effective_max_tokens}",
+        f"dm_scope: {cfg.effective_dm_scope}",
+        f"compact_threshold: {cfg.effective_compact_threshold}",
+        f"compact_micro_age: {cfg.effective_compact_micro_age}",
+    ]
+    if cfg.fallback_models:
+        fb_list = ", ".join(cfg.fallback_models)
+        lines.append(f"fallback_models: [{fb_list}]")
+    lines.append("---\n")
+    frontmatter = "\n".join(lines)
     body = cfg.system_body or ""
     md_path.write_text(frontmatter + body + "\n", encoding="utf-8")
 
@@ -722,3 +741,128 @@ def _cmd_exit(ctx: CommandContext, args: str) -> CommandResult:
             response="/exit is only available in the CLI channel.",
         )
     return CommandResult(handled=True, exit_requested=True)
+
+
+# ---------------------------------------------------------------------------
+# /profiles, /cooldowns, /stats, /simulate-failure, /fallback
+# ---------------------------------------------------------------------------
+
+def _cmd_profiles(ctx: CommandContext, _args: str) -> CommandResult:
+    if not ctx.runner:
+        return CommandResult(handled=True, response="Resilience runner not available.")
+    rows = ctx.runner.profile_manager.list_profiles()
+    if not rows:
+        return CommandResult(handled=True, response="No profiles configured.")
+    lines = ["**API Profiles**"]
+    for r in rows:
+        line = f"  {r['name']:16s} {r['status']:24s} last_good={r['last_good']}"
+        if r["failure_reason"]:
+            line += f"  failure={r['failure_reason']}"
+        if r["base_url"] != "(default)":
+            line += f"  base_url={r['base_url']}"
+        lines.append(line)
+    return CommandResult(handled=True, response="\n".join(lines))
+
+
+def _cmd_cooldowns(ctx: CommandContext, _args: str) -> CommandResult:
+    if not ctx.runner:
+        return CommandResult(handled=True, response="Resilience runner not available.")
+    import time as _time
+
+    now = _time.time()
+    rows: list[str] = []
+    for p in ctx.runner.profile_manager.profiles:
+        remaining = p.cooldown_until - now
+        if remaining > 0:
+            rows.append(
+                f"  {p.name}: {remaining:.0f}s remaining"
+                f" (reason: {p.failure_reason or 'unknown'})"
+            )
+    if not rows:
+        return CommandResult(handled=True, response="No active cooldowns.")
+    return CommandResult(handled=True, response="**Active Cooldowns**\n" + "\n".join(rows))
+
+
+def _cmd_stats(ctx: CommandContext, _args: str) -> CommandResult:
+    if not ctx.runner:
+        return CommandResult(handled=True, response="Resilience runner not available.")
+    stats = ctx.runner.get_stats()
+    lines = ["**Resilience Stats**"]
+    for k, v in stats.items():
+        lines.append(f"  {k}: {v}")
+    return CommandResult(handled=True, response="\n".join(lines))
+
+
+def _cmd_simulate_failure(ctx: CommandContext, args: str) -> CommandResult:
+    if not ctx.sim_failure:
+        return CommandResult(handled=True, response="Simulated failure not available.")
+    from pip_agent.resilience import SimulatedFailure as _SF
+
+    arg = args.strip()
+    if not arg:
+        valid = ", ".join(_SF.TEMPLATES.keys())
+        lines = ["Usage: /simulate-failure <reason>", f"Valid: {valid}"]
+        if ctx.sim_failure.is_armed:
+            lines.append(f"Currently armed: {ctx.sim_failure.pending_reason}")
+        return CommandResult(handled=True, response="\n".join(lines))
+    if arg.lower() in ("off", "disarm", "clear"):
+        ctx.sim_failure.disarm()
+        return CommandResult(handled=True, response="Simulated failure disarmed.")
+    msg = ctx.sim_failure.arm(arg)
+    return CommandResult(handled=True, response=msg)
+
+
+def _cmd_fallback(ctx: CommandContext, _args: str) -> CommandResult:
+    eff = _resolve_effective_agent(ctx)
+    lines = [
+        f"**Fallback Chain for {eff.name or eff.id}**",
+        f"  Primary: {eff.effective_model}",
+    ]
+    if eff.fallback_models:
+        for i, m in enumerate(eff.fallback_models, 1):
+            lines.append(f"  Fallback {i}: {m}")
+    else:
+        lines.append("  (no fallback models configured)")
+    return CommandResult(handled=True, response="\n".join(lines))
+
+
+def _cmd_model(ctx: CommandContext, _args: str) -> CommandResult:
+    """Show the effective LLM configuration for the current agent."""
+    inbound = ctx.inbound
+    agent_id, binding = ctx.bindings.resolve(
+        channel=inbound.channel,
+        account_id=inbound.account_id,
+        guild_id=inbound.guild_id,
+        peer_id=inbound.peer_id,
+    )
+    if not agent_id:
+        agent_id = ctx.registry.default_agent().id
+        binding = None
+    base = ctx.registry.get_agent(agent_id) or ctx.registry.default_agent()
+    eff = resolve_effective_config(base, binding)
+
+    ov = (binding.overrides if binding else {}) or {}
+
+    def tag(field: str) -> str:
+        return " (binding override)" if field in ov else ""
+
+    lines = [
+        f"**Model Config for {eff.name or eff.id} ({eff.id})**",
+        f"  model:             {eff.effective_model}{tag('model')}",
+        f"  max_tokens:        {eff.effective_max_tokens}{tag('max_tokens')}",
+        f"  compact_threshold: {eff.effective_compact_threshold}{tag('compact_threshold')}",
+        f"  compact_micro_age: {eff.effective_compact_micro_age}{tag('compact_micro_age')}",
+    ]
+    if eff.fallback_models:
+        lines.append(f"  fallback_models:{tag('fallback_models')}")
+        for i, m in enumerate(eff.fallback_models, 1):
+            lines.append(f"    {i}. {m}")
+    else:
+        lines.append("  fallback_models:   (none)")
+
+    lines.append("")
+    if binding and ov:
+        lines.append(f"Source: persona.md + binding overrides ({binding.display()})")
+    else:
+        lines.append(f"Source: persona.md (.pip/agents/{eff.id}/persona.md)")
+    return CommandResult(handled=True, response="\n".join(lines))

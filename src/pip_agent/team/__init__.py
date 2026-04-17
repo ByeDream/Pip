@@ -16,6 +16,7 @@ log = logging.getLogger(__name__)
 
 from pip_agent.config import settings  # noqa: E402
 from pip_agent.profiler import Profiler  # noqa: E402
+from pip_agent.routing import DEFAULT_MAX_TOKENS  # noqa: E402
 from pip_agent.tool_dispatch import TeammateToolSurface, ToolContext, dispatch_tool  # noqa: E402
 from pip_agent.tools import VALID_MSG_TYPES, tools_for_role  # noqa: E402
 from pip_agent.tools import WORKDIR as _DEFAULT_WORKDIR  # noqa: E402
@@ -301,6 +302,7 @@ class Teammate:
         *,
         model: str,
         max_turns: int,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         protocol: ProtocolTracker | None = None,
         skill_registry: SkillRegistry | None = None,
         active_names_fn: callable = lambda: [],
@@ -311,6 +313,7 @@ class Teammate:
     ) -> None:
         self.spec = spec
         self._model = model
+        self._max_tokens = max_tokens
         self._client = client
         self._bus = bus
         self._profiler = profiler
@@ -426,7 +429,7 @@ class Teammate:
             try:
                 response = self._client.messages.create(
                     model=self._model,
-                    max_tokens=settings.max_tokens,
+                    max_tokens=self._max_tokens,
                     system=system,
                     tools=tools,
                     messages=messages,
@@ -710,6 +713,7 @@ class TeamManager:
         client: anthropic.Anthropic,
         profiler: Profiler,
         *,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         skill_registry: SkillRegistry | None = None,
         plan_manager: PlanManager | None = None,
         worktree_manager: WorktreeManager | None = None,
@@ -718,6 +722,7 @@ class TeamManager:
     ) -> None:
         self._client = client
         self._profiler = profiler
+        self._default_max_tokens = max_tokens
         self._skill_registry = skill_registry
         self._plan_manager = plan_manager
         self._worktree_manager = worktree_manager
@@ -762,6 +767,7 @@ class TeamManager:
             self._bus,
             self._profiler,
             model=model,
+            max_tokens=self._default_max_tokens,
             max_turns=max_turns,
             protocol=self._protocol,
             skill_registry=self._skill_registry,
