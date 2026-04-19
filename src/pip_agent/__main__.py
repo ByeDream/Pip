@@ -1,7 +1,6 @@
 import argparse
 import sys
 
-from pip_agent.agent import run
 from pip_agent.config import ConfigError
 
 
@@ -13,6 +12,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Force WeChat QR login; optionally specify agent name to bind",
     )
     group.add_argument("--cli", action="store_true", help="CLI-only mode")
+    group.add_argument("--sdk", action="store_true", help="CLI via Claude Agent SDK")
     group.add_argument("--version", action="store_true", help="Show version and exit")
     args = parser.parse_args(argv)
 
@@ -22,12 +22,18 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     try:
-        if args.cli:
+        if args.sdk:
+            from pip_agent.agent_cli import run_sdk_cli
+            run_sdk_cli()
+        elif args.cli:
+            from pip_agent.agent import run
             run(mode="cli")
         elif args.scan:
+            from pip_agent.agent import run
             bind_agent = args.scan if isinstance(args.scan, str) else None
             run(mode="scan", bind_agent=bind_agent)
         else:
+            from pip_agent.agent import run
             run(mode="auto")
     except ConfigError as exc:
         print(f"  [config error] {exc}", file=sys.stderr)
