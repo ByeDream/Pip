@@ -594,15 +594,18 @@ def _process_inbound(
                     "text": f'<attached-file name="{att.filename}">\n{att.text}\n</attached-file>',
                 })
             elif att.type == "file" and att.data:
-                inbox_dir = WORKDIR / ".pip" / "inbox"
-                inbox_dir.mkdir(parents=True, exist_ok=True)
+                if ctx.memory_store:
+                    dl_dir = ctx.memory_store.agent_dir / "downloads"
+                else:
+                    dl_dir = WORKDIR / ".pip" / "downloads"
+                dl_dir.mkdir(parents=True, exist_ok=True)
                 fname = att.filename or "file"
-                dest = inbox_dir / fname
+                dest = dl_dir / fname
                 suffix = 1
                 while dest.exists():
                     stem = Path(fname).stem
                     ext = Path(fname).suffix
-                    dest = inbox_dir / f"{stem}_{suffix}{ext}"
+                    dest = dl_dir / f"{stem}_{suffix}{ext}"
                     suffix += 1
                 dest.write_bytes(att.data)
                 content_blocks.append({

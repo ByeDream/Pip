@@ -128,6 +128,7 @@ def _ensure_dirs(workdir: Path, *, default_agent_id: str = "pip-boy") -> None:
         f".pip/agents/{default_agent_id}/users",
         f".pip/agents/{default_agent_id}/transcripts",
         f".pip/agents/{default_agent_id}/tasks",
+        f".pip/agents/{default_agent_id}/downloads",
         f".pip/agents/{default_agent_id}/team",
         f".pip/agents/{default_agent_id}/team/inbox",
     ]

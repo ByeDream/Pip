@@ -227,12 +227,13 @@ DOWNLOAD_SCHEMA = {
                 "description": "The URL to download from.",
             },
             "filename": {
-                "type": "string",
-                "description": (
-                    "Target filename (e.g. 'report.pdf'). "
-                    "Saved under .pip/inbox/. If omitted, derived from URL."
-                ),
-            },
+                    "type": "string",
+                    "description": (
+                        "Target filename (e.g. 'report.pdf'). "
+                        "Saved under the agent's downloads directory. "
+                        "If omitted, derived from URL."
+                    ),
+                },
         },
         "required": ["url"],
     },
@@ -1339,8 +1340,8 @@ def run_web_fetch(tool_input: dict) -> str:
     return text or "(empty response)"
 
 
-def run_download(tool_input: dict, *, workdir: Path | None = None) -> str:
-    """Download a URL to .pip/inbox/ as a binary file."""
+def run_download(tool_input: dict, *, downloads_dir: Path | None = None) -> str:
+    """Download a URL to the agent's downloads directory."""
     import httpx
     from urllib.parse import urlparse, unquote
 
@@ -1367,15 +1368,14 @@ def run_download(tool_input: dict, *, workdir: Path | None = None) -> str:
         path_part = urlparse(url).path
         filename = unquote(path_part.rsplit("/", 1)[-1]) or "download"
 
-    base = workdir or WORKDIR
-    inbox_dir = base / ".pip" / "inbox"
-    inbox_dir.mkdir(parents=True, exist_ok=True)
-    dest = inbox_dir / Path(filename).name
+    dest_dir = downloads_dir or (WORKDIR / ".pip" / "downloads")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / Path(filename).name
     suffix = 1
     while dest.exists():
         stem = Path(filename).stem
         ext = Path(filename).suffix or ""
-        dest = inbox_dir / f"{stem}_{suffix}{ext}"
+        dest = dest_dir / f"{stem}_{suffix}{ext}"
         suffix += 1
     dest.write_bytes(data)
     return f"Saved {len(data)} bytes -> {dest}"

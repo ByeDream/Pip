@@ -249,7 +249,10 @@ _IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 def _handle_download(ctx: ToolContext, inp: dict) -> DispatchResult:
     import base64
 
-    text = _wrap_simple(run_download, inp, workdir=ctx.workdir)
+    dl_dir = None
+    if ctx.memory_store:
+        dl_dir = ctx.memory_store.agent_dir / "downloads"
+    text = _wrap_simple(run_download, inp, downloads_dir=dl_dir)
     if not text.startswith("Saved ") or " -> " not in text:
         return DispatchResult(content=text)
 
