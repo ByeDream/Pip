@@ -1342,8 +1342,9 @@ def run_web_fetch(tool_input: dict) -> str:
 
 def run_download(tool_input: dict, *, downloads_dir: Path | None = None) -> str:
     """Download a URL to the agent's downloads directory."""
+    from urllib.parse import unquote, urlparse
+
     import httpx
-    from urllib.parse import urlparse, unquote
 
     url = tool_input["url"]
     blocked = _validate_fetch_url(url)
