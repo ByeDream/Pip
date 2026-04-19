@@ -41,10 +41,10 @@ A three-tier pipeline that learns from conversations automatically:
 
 ### Tools
 
-- **Filesystem** — `read`, `write`, `edit`, `glob` (sandboxed to working directory)
+- **Filesystem** — `read`, `write`, `edit`, `glob`, `grep` (sandboxed to working directory)
 - **Shell** — `bash` execution with optional **background mode** for long-running commands
-- **Web** — `web_search` and `web_fetch` for real-time information retrieval
-- **Memory** — `memory_search` for explicit recall, `reflect` for on-demand reflection
+- **Web** — `web_search`, `web_fetch`, and `download` (with SSRF protection and size cap)
+- **Memory** — `memory_search` for explicit recall, `reflect` for on-demand reflection, `remember_user` for user profiles
 - **Skills** — `load_skill` dynamically loads built-in and user-defined skill guides
 
 ### Task Planning
@@ -57,10 +57,10 @@ A three-tier pipeline that learns from conversations automatically:
 ### Multi-Agent Team
 
 - **Teammate Spawning** — `team_spawn` creates daemon threads with per-session model and turn limits
+- **Persona Management** — `team_create`, `team_edit`, `team_delete` for managing teammate persona definitions
 - **Inbox Messaging** — JSONL-based message bus (`send`, `read_inbox`) between lead and teammates
-- **Model Selection** — Per-project `.pip/models.json` defines available models for teammate assignment
+- **Model Selection** — Per-project `.pip/models.json` defines available models; `team_list_models` to browse
 - **Per-Agent Isolation** — Each agent has its own data directory, TeamManager, and WorktreeManager
-- **CLI Commands** — `/team` for roster status, `/inbox` to peek the lead inbox
 
 ### Git Worktree Isolation
 
@@ -84,6 +84,20 @@ Every `messages.create` call is wrapped in a three-layer retry onion (`pip_agent
 - **Layer 3 — Tool-Use Loop** — The standard `while True + stop_reason` loop; each iteration is one Layer-1 call.
 - **Fallback Models** — After all primary profiles are exhausted, Pip-Boy tries each model in `fallback_models` (per-agent YAML) before raising `ResilienceExhausted`.
 - **Simulated Failures** — `/simulate-failure <reason>` arms the next API call to fail with a given category, letting you verify the retry path without real outages.
+
+### Heartbeat
+
+- **Periodic Background Checks** — A configurable heartbeat job runs at a set interval during active hours, executing the agent's `HEARTBEAT.md` prompt
+- **Default Checks** — Task board status, git status, workspace health; report only actionable items
+- **Channel Routing** — Optional YAML frontmatter in `HEARTBEAT.md` routes replies to a specific channel and peer
+- **Slash Commands** — `/heartbeat` for status, `/trigger` to fire manually
+
+### Cron Jobs
+
+- **User-Defined Schedules** — `cron_add`, `cron_remove`, `cron_update`, `cron_list` tools for managing recurring tasks
+- **Auto-Disable** — Jobs that fail repeatedly are automatically disabled after a threshold
+- **Lane Isolation** — Cron jobs run on a dedicated lane, never blocking other background work
+- **Slash Commands** — `/cron` to list jobs, `/cron-trigger <id>` to fire one manually
 
 ### Built-in Skills
 
@@ -173,23 +187,31 @@ At least one of `ANTHROPIC_API_KEY` (in `.env`) or a populated `.pip/keys.json` 
 | `DREAM_MIN_OBSERVATIONS` | `20` | Minimum observations before Dream can run |
 | `DREAM_INACTIVE_MINUTES` | `30` | Agent idle time (minutes) required for Dream |
 
+#### Heartbeat
+
+| Variable | Default | Description |
+|---|---|---|
+| `HEARTBEAT_INTERVAL` | `1800` | Seconds between heartbeat checks |
+| `HEARTBEAT_ACTIVE_START` | `9` | Local hour (0-23) when heartbeats begin |
+| `HEARTBEAT_ACTIVE_END` | `22` | Local hour (0-23) when heartbeats stop |
+
 ### Per-Agent Configuration
 
 Model, token limits, compaction settings, and the fallback model chain are configured per-agent via YAML frontmatter in `.pip/agents/<id>/persona.md`:
 
 ```yaml
 ---
-model: claude-sonnet-4-6
-max_tokens: 8192
-compact_threshold: 50000
-compact_micro_age: 3
+model: claude-opus-4-6
+max_tokens: 16384
+compact_threshold: 150000
+compact_micro_age: 8
 fallback_models:
-  - claude-haiku-4-5
   - claude-sonnet-4-5
+  - claude-haiku-4-5
 ---
 ```
 
-`fallback_models` is optional. When set, Pip-Boy falls back through each listed model after every primary profile has failed, before giving up.
+All fields are optional and fall back to built-in defaults (`model: claude-opus-4-6`, `max_tokens: 8192`, `compact_threshold: 50000`, `compact_micro_age: 8`). `fallback_models`, when set, makes Pip-Boy fall back through each listed model after every primary profile has failed, before giving up.
 
 ### Multi-Key Profiles (`.pip/keys.json`)
 
@@ -207,15 +229,35 @@ Pip-Boy scaffolds `.pip/keys.json` on first run with a blank `api_key` placehold
 
 Rotation honours per-reason cooldowns — `rate_limit` 120s, `auth` / `billing` 300s, `timeout` 60s. The file is covered by `.gitignore`.
 
-### Slash Commands (Resilience)
+### Slash Commands
 
 | Command | Description |
 |---|---|
-| `/profiles` | List all loaded API profiles, their availability, and last-good timestamp |
+| `/help` | Show all available commands |
+| `/bind <agent-id> [options]` | Bind current chat to an agent (auto-creates if needed) |
+| `/name <display_name>` | Set display name for the current agent |
+| `/unbind` | Remove current chat's routing binding |
+| `/clean` | Remove binding and delete the agent + all its data |
+| `/reset` | Factory-reset agent memory (keep binding and persona) |
+| `/status` | Show current routing info |
+| `/model` | Show the current agent's full model configuration |
+| `/memory` | Show memory statistics for the current agent |
+| `/axioms` | Show current judgment principles |
+| `/recall <query>` | Search through stored memories |
+| `/admin grant\|revoke\|list` | Manage admin privileges (owner only) |
+| `/scheduler` | Show background scheduler status |
+| `/lanes` | Show per-lane queue stats |
+| `/heartbeat` | Show heartbeat status and configuration |
+| `/trigger` | Manually fire the heartbeat now |
+| `/cron` | List all scheduled cron jobs |
+| `/cron-trigger <id>` | Manually fire a specific cron job |
+| `/profiles` | List API profiles, their availability, and last-good timestamp |
 | `/cooldowns` | Show profiles currently in cooldown with remaining seconds |
-| `/stats` | Print resilience runner counters (attempts, successes, rotations, compactions, fallbacks) |
-| `/simulate-failure <reason>` | Arm a fake failure (`rate_limit`, `auth`, `timeout`, `billing`, `overflow`, `unknown`) for the next API call; use `off` to disarm |
+| `/stats` | Print resilience runner counters |
+| `/simulate-failure <reason>` | Arm a fake failure for the next API call; use `off` to disarm |
 | `/fallback` | Show the current agent's primary + fallback model chain |
+| `/update` | Upgrade pip-boy to latest version and restart |
+| `/exit` | Quit Pip-Boy (CLI only) |
 
 ### Project Directory Structure
 
@@ -229,6 +271,7 @@ Rotation honours per-reason cooldowns — `rate_limit` 120s, `auth` / `billing` 
 │   ├── bindings.json            # Channel → agent routing
 │   └── pip-boy/                 # Per-agent directory
 │       ├── persona.md           # Agent persona + config (YAML frontmatter)
+│       ├── HEARTBEAT.md         # Heartbeat prompt template
 │       ├── state.json           # Memory pipeline state
 │       ├── memories.json        # L2 consolidated memories
 │       ├── axioms.md            # L3 judgment principles
