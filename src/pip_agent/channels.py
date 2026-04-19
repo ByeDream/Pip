@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 
 
 def _detect_image_mime(data: bytes) -> str:
-    """Detect image MIME type from magic bytes. Falls back to image/jpeg."""
+    """Detect image MIME type from magic bytes. Returns '' for non-images."""
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         return "image/png"
     if data[:3] == b"\xff\xd8\xff":
@@ -34,7 +34,7 @@ def _detect_image_mime(data: bytes) -> str:
         return "image/gif"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
-    return "image/jpeg"
+    return ""
 
 
 def _parse_ilink_aes_key(raw: str) -> bytes:
