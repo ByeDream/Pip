@@ -334,7 +334,7 @@ def agent_loop(
                     if settings.verbose:
                         print()
                         print(block.text)
-                    if channel and channel.name not in ("cli", "wechat"):
+                    if channel and channel.name != "cli":
                         send_with_retry(channel, peer_id, block.text)
                 if block.type == "tool_use":
                     if settings.verbose:
