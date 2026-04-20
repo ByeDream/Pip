@@ -130,9 +130,9 @@ def consolidate(
     model: str = "",
 ) -> list[Memory]:
     """L2: merge observations into memories. Returns updated memory list."""
-    from pip_agent.routing import DEFAULT_MODEL
+    from pip_agent.anthropic_client import default_direct_sdk_model
     if not model:
-        model = DEFAULT_MODEL
+        model = default_direct_sdk_model()
 
     if not observations and not memories:
         return []
@@ -213,9 +213,9 @@ def distill_axioms(
 
     Returns markdown text for axioms.md, or empty string if nothing qualifies.
     """
-    from pip_agent.routing import DEFAULT_MODEL
+    from pip_agent.anthropic_client import default_direct_sdk_model
     if not model:
-        model = DEFAULT_MODEL
+        model = default_direct_sdk_model()
 
     candidates = [
         m for m in memories

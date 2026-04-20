@@ -124,6 +124,97 @@ class TestResolveCredential:
 
 
 # ---------------------------------------------------------------------------
+# default_direct_sdk_model — single knob for reflect / consolidate / axioms
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultDirectSdkModel:
+    """Direct-SDK calls (reflect, consolidate, axioms) must default to the
+    same model as the default agent. Any stage that hardcodes its own
+    shorthand breaks users whose proxy only whitelists the agent's model.
+    """
+
+    def test_matches_routing_default_model(self):
+        from pip_agent import routing
+        from pip_agent.anthropic_client import default_direct_sdk_model
+
+        assert default_direct_sdk_model() == routing.DEFAULT_MODEL
+
+    def test_reflect_uses_it_as_fallback(self, monkeypatch, tmp_path):
+        """``reflect_from_jsonl`` without an explicit ``model=`` must fall
+        back through ``default_direct_sdk_model()``, never a stage-local
+        constant.
+
+        ``reflect.py`` binds the helper at import time via ``from ... import``,
+        so we patch the name in the reflect module's namespace — which is
+        exactly what a stray refactor that re-introduces a local default
+        would end up doing wrong too.
+        """
+        from pip_agent.memory import reflect
+
+        monkeypatch.setattr(
+            reflect, "default_direct_sdk_model", lambda: "sentinel-model",
+        )
+
+        captured = {}
+
+        class FakeResp:
+            content = [type("B", (), {"text": "[]"})()]
+
+        class FakeLLM:
+            class messages:  # noqa: N801
+                @staticmethod
+                def create(**kwargs):
+                    captured.update(kwargs)
+                    return FakeResp()
+
+        jsonl = tmp_path / "sess.jsonl"
+        jsonl.write_text(
+            '{"type":"user","message":{"role":"user","content":"hi"}}\n',
+            encoding="utf-8",
+        )
+
+        reflect.reflect_from_jsonl(jsonl, agent_id="pip-boy", client=FakeLLM())
+
+        assert captured.get("model") == "sentinel-model"
+
+    def test_consolidate_uses_it_as_fallback(self, monkeypatch):
+        """Same invariant for ``consolidate`` — it must also resolve the
+        default model via the shared helper.
+        """
+        from pip_agent.memory import consolidate
+
+        # consolidate imports the helper inside the function body, so we
+        # patch the source module instead of the caller's namespace.
+        from pip_agent import anthropic_client
+
+        monkeypatch.setattr(
+            anthropic_client, "default_direct_sdk_model", lambda: "sentinel-model",
+        )
+
+        captured = {}
+
+        class FakeResp:
+            content = [type("B", (), {"text": "[]"})()]
+
+        class FakeLLM:
+            class messages:  # noqa: N801
+                @staticmethod
+                def create(**kwargs):
+                    captured.update(kwargs)
+                    return FakeResp()
+
+        consolidate.consolidate(
+            FakeLLM(),
+            [{"ts": 1.0, "text": "x", "category": "lesson", "source": "auto"}],
+            [],
+            1,
+        )
+
+        assert captured.get("model") == "sentinel-model"
+
+
+# ---------------------------------------------------------------------------
 # build_anthropic_client — translates the credential into SDK kwargs
 # ---------------------------------------------------------------------------
 

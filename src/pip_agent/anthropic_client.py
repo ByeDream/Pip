@@ -80,6 +80,30 @@ def resolve_anthropic_credential() -> AnthropicCredential | None:
     return AnthropicCredential(token=token, bearer=bearer, base_url=base_url)
 
 
+def default_direct_sdk_model() -> str:
+    """Default model for any direct-SDK call (reflect, consolidate, axioms).
+
+    Rule: direct-SDK callers pick **the same model as the default agent**
+    (Pip-Boy) unless the caller explicitly passes a ``model=`` override.
+
+    Why: proxy gateways (and users' quota limits) only let certain models
+    through. If we hardcode a different shorthand inside reflect, users who
+    already configured Pip-Boy's model to something their proxy accepts
+    will get ``invalid_request_error: model does not exist`` on every
+    background reflect / consolidate / axioms run. One knob (the agent's
+    model in persona.md) should govern all direct-SDK calls by default.
+
+    To diverge intentionally — e.g. a future "reflect on a cheaper model"
+    policy — pass ``model=`` explicitly to the call site; do NOT fork a
+    second hardcoded default in the stage module.
+    """
+    # Lazy import to avoid circular deps (routing imports config, which
+    # anthropic_client does too).
+    from pip_agent.routing import DEFAULT_MODEL
+
+    return DEFAULT_MODEL
+
+
 def build_anthropic_client() -> "anthropic.Anthropic | None":
     """Build a direct-SDK Anthropic client, or ``None`` if unconfigured.
 

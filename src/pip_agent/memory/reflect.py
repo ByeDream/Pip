@@ -24,7 +24,7 @@ from pathlib import Path
 
 import anthropic
 
-from pip_agent.anthropic_client import build_anthropic_client
+from pip_agent.anthropic_client import build_anthropic_client, default_direct_sdk_model
 from pip_agent.memory.transcript_source import load_formatted
 from pip_agent.types import Observation
 
@@ -72,7 +72,10 @@ _REFLECT_SYSTEM_CACHE: str | None = None
 # push us past the 200K context window.
 _MAX_PROMPT_CHARS = 60000
 
-DEFAULT_REFLECT_MODEL = "claude-sonnet-4-5"
+# No module-level DEFAULT_REFLECT_MODEL — the shared rule in
+# ``anthropic_client.default_direct_sdk_model()`` governs. Forking a model
+# constant here caused a regression where ``claude-sonnet-4-5`` was sent to
+# proxies that only whitelisted the agent's own configured model.
 
 
 def _get_reflect_system() -> str:
@@ -136,7 +139,7 @@ def reflect_from_jsonl(
         return start_offset, []
 
     if not model:
-        model = DEFAULT_REFLECT_MODEL
+        model = default_direct_sdk_model()
 
     current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     prompt = (
