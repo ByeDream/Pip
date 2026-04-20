@@ -1,7 +1,31 @@
 import argparse
+import logging
 import sys
 
-from pip_agent.config import ConfigError
+from pip_agent.config import ConfigError, settings
+
+
+def _configure_logging() -> None:
+    """Route internal log records to stdout.
+
+    Without this, Python's default WARNING threshold silently drops every
+    ``log.info`` in the codebase — which hides scheduler ticks, heartbeat
+    sentinel suppression, session ids, SDK cost/turn summaries, MCP tool
+    calls, and the reflect pipeline. The only feedback users get is the
+    agent's own text output, which is useless when the agent legitimately
+    stays quiet (e.g. a ``HEARTBEAT_OK`` that was correctly silenced).
+
+    We keep chatty third-party libraries at WARNING so the stream stays
+    readable; bump them temporarily if you're debugging them specifically.
+    """
+    level = logging.INFO if settings.verbose else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        stream=sys.stdout,
+    )
+    for noisy in ("mcp", "anyio", "asyncio", "httpx", "httpcore", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -19,6 +43,8 @@ def main(argv: list[str] | None = None) -> None:
         from pip_agent import __version__
         print(f"pip-boy {__version__}")
         return
+
+    _configure_logging()
 
     try:
         from pip_agent.agent_host import run_host
