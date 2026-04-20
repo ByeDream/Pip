@@ -81,6 +81,16 @@ _LEADING_AT_RE = re.compile(r"^@\S*\s*")
 _CRON_SENDER = "__cron__"
 _HEARTBEAT_SENDER = "__heartbeat__"
 
+# "Nothing to report" sentinel documented in ``scaffold/heartbeat.md``. When the
+# heartbeat reply matches this (case-insensitive, tolerant of common wrappers
+# the model might add), we treat it as a quiet confirmation and skip delivery.
+# Any other heartbeat reply — proactive greeting, reminder, found-an-issue
+# message — flows through the normal dispatch path.
+_HEARTBEAT_OK_RE = re.compile(
+    r"^[\s`'\".]*heartbeat[_\s-]*ok[\s`'\".!]*$",
+    re.IGNORECASE,
+)
+
 
 def _format_prompt(
     inbound: InboundMessage,
@@ -268,13 +278,54 @@ class AgentHost:
             self._sessions[sk] = result.session_id
             _save_sessions(self._sessions)
 
+        self._dispatch_reply(
+            inbound=inbound,
+            result=result,
+            ch=ch,
+            reply_peer=reply_peer,
+            session_key=sk,
+        )
+
+    @staticmethod
+    def _dispatch_reply(
+        *,
+        inbound: InboundMessage,
+        result: QueryResult,
+        ch: Channel | None,
+        reply_peer: str,
+        session_key: str,
+    ) -> None:
+        """Route the agent's reply back to the originating surface.
+
+        Heartbeat replies are *generally* delivered like any other reply — a
+        proactive greeting, a reminder, or a "found something" alert is the
+        whole point of the heartbeat. The single exception is the
+        ``HEARTBEAT_OK`` sentinel defined in ``scaffold/heartbeat.md`` which
+        means "nothing to report"; we swallow that to avoid CLI noise.
+
+        Cron replies always flow through the normal dispatch — the cron job's
+        configured ``channel``/``peer_id`` is the intended delivery target.
+        """
+        if (
+            inbound.sender_id == _HEARTBEAT_SENDER
+            and result.text
+            and _HEARTBEAT_OK_RE.match(result.text)
+        ):
+            log.info(
+                "Heartbeat sentinel for %s (suppressed): %r",
+                session_key, result.text[:80],
+            )
+            return
+
         if result.error:
-            log.warning("Agent error for %s: %s", sk, result.error)
+            log.warning("Agent error for %s: %s", session_key, result.error)
             if inbound.channel == "cli":
                 print(f"\n  [error] {result.error}")
             elif ch:
                 send_with_retry(ch, reply_peer, f"[error] {result.error}")
-        elif result.text:
+            return
+
+        if result.text:
             if inbound.channel == "cli" and not settings.verbose:
                 print(f"\n{result.text}")
             elif inbound.channel == "cli":
