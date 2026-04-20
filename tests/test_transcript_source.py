@@ -50,6 +50,55 @@ class TestNormalizeLine:
         assert "running" in text
         assert "[tool:Bash]" in text
 
+    def test_thinking_only_assistant_preserves_summary(self):
+        # Observed in real CC JSONL: heartbeat-style replies carry a single
+        # thinking block and no text. Previously these were dropped silently.
+        rec = {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "thinking",
+                    "thinking": "This is a heartbeat check. Let me do the basic checks.",
+                    "signature": "sig-ignored",
+                }],
+            },
+        }
+        result = normalize_line(rec)
+        assert result is not None
+        role, text = result
+        assert role == "assistant"
+        assert text.startswith("[thought]")
+        assert "heartbeat check" in text
+
+    def test_thinking_summary_collapses_whitespace_and_truncates(self):
+        long_thought = "word " * 200  # > 200 chars once joined
+        rec = {
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "line1\n\nline2\t" + long_thought}],
+        }
+        role, text = normalize_line(rec)
+        assert role == "assistant"
+        assert "\n" not in text and "\t" not in text
+        # 200-char cap on the thought body (plus the "[thought] " prefix).
+        assert len(text) <= len("[thought] ") + 200
+
+    def test_thinking_with_trailing_text_keeps_both(self):
+        rec = {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "pondering"},
+                    {"type": "text", "text": "HEARTBEAT_OK"},
+                ],
+            },
+        }
+        role, text = normalize_line(rec)
+        assert role == "assistant"
+        assert "[thought] pondering" in text
+        assert "HEARTBEAT_OK" in text
+
     def test_flat_anthropic_shape(self):
         rec = {"role": "user", "content": "plain text"}
         assert normalize_line(rec) == ("user", "plain text")

@@ -84,9 +84,9 @@ def iter_transcript(
 def _stringify_content(content: object) -> str:
     """Collapse a message's ``content`` field into a short readable string.
 
-    Accepts the three observed shapes:
+    Accepts the observed shapes:
     * plain string
-    * list of blocks (``{"type": "text", "text": ...}`` or ``{"type": "tool_use", ...}``)
+    * list of blocks — ``text`` / ``thinking`` / ``tool_use`` / ``tool_result``
     * dict block (single-block shorthand)
     """
     if isinstance(content, str):
@@ -110,6 +110,13 @@ def _stringify_block(block: dict) -> str:
     btype = block.get("type") or ""
     if btype == "text":
         return str(block.get("text", ""))[:_MAX_BLOCK_CHARS]
+    if btype == "thinking":
+        # Assistant turns that produced *only* thinking + tool_use would otherwise
+        # render as empty text and be dropped by ``normalize_line``. Keep a short
+        # summary so reflect can still see the reasoning existed.
+        raw = str(block.get("thinking", ""))
+        summary = " ".join(raw.split())[:200]
+        return f"[thought] {summary}" if summary else ""
     if btype == "tool_use":
         name = block.get("name", "?")
         return f"[tool:{name}]"
