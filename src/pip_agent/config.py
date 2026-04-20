@@ -44,14 +44,11 @@ class Settings(BaseSettings):
     wecom_bot_id: str = Field(default="")
     wecom_bot_secret: str = Field(default="")
 
-    # Memory pipeline (reflect / consolidate / dream) timing knobs.
-    reflect_transcript_threshold: int = Field(default=10)
-    transcript_retention_days: int = Field(default=7)
-    dream_hour: int = Field(default=2)
-    dream_min_observations: int = Field(default=20)
-    dream_inactive_minutes: int = Field(default=30)
-
-    # Heartbeat injection timing.
+    # Heartbeat injection timing. ``HEARTBEAT.md`` at
+    # ``.pip/agents/<agent_id>/`` is fired as a ``<heartbeat>`` inbound every
+    # ``heartbeat_interval`` seconds during the active window. Set the interval
+    # to 0 to disable. Dream/consolidate cadence is driven by ``cron.json`` via
+    # the ``cron_*`` MCP tools, not by env vars.
     heartbeat_interval: int = Field(default=1800)
     heartbeat_active_start: int = Field(default=9)
     heartbeat_active_end: int = Field(default=22)

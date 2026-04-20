@@ -166,34 +166,24 @@ pip install --upgrade pip-boy
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `ANTHROPIC_API_KEY` | Conditional | — | Primary Anthropic API key; loaded as profile `env` and always serves as the baseline |
-| `ANTHROPIC_BASE_URL` | No | *(api.anthropic.com)* | Custom API endpoint (proxy support); applied to the `env` profile and inherited by any `keys.json` profile that omits its own `base_url` |
-| `KEYS_FILE_PATH` | No | `.pip/keys.json` | Override the additional-profiles file location |
-| `SEARCH_API_KEY` | No | — | Tavily API key; falls back to DuckDuckGo |
+| `ANTHROPIC_API_KEY` | Conditional | — | Direct Anthropic credential. Sent as `x-api-key` unless a proxy rule below promotes it. |
+| `ANTHROPIC_AUTH_TOKEN` | Conditional | — | Proxy-style bearer token. Takes precedence over `ANTHROPIC_API_KEY`. |
+| `ANTHROPIC_BASE_URL` | No | *(api.anthropic.com)* | Custom API endpoint. When set, any credential is promoted to bearer mode for proxy gateways. |
 | `WECOM_BOT_ID` | No | — | WeCom bot ID for enterprise WeChat channel |
 | `WECOM_BOT_SECRET` | No | — | WeCom bot secret |
-| `VERBOSE` | No | `true` | Verbose output |
-| `PROFILER_ENABLED` | No | `false` | Enable performance profiling |
+| `VERBOSE` | No | `true` | Echo scheduler and heartbeat traces on the CLI |
 
-At least one of `ANTHROPIC_API_KEY` (in `.env`) or a populated `.pip/keys.json` profile must be present.
-
-#### Memory Pipeline
-
-| Variable | Default | Description |
-|---|---|---|
-| `REFLECT_TRANSCRIPT_THRESHOLD` | `10` | New transcripts needed to trigger reflection |
-| `TRANSCRIPT_RETENTION_DAYS` | `7` | Days to keep reflected transcripts |
-| `DREAM_HOUR` | `2` | Local hour (0-23) for the Dream cycle |
-| `DREAM_MIN_OBSERVATIONS` | `20` | Minimum observations before Dream can run |
-| `DREAM_INACTIVE_MINUTES` | `30` | Agent idle time (minutes) required for Dream |
+At least one of `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` must be present. If neither is set, Pip-Boy lets Claude Code fall back to its own auth (`claude login` / system config).
 
 #### Heartbeat
 
 | Variable | Default | Description |
 |---|---|---|
-| `HEARTBEAT_INTERVAL` | `1800` | Seconds between heartbeat checks |
+| `HEARTBEAT_INTERVAL` | `1800` | Seconds between heartbeat injections. `0` disables. |
 | `HEARTBEAT_ACTIVE_START` | `9` | Local hour (0-23) when heartbeats begin |
 | `HEARTBEAT_ACTIVE_END` | `22` | Local hour (0-23) when heartbeats stop |
+
+Memory pipeline cadence (reflect / consolidate / axioms) is driven by `cron.json` via the `cron_*` MCP tools, not by env vars.
 
 ### Per-Agent Configuration
 
