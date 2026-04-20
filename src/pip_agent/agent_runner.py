@@ -1,9 +1,8 @@
 """SDK-native agent runner: wraps ``claude_agent_sdk.query()`` for Pip-Boy.
 
-This module replaces the hand-rolled ``agent_loop()`` with the Claude Agent SDK.
 The SDK manages the full agent loop — tool dispatch, context compaction, and
-session persistence — while Pip-Boy's unique capabilities are provided via
-an in-process MCP server.
+session persistence — while Pip-Boy's unique capabilities are exposed via an
+in-process MCP server (see ``mcp_tools.py``).
 """
 
 from __future__ import annotations
@@ -39,8 +38,7 @@ class QueryResult:
     num_turns: int = 0
 
 
-# SDK built-in tools we allow the agent to use.
-_BUILTIN_TOOLS = [
+_BUILTIN_TOOLS: list[str] = [
     "Bash", "Read", "Write", "Edit", "MultiEdit",
     "Glob", "Grep",
     "WebSearch", "WebFetch",
@@ -51,11 +49,14 @@ _BUILTIN_TOOLS = [
 
 
 def _build_env() -> dict[str, str]:
-    """Collect environment variables to pass to the CLI subprocess.
+    """Collect env vars to forward to the Claude Code CLI subprocess.
 
-    Proxy-aware: when ``base_url`` is set, uses ``ANTHROPIC_AUTH_TOKEN``
-    (Bearer scheme) and disables experimental beta features that proxies
-    typically reject (``context_management``, ``defer_loading``, etc.).
+    Proxy-aware: when ``anthropic_base_url`` is set the API key is forwarded as
+    ``ANTHROPIC_AUTH_TOKEN`` (Bearer scheme) and experimental betas are
+    disabled, which common proxies reject.
+
+    Pip-Boy does not forward any search or tool-specific keys — those are
+    handled by Claude Code's own config.
     """
     from pip_agent.config import settings
 
@@ -68,8 +69,6 @@ def _build_env() -> dict[str, str]:
     if settings.anthropic_base_url:
         env["ANTHROPIC_BASE_URL"] = settings.anthropic_base_url
         env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
-    if settings.search_api_key:
-        env["SEARCH_API_KEY"] = settings.search_api_key
     return env
 
 
@@ -88,29 +87,26 @@ async def run_query(
     Parameters
     ----------
     prompt:
-        The user message to send.
+        The user message to send. Plain string; Phase 7 will extend this to
+        also accept ``list[dict]`` for image attachments.
     mcp_ctx:
-        Pre-configured MCP context with all runtime services.
+        Pre-configured MCP context with all host-side services.
     model:
-        Model identifier (e.g. ``claude-sonnet-4-6``).
+        Model identifier (e.g. ``claude-sonnet-4-6``). ``""`` lets CC pick.
     session_id:
-        SDK session ID to resume.  ``None`` starts a new session.
+        SDK session ID to resume. ``None`` starts a new session.
     system_prompt_append:
-        Custom text appended to the ``claude_code`` preset system prompt.
-        Carries the agent persona, memory enrichment, and skill catalog.
+        Text appended to the ``claude_code`` preset. Carries Pip persona,
+        memory enrichment, and user profile context.
     cwd:
         Working directory for the agent.
     verbose:
-        Print intermediate messages to stdout.
+        If True, stream text blocks to stdout.
     """
     mcp_server = build_mcp_server(mcp_ctx)
     effective_cwd = str(cwd) if cwd else str(mcp_ctx.workdir)
 
-    hooks = build_hooks(
-        transcripts_dir=mcp_ctx.transcripts_dir,
-        memory_store=mcp_ctx.memory_store,
-        profiler=mcp_ctx.profiler,
-    )
+    hooks = build_hooks(memory_store=mcp_ctx.memory_store)
 
     options = ClaudeAgentOptions(
         model=model or None,

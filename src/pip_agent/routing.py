@@ -3,13 +3,13 @@ Multi-agent routing: binding table, agent config, session key generation.
 
 Inbound messages are resolved through a 5-tier binding table to determine
 which agent handles them. Each agent carries its own config (model, system
-prompt, dm_scope, etc.) loaded from .pip/agents/*.md files.
+prompt, dm_scope) loaded from ``.pip/agents/<id>/persona.md``.
 
 Tier priority (lower = more specific, matched first):
   T1  peer_id      — route a specific user to an agent
   T2  guild_id     — route a specific group/guild to an agent
   T3  account_id   — route by bot account
-  T4  channel      — route an entire platform (e.g. "wecom")
+  T4  channel      — route an entire platform (e.g. ``wecom``)
   T5  default      — catch-all fallback
 """
 
@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -31,10 +31,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = "claude-opus-4-6"
-DEFAULT_MAX_TOKENS = 8192
 DEFAULT_DM_SCOPE = "per-guild"
-DEFAULT_COMPACT_THRESHOLD = 50_000
-DEFAULT_COMPACT_MICRO_AGE = 8
 DEFAULT_AGENT_ID = "pip-boy"
 
 # ---------------------------------------------------------------------------
@@ -62,35 +59,25 @@ def normalize_agent_id(value: str) -> str:
 
 @dataclass
 class AgentConfig:
+    """Persona + routing metadata for one agent.
+
+    Token limits, compaction thresholds, and fallback-model chains are all
+    delegated to Claude Code; Pip-Boy only stores persona-level knobs.
+    """
+
     id: str
     name: str = ""
     system_body: str = ""
     model: str = ""
-    max_tokens: int = 0
     dm_scope: str = ""
-    compact_threshold: int = 0
-    compact_micro_age: int = 0
-    fallback_models: list[str] = field(default_factory=list)
 
     @property
     def effective_model(self) -> str:
         return self.model or DEFAULT_MODEL
 
     @property
-    def effective_max_tokens(self) -> int:
-        return self.max_tokens or DEFAULT_MAX_TOKENS
-
-    @property
     def effective_dm_scope(self) -> str:
         return self.dm_scope or DEFAULT_DM_SCOPE
-
-    @property
-    def effective_compact_threshold(self) -> int:
-        return self.compact_threshold or DEFAULT_COMPACT_THRESHOLD
-
-    @property
-    def effective_compact_micro_age(self) -> int:
-        return self.compact_micro_age or DEFAULT_COMPACT_MICRO_AGE
 
     def system_prompt(self, workdir: str = "") -> str:
         body = self.system_body if self.system_body else ""
@@ -100,7 +87,7 @@ class AgentConfig:
 
 
 # ---------------------------------------------------------------------------
-# YAML frontmatter parsing (shared pattern with team module)
+# YAML frontmatter parsing
 # ---------------------------------------------------------------------------
 
 _FM_RE = re.compile(r"^---\n(.*?)\n---\n?(.*)", re.DOTALL)
@@ -120,29 +107,17 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
 def agent_config_from_file(path: Path) -> AgentConfig:
     text = path.read_text(encoding="utf-8")
     meta, body = _parse_frontmatter(text)
-    # For <agents_dir>/<id>/persona.md, derive id from parent dir name
     if path.name == "persona.md":
         default_id = path.parent.name
     else:
         default_id = path.stem
-    fb_raw = meta.get("fallback_models") or []
-    if isinstance(fb_raw, str):
-        fallback_models = [s.strip() for s in fb_raw.split(",") if s.strip()]
-    elif isinstance(fb_raw, list):
-        fallback_models = [str(s).strip() for s in fb_raw if str(s).strip()]
-    else:
-        fallback_models = []
 
     return AgentConfig(
         id=normalize_agent_id(meta.get("id", default_id)),
         name=meta.get("name", ""),
         system_body=body,
         model=meta.get("model", ""),
-        max_tokens=int(meta["max_tokens"]) if "max_tokens" in meta else 0,
         dm_scope=meta.get("dm_scope", ""),
-        compact_threshold=int(meta["compact_threshold"]) if "compact_threshold" in meta else 0,
-        compact_micro_age=int(meta["compact_micro_age"]) if "compact_micro_age" in meta else 0,
-        fallback_models=fallback_models,
     )
 
 
@@ -153,9 +128,9 @@ def agent_config_from_file(path: Path) -> AgentConfig:
 @dataclass
 class Binding:
     agent_id: str
-    tier: int                # 1-5
-    match_key: str           # "peer_id" | "guild_id" | "account_id" | "channel" | "default"
-    match_value: str         # e.g. "wecom:admin-001", "wecom", "*"
+    tier: int
+    match_key: str
+    match_value: str
     priority: int = 0
     overrides: dict[str, Any] = field(default_factory=dict)
 
@@ -243,8 +218,6 @@ class BindingTable:
                 return b.agent_id, b
         return None, None
 
-    # -- persistence --
-
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         data = [b.to_dict() for b in self._bindings]
@@ -290,10 +263,8 @@ def build_session_key(
     if is_group and gid:
         if dm_scope == "per-guild-peer":
             return f"agent:{aid}:{ch}:guild:{gid}:peer:{pid}"
-        # per-guild (default for group)
         return f"agent:{aid}:{ch}:guild:{gid}"
 
-    # private message
     return f"agent:{aid}:{ch}:peer:{pid}"
 
 
@@ -308,19 +279,10 @@ _BUILTIN_DEFAULT = AgentConfig(
         "## Identity\n\n"
         "You are Pip-Boy, a personal assistant agent.\n"
         "Your working directory is {workdir}.\n"
-        "If AGENTS.md exists in your working directory, read it for project context.\n\n"
-        "## Rules\n\n"
-        "- **Direct execution** — Simple, single-step requests. Just use your tools.\n"
-        "- **Tasks** — Multi-step goals that need structured tracking.\n"
-        "- **Background tasks** — Long-running shell commands. Use `background: true`.\n"
-        "- **Agent Team** — Parallel work, specialized roles, "
-        "or tasks too large for a single context."
+        "If AGENTS.md exists in your working directory, read it for project context.\n"
     ),
     model=DEFAULT_MODEL,
-    max_tokens=DEFAULT_MAX_TOKENS,
     dm_scope=DEFAULT_DM_SCOPE,
-    compact_threshold=DEFAULT_COMPACT_THRESHOLD,
-    compact_micro_age=DEFAULT_COMPACT_MICRO_AGE,
 )
 
 
@@ -340,7 +302,6 @@ class AgentRegistry:
     def _load_dir(self, agents_dir: Path) -> None:
         if not agents_dir.is_dir():
             return
-        # New layout: <agents_dir>/<agent-id>/persona.md
         for persona in sorted(agents_dir.glob("*/persona.md")):
             try:
                 cfg = agent_config_from_file(persona)
@@ -348,7 +309,6 @@ class AgentRegistry:
                 log.debug("Loaded agent config: %s from %s", cfg.id, persona)
             except Exception as exc:
                 log.warning("Failed to load agent config %s: %s", persona, exc)
-        # Legacy layout: <agents_dir>/<agent-id>.md (flat files)
         for path in sorted(agents_dir.glob("*.md")):
             try:
                 cfg = agent_config_from_file(path)
@@ -396,23 +356,10 @@ def resolve_effective_config(
     """Return agent config with binding overrides applied (shallow copy)."""
     if not binding or not binding.overrides:
         return agent
-    from dataclasses import replace
     kwargs: dict[str, Any] = {}
     ov = binding.overrides
     if "scope" in ov:
         kwargs["dm_scope"] = ov["scope"]
     if "model" in ov:
         kwargs["model"] = ov["model"]
-    for key in ("max_tokens", "compact_threshold", "compact_micro_age"):
-        if key in ov:
-            try:
-                kwargs[key] = int(ov[key])
-            except (ValueError, TypeError):
-                log.warning("Invalid override %s=%r, skipping", key, ov[key])
-    if "fallback_models" in ov:
-        raw = ov["fallback_models"]
-        if isinstance(raw, str):
-            kwargs["fallback_models"] = [s.strip() for s in raw.split(",") if s.strip()]
-        elif isinstance(raw, list):
-            kwargs["fallback_models"] = [str(s).strip() for s in raw if str(s).strip()]
     return replace(agent, **kwargs) if kwargs else agent

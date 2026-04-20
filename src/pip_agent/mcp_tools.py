@@ -1,8 +1,16 @@
-"""In-process MCP server exposing Pip-Boy's unique capabilities to the Claude Agent SDK.
+"""In-process MCP server exposing Pip-Boy's unique capabilities to the SDK.
 
-Only tools that the SDK does NOT provide natively are exposed here.
-Basic file/shell/web tools (Bash, Read, Write, Edit, Glob, Grep, WebSearch,
-WebFetch) are handled by the SDK's built-in tool implementations.
+Only tools that Claude Code does NOT provide natively are exposed here.
+Everything else (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch,
+Task, TodoWrite, Skill, …) is delegated to Claude Code's built-ins.
+
+Tools currently exposed:
+
+* Memory: ``memory_search``, ``memory_write``, ``remember_user``, ``reflect``
+* Cron: ``cron_add``, ``cron_remove``, ``cron_update``, ``cron_list``
+  (Phase 5 wires them to the host scheduler; until then they return an error.)
+
+``send_file`` lands in Phase 8.
 """
 
 from __future__ import annotations
@@ -17,14 +25,9 @@ from typing import TYPE_CHECKING, Any
 from claude_agent_sdk import McpSdkServerConfig, SdkMcpTool, create_sdk_mcp_server
 
 if TYPE_CHECKING:
-    import anthropic
-
-    from pip_agent.background import BackgroundTaskManager
     from pip_agent.channels import Channel
+    from pip_agent.host_scheduler import HostScheduler
     from pip_agent.memory import MemoryStore
-    from pip_agent.profiler import Profiler
-    from pip_agent.scheduler import BackgroundScheduler
-    from pip_agent.worktree import WorktreeManager
 
 log = logging.getLogger(__name__)
 
@@ -39,41 +42,25 @@ def _error(msg: str) -> dict[str, Any]:
 
 @dataclass
 class McpContext:
-    """Mutable runtime context shared by all MCP tool handlers.
+    """Runtime context shared by all MCP tool handlers.
 
-    Updated by the host layer before each ``query()`` call to reflect
-    the effective agent, session, and channel.
+    Populated fresh by :class:`AgentHost` before each ``query()`` call so
+    handlers see the correct agent/session/channel identity.
     """
 
     memory_store: MemoryStore | None = None
-    worktree_manager: WorktreeManager | None = None
-    bg_manager: BackgroundTaskManager | None = None
-    profiler: Profiler | None = None
-    client: anthropic.Anthropic | None = None
     workdir: Path = field(default_factory=Path.cwd)
     model: str = ""
-    transcripts_dir: Path | None = None
-    scheduler: BackgroundScheduler | None = None
+    session_id: str = ""
+    scheduler: HostScheduler | None = None
     channel: Channel | None = None
     peer_id: str = ""
     sender_id: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Tool builder
-# ---------------------------------------------------------------------------
-
-
 def build_mcp_server(ctx: McpContext) -> McpSdkServerConfig:
-    """Create an in-process MCP server with all Pip-Boy-unique tools.
-
-    The returned config is passed to ``ClaudeAgentOptions.mcp_servers``.
-    Tool handlers close over *ctx* so state changes are visible immediately.
-    """
-    tools = (
-        _memory_tools(ctx)
-        + _cron_tools(ctx)
-    )
+    """Create the in-process MCP server with all Pip-Boy-unique tools."""
+    tools = _memory_tools(ctx) + _cron_tools(ctx)
     return create_sdk_mcp_server("pip", tools=tools)
 
 
@@ -87,11 +74,11 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
     async def memory_search(args: dict[str, Any]) -> dict[str, Any]:
         if ctx.memory_store is None:
             return _error("Memory store not available.")
-        query = args.get("query", "").strip()
-        if not query:
+        q = args.get("query", "").strip()
+        if not q:
             return _error("'query' is required.")
         top_k = int(args.get("top_k", 5))
-        results = ctx.memory_store.search(query, top_k=top_k)
+        results = ctx.memory_store.search(q, top_k=top_k)
         if not results:
             return _text("(no matching memories)")
         lines = [f"- {r.get('text', '')} (score: {r.get('score', 0)})" for r in results]
@@ -124,34 +111,56 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
         return _text(result)
 
     async def reflect(args: dict[str, Any]) -> dict[str, Any]:
-        if ctx.memory_store is None or ctx.client is None:
-            return _error("Reflection not available.")
-        from pip_agent.memory.reflect import reflect as do_reflect
+        """Trigger L1 reflection over the current Claude Code session JSONL.
 
-        if ctx.transcripts_dir is not None:
-            state = ctx.memory_store.load_state()
-            since = state.get("last_reflect_transcript_ts", 0)
-            observations = do_reflect(
-                ctx.client, ctx.transcripts_dir, ctx.memory_store.agent_id,
-                since, model=ctx.model,
+        Locates the session transcript via ``ctx.session_id`` (populated by
+        ``AgentHost`` from the SDK ``SystemMessage(init)``), then runs the
+        same delta-cursor reflection loop the ``PreCompact`` hook uses.
+        """
+        if ctx.memory_store is None:
+            return _error("Memory store not available.")
+        if not ctx.session_id:
+            return _text(
+                "Reflection skipped: no active SDK session_id yet. "
+                "Run at least one turn with Claude Code first."
             )
-            if observations:
-                ctx.memory_store.write_observations(observations)
-            latest = 0
-            if ctx.transcripts_dir.is_dir():
-                for fp in ctx.transcripts_dir.glob("*.json"):
-                    try:
-                        ts = int(fp.stem)
-                    except ValueError:
-                        continue
-                    if ts > latest:
-                        latest = ts
-            if latest > 0:
-                state["last_reflect_transcript_ts"] = latest
+
+        from pip_agent.memory.reflect import reflect_from_jsonl
+        from pip_agent.memory.transcript_source import locate_session_jsonl
+
+        path = locate_session_jsonl(ctx.session_id)
+        if path is None:
+            return _text(
+                f"Reflection skipped: transcript for session {ctx.session_id[:8]} "
+                f"not found under ~/.claude/projects/."
+            )
+
+        state = ctx.memory_store.load_state()
+        offsets: dict[str, int] = state.get("last_reflect_jsonl_offset") or {}
+        start_offset = int(offsets.get(ctx.session_id, 0))
+
+        try:
+            new_offset, observations = reflect_from_jsonl(
+                path,
+                start_offset=start_offset,
+                agent_id=ctx.memory_store.agent_id,
+                model=ctx.model,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _error(f"Reflection failed: {exc}")
+
+        if observations:
+            ctx.memory_store.write_observations(observations)
+        if new_offset != start_offset:
+            offsets[ctx.session_id] = new_offset
+            state["last_reflect_jsonl_offset"] = offsets
             state["last_reflect_at"] = time.time()
             ctx.memory_store.save_state(state)
-            if observations:
-                return _text(f"Reflection complete: extracted {len(observations)} observations.")
+
+        if observations:
+            return _text(
+                f"Reflection complete: extracted {len(observations)} observations."
+            )
         return _text("Reflection complete: no new observations found.")
 
     return [
@@ -197,10 +206,7 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
                         "type": "string",
                         "description": "Raw sender_id without channel prefix.",
                     },
-                    "name": {
-                        "type": "string",
-                        "description": "The user's real name.",
-                    },
+                    "name": {"type": "string", "description": "The user's real name."},
                     "call_me": {
                         "type": "string",
                         "description": "Preferred name to be called.",
@@ -229,62 +235,62 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
     ]
 
 
-
 # ---------------------------------------------------------------------------
-# Cron tools
+# Cron tools — wiring to HostScheduler lands in Phase 5.
 # ---------------------------------------------------------------------------
 
 
 def _cron_tools(ctx: McpContext) -> list[SdkMcpTool]:
 
-    def _cs():
+    def _require_scheduler() -> str | None:
         if ctx.scheduler is None:
-            return None
-        return ctx.scheduler.get_cron_service()
+            return "Scheduler not wired (pending Phase 5)."
+        return None
 
     async def cron_add(args: dict[str, Any]) -> dict[str, Any]:
-        cs = _cs()
-        if cs is None:
-            return _error("Cron service not available.")
-        result = cs.add_job(
-            name=args.get("name", ""),
-            schedule_kind=args.get("schedule_kind", ""),
-            schedule_config=args.get("schedule_config", {}),
-            message=args.get("message", ""),
-            channel=ctx.channel.name if ctx.channel else "cli",
-            peer_id=ctx.peer_id or "cli-user",
-            sender_id=ctx.sender_id,
-            agent_id=ctx.memory_store.agent_id if ctx.memory_store else "",
+        err = _require_scheduler()
+        if err:
+            return _error(err)
+        assert ctx.scheduler is not None
+        return _text(
+            ctx.scheduler.add_job(
+                name=args.get("name", ""),
+                schedule_kind=args.get("schedule_kind", ""),
+                schedule_config=args.get("schedule_config", {}),
+                message=args.get("message", ""),
+                channel=ctx.channel.name if ctx.channel else "cli",
+                peer_id=ctx.peer_id or "cli-user",
+                sender_id=ctx.sender_id,
+                agent_id=ctx.memory_store.agent_id if ctx.memory_store else "",
+            )
         )
-        return _text(result)
 
     async def cron_remove(args: dict[str, Any]) -> dict[str, Any]:
-        cs = _cs()
-        if cs is None:
-            return _error("Cron service not available.")
-        return _text(cs.remove_job(args.get("job_id", "")))
+        err = _require_scheduler()
+        if err:
+            return _error(err)
+        assert ctx.scheduler is not None
+        return _text(ctx.scheduler.remove_job(args.get("job_id", "")))
 
     async def cron_update(args: dict[str, Any]) -> dict[str, Any]:
-        cs = _cs()
-        if cs is None:
-            return _error("Cron service not available.")
+        err = _require_scheduler()
+        if err:
+            return _error(err)
         job_id = args.get("job_id", "")
         if not job_id:
             return _error("'job_id' is required.")
-        return _text(cs.update_job(job_id, **args))
+        assert ctx.scheduler is not None
+        return _text(ctx.scheduler.update_job(job_id, **args))
 
     async def cron_list(args: dict[str, Any]) -> dict[str, Any]:
-        cs = _cs()
-        if cs is None:
-            return _text("No scheduled tasks.")
-        jobs = cs.list_jobs()
+        if ctx.scheduler is None:
+            return _text("No scheduled tasks (scheduler not wired).")
+        jobs = ctx.scheduler.list_jobs()
         if not jobs:
             return _text("No scheduled tasks.")
         return _text(json.dumps(jobs, indent=2, ensure_ascii=False))
 
-    _SCHED_ENUM = {
-        "type": "string", "enum": ["at", "every", "cron"],
-    }
+    _SCHED_ENUM = {"type": "string", "enum": ["at", "every", "cron"]}
 
     return [
         SdkMcpTool(
@@ -298,10 +304,7 @@ def _cron_tools(ctx: McpContext) -> list[SdkMcpTool]:
                     "schedule_config": {"type": "object"},
                     "message": {"type": "string"},
                 },
-                "required": [
-                    "name", "schedule_kind",
-                    "schedule_config", "message",
-                ],
+                "required": ["name", "schedule_kind", "schedule_config", "message"],
             },
             handler=cron_add,
         ),

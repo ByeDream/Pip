@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from pip_agent.routing import (
     DEFAULT_AGENT_ID,
-    DEFAULT_COMPACT_MICRO_AGE,
-    DEFAULT_COMPACT_THRESHOLD,
     DEFAULT_DM_SCOPE,
-    DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL,
     AgentConfig,
     AgentRegistry,
@@ -19,9 +16,6 @@ from pip_agent.routing import (
     resolve_effective_config,
 )
 
-# ---------------------------------------------------------------------------
-# normalize_agent_id
-# ---------------------------------------------------------------------------
 
 class TestNormalizeAgentId:
     def test_simple(self):
@@ -44,33 +38,16 @@ class TestNormalizeAgentId:
         assert len(result) <= 64
 
 
-# ---------------------------------------------------------------------------
-# AgentConfig
-# ---------------------------------------------------------------------------
-
 class TestAgentConfig:
     def test_defaults(self):
         cfg = AgentConfig(id="test")
         assert cfg.effective_model == DEFAULT_MODEL
-        assert cfg.effective_max_tokens == DEFAULT_MAX_TOKENS
         assert cfg.effective_dm_scope == DEFAULT_DM_SCOPE
-        assert cfg.effective_compact_threshold == DEFAULT_COMPACT_THRESHOLD
-        assert cfg.effective_compact_micro_age == DEFAULT_COMPACT_MICRO_AGE
 
     def test_overridden(self):
-        cfg = AgentConfig(
-            id="custom",
-            model="gpt-4o",
-            max_tokens=4096,
-            dm_scope="main",
-            compact_threshold=20000,
-            compact_micro_age=5,
-        )
+        cfg = AgentConfig(id="custom", model="gpt-4o", dm_scope="main")
         assert cfg.effective_model == "gpt-4o"
-        assert cfg.effective_max_tokens == 4096
         assert cfg.effective_dm_scope == "main"
-        assert cfg.effective_compact_threshold == 20000
-        assert cfg.effective_compact_micro_age == 5
 
     def test_system_prompt(self):
         cfg = AgentConfig(id="bot", name="TestBot", system_body="Working at {workdir}.")
@@ -83,10 +60,6 @@ class TestAgentConfig:
         assert prompt == ""
 
 
-# ---------------------------------------------------------------------------
-# agent_config_from_file
-# ---------------------------------------------------------------------------
-
 class TestAgentConfigFromFile:
     def test_load(self, tmp_path):
         md = tmp_path / "test-bot.md"
@@ -94,10 +67,7 @@ class TestAgentConfigFromFile:
             "---\n"
             "name: TestBot\n"
             "model: gpt-4\n"
-            "max_tokens: 2048\n"
             "dm_scope: main\n"
-            "compact_threshold: 10000\n"
-            "compact_micro_age: 2\n"
             "---\n"
             "Be concise.\n",
             encoding="utf-8",
@@ -106,10 +76,7 @@ class TestAgentConfigFromFile:
         assert cfg.id == "test-bot"
         assert cfg.name == "TestBot"
         assert cfg.model == "gpt-4"
-        assert cfg.max_tokens == 2048
         assert cfg.dm_scope == "main"
-        assert cfg.compact_threshold == 10000
-        assert cfg.compact_micro_age == 2
         assert cfg.system_body == "Be concise."
 
     def test_no_frontmatter(self, tmp_path):
@@ -119,10 +86,24 @@ class TestAgentConfigFromFile:
         assert cfg.id == "plain"
         assert cfg.system_body == "Just a plain body."
 
+    def test_ignores_unknown_frontmatter_keys(self, tmp_path):
+        md = tmp_path / "legacy.md"
+        md.write_text(
+            "---\n"
+            "name: Legacy\n"
+            "model: gpt-4\n"
+            "max_tokens: 2048\n"
+            "compact_threshold: 10000\n"
+            "compact_micro_age: 2\n"
+            "---\n"
+            "Body.\n",
+            encoding="utf-8",
+        )
+        cfg = agent_config_from_file(md)
+        assert cfg.name == "Legacy"
+        assert cfg.model == "gpt-4"
+        assert not hasattr(cfg, "max_tokens")
 
-# ---------------------------------------------------------------------------
-# Binding
-# ---------------------------------------------------------------------------
 
 class TestBinding:
     def test_display(self):
@@ -145,38 +126,30 @@ class TestBinding:
         assert b2.overrides == {"model": "gpt-4"}
 
 
-# ---------------------------------------------------------------------------
-# BindingTable
-# ---------------------------------------------------------------------------
-
 class TestBindingTable:
     def test_resolve_peer(self):
         bt = BindingTable()
         bt.add(Binding(agent_id="peer-bot", tier=1, match_key="peer_id", match_value="u1"))
         bt.add(Binding(agent_id="default", tier=5, match_key="default", match_value="*"))
-
-        aid, binding = bt.resolve(peer_id="u1")
+        aid, _ = bt.resolve(peer_id="u1")
         assert aid == "peer-bot"
 
     def test_resolve_guild(self):
         bt = BindingTable()
         bt.add(Binding(agent_id="guild-bot", tier=2, match_key="guild_id", match_value="g1"))
         bt.add(Binding(agent_id="default", tier=5, match_key="default", match_value="*"))
-
         aid, _ = bt.resolve(guild_id="g1")
         assert aid == "guild-bot"
 
     def test_resolve_channel(self):
         bt = BindingTable()
         bt.add(Binding(agent_id="ch-bot", tier=4, match_key="channel", match_value="wecom"))
-
         aid, _ = bt.resolve(channel="wecom")
         assert aid == "ch-bot"
 
     def test_resolve_default(self):
         bt = BindingTable()
         bt.add(Binding(agent_id="fallback", tier=5, match_key="default", match_value="*"))
-
         aid, _ = bt.resolve(channel="cli", peer_id="x")
         assert aid == "fallback"
 
@@ -192,7 +165,6 @@ class TestBindingTable:
         bt.add(Binding(agent_id="default", tier=5, match_key="default", match_value="*"))
         bt.add(Binding(agent_id="guild-bot", tier=2, match_key="guild_id", match_value="g1"))
         bt.add(Binding(agent_id="peer-bot", tier=1, match_key="peer_id", match_value="u1"))
-
         aid, _ = bt.resolve(guild_id="g1", peer_id="u1")
         assert aid == "peer-bot"
 
@@ -235,10 +207,6 @@ class TestBindingTable:
         assert bt.list_all() == []
 
 
-# ---------------------------------------------------------------------------
-# build_session_key
-# ---------------------------------------------------------------------------
-
 class TestBuildSessionKey:
     def test_per_guild_group(self):
         sk = build_session_key("bot", "wecom", "u1", guild_id="g1", is_group=True)
@@ -267,10 +235,6 @@ class TestBuildSessionKey:
         sk = build_session_key("Pip-Boy", "cli", "cli-user")
         assert sk.startswith("agent:pip-boy:")
 
-
-# ---------------------------------------------------------------------------
-# AgentRegistry
-# ---------------------------------------------------------------------------
 
 class TestAgentRegistry:
     def test_default_when_empty(self):
@@ -308,10 +272,6 @@ class TestAgentRegistry:
         assert reg.get_agent("My-Bot") is not None
 
 
-# ---------------------------------------------------------------------------
-# resolve_effective_config
-# ---------------------------------------------------------------------------
-
 class TestResolveEffectiveConfig:
     def test_no_overrides(self):
         agent = AgentConfig(id="bot", model="gpt-4", dm_scope="per-guild")
@@ -322,12 +282,11 @@ class TestResolveEffectiveConfig:
         agent = AgentConfig(id="bot", model="gpt-4", dm_scope="per-guild")
         binding = Binding(
             agent_id="bot", tier=2, match_key="guild_id", match_value="g1",
-            overrides={"model": "gpt-4o", "scope": "main", "max_tokens": "2048"},
+            overrides={"model": "gpt-4o", "scope": "main"},
         )
         result = resolve_effective_config(agent, binding)
         assert result.model == "gpt-4o"
         assert result.dm_scope == "main"
-        assert result.max_tokens == 2048
         assert result.id == "bot"
 
     def test_empty_overrides(self):

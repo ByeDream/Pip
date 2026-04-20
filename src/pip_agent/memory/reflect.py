@@ -1,20 +1,31 @@
-"""L1 Observer: extract behavioral observations from recent transcripts.
+"""L1 Observer: extract behavioral observations from the active session JSONL.
 
-Reads saved transcript JSON files, formats them, and asks an LLM to identify
-decision patterns, judgment frameworks, and recurring preferences — focusing
-on HOW the user thinks rather than WHAT was done.
+Pip's reflect stage reads Claude Code's native per-session JSONL log (see
+``memory/transcript_source.py`` for the path + schema contract) and asks an
+LLM to extract two kinds of observations:
+
+* **User behavior** — decision patterns, judgment frameworks, values,
+  recurring preferences.
+* **Objective experience** — non-obvious technical lessons, API constraints,
+  reusable solution patterns.
+
+The reflect prompt and JSON-array output contract are preserved from the old
+transcript-based implementation; only the data source changed (Phase 4.5).
+Callers advance a ``state["last_reflect_jsonl_offset"][session_id]`` byte
+cursor so each run only sees newly-appended lines.
 """
 
 from __future__ import annotations
 
-import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
 
+from pip_agent.memory.transcript_source import load_formatted
 from pip_agent.types import Observation
 
 log = logging.getLogger(__name__)
@@ -56,6 +67,13 @@ _REFLECT_SYSTEM_BASE = (
 
 _REFLECT_SYSTEM_CACHE: str | None = None
 
+# Prompt budget — how many chars of transcript we feed the reflect LLM per
+# call. Intentionally conservative so a single overflowing tool_result can't
+# push us past the 200K context window.
+_MAX_PROMPT_CHARS = 60000
+
+DEFAULT_REFLECT_MODEL = "claude-sonnet-4-5"
+
 
 def _get_reflect_system() -> str:
     global _REFLECT_SYSTEM_CACHE
@@ -74,136 +92,98 @@ def _get_reflect_system() -> str:
         _REFLECT_SYSTEM_CACHE = _REFLECT_SYSTEM_BASE
     return _REFLECT_SYSTEM_CACHE
 
-MAX_TRANSCRIPTS = 50
-MAX_TRANSCRIPT_CHARS = 3000
+
+# ---------------------------------------------------------------------------
+# Client factory
+# ---------------------------------------------------------------------------
 
 
-def _format_transcript(messages: list[dict]) -> str:
-    """Simplified transcript formatter for reflection (not reusing compact's)."""
-    lines: list[str] = []
-    for msg in messages:
-        role = msg.get("role", "?").upper()
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            lines.append(f"[{role}] {content[:500]}")
-        elif isinstance(content, list):
-            parts: list[str] = []
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
-                        parts.append(block.get("text", "")[:500])
-                    elif block.get("type") == "tool_use":
-                        parts.append(f"[tool: {block.get('name', '?')}]")
-            if parts:
-                lines.append(f"[{role}] " + " ".join(parts))
-    return "\n".join(lines)
+def _default_anthropic_client() -> anthropic.Anthropic | None:
+    """Build an Anthropic client from env vars, or return ``None`` if unavailable.
 
-
-def _load_transcripts(
-    transcripts_dir: Path,
-    agent_id: str,
-    since: float,
-) -> list[str]:
-    """Load and format transcripts for the given agent since a timestamp."""
-    if not transcripts_dir.is_dir():
-        return []
-
-    files = sorted(transcripts_dir.glob("*.json"), reverse=True)
-    formatted: list[str] = []
-
-    for fp in files[:MAX_TRANSCRIPTS * 2]:
-        try:
-            ts = int(fp.stem)
-        except ValueError:
-            continue
-        if ts < since:
-            continue
-
-        try:
-            messages = json.loads(fp.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            continue
-
-        if not isinstance(messages, list):
-            continue
-
-        text = _format_transcript(messages)
-        if not text.strip():
-            continue
-
-        has_agent_content = False
-        for m in messages:
-            if m.get("role") != "assistant":
-                continue
-            c = m.get("content", "")
-            if isinstance(c, str) and c.strip():
-                has_agent_content = True
-                break
-            if isinstance(c, list) and any(
-                isinstance(b, dict) and b.get("text", "").strip()
-                for b in c
-            ):
-                has_agent_content = True
-                break
-        if not has_agent_content:
-            continue
-
-        if len(text) > MAX_TRANSCRIPT_CHARS:
-            text = text[:MAX_TRANSCRIPT_CHARS] + "\n[truncated]"
-        abs_time = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
-            "%Y-%m-%d %H:%M UTC"
-        )
-        formatted.append(f"--- Transcript at {abs_time} ---\n{text}")
-
-        if len(formatted) >= MAX_TRANSCRIPTS:
-            break
-
-    return formatted
-
-
-def reflect(
-    client: anthropic.Anthropic,
-    transcripts_dir: Path,
-    agent_id: str,
-    since: float,
-    *,
-    model: str = "",
-) -> list[Observation]:
-    """Run L1 reflection on recent transcripts.
-
-    Returns list of observation dicts: [{text, category}, ...].
+    Reflection is best-effort: if no credentials are present we log and skip
+    rather than crash the host. We honour the same env vars Claude Code uses
+    so users under a proxy (``ANTHROPIC_BASE_URL`` + ``ANTHROPIC_AUTH_TOKEN``)
+    get reflect "for free".
     """
-    from pip_agent.routing import DEFAULT_MODEL
+    api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")
+    base_url = os.getenv("ANTHROPIC_BASE_URL")
+    if not api_key:
+        log.info("reflect: no ANTHROPIC_API_KEY/AUTH_TOKEN; skipping")
+        return None
+    try:
+        kwargs: dict[str, str] = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        return anthropic.Anthropic(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("reflect: cannot build Anthropic client: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Reflect
+# ---------------------------------------------------------------------------
+
+
+def reflect_from_jsonl(
+    transcript_path: Path,
+    *,
+    start_offset: int = 0,
+    agent_id: str,
+    model: str = "",
+    client: anthropic.Anthropic | None = None,
+) -> tuple[int, list[Observation]]:
+    """Run L1 reflection over new lines in ``transcript_path``.
+
+    Returns ``(new_offset, observations)``. ``new_offset`` is the byte cursor
+    to persist; ``observations`` is the list of extracted observation dicts
+    (possibly empty). The transcript is read incrementally from
+    ``start_offset``, so repeatedly calling this on a growing file only pays
+    for the delta.
+
+    If the transcript has no new reflect-worthy content, returns the advanced
+    offset (or the original if nothing was read) with an empty observation
+    list. If the LLM call fails or no client is available, returns
+    ``(start_offset, [])`` — the cursor is NOT advanced so the next run can
+    retry.
+    """
+    if not transcript_path or not Path(transcript_path).is_file():
+        return start_offset, []
+
+    new_offset, formatted = load_formatted(
+        Path(transcript_path),
+        start_offset=start_offset,
+        max_chars=_MAX_PROMPT_CHARS,
+    )
+    if not formatted.strip():
+        return new_offset, []
+
+    llm = client or _default_anthropic_client()
+    if llm is None:
+        return start_offset, []
+
     if not model:
-        model = DEFAULT_MODEL
-
-    transcripts = _load_transcripts(transcripts_dir, agent_id, since)
-    if not transcripts:
-        log.debug("reflect: no transcripts since %s for agent %s", since, agent_id)
-        return []
-
-    combined = "\n\n".join(transcripts)
-    if len(combined) > 60000:
-        combined = combined[:60000] + "\n[truncated]"
+        model = DEFAULT_REFLECT_MODEL
 
     current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     prompt = (
         f"Current time: {current_time}\n\n"
-        f"Here are recent conversation transcripts for agent '{agent_id}':\n\n"
-        f"{combined}\n\n"
-        "Extract behavioral observations about the user now."
+        f"Here is the active session transcript for agent '{agent_id}':\n\n"
+        f"{formatted}\n\n"
+        "Extract observations now."
     )
 
     try:
-        response = client.messages.create(
+        response = llm.messages.create(
             model=model,
             max_tokens=1024,
             system=_get_reflect_system(),
             messages=[{"role": "user", "content": prompt}],
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         log.warning("reflect LLM call failed: %s", exc)
-        return []
+        return start_offset, []
 
     text = ""
     for block in response.content:
@@ -214,7 +194,7 @@ def reflect(
     observations = extract_json_array(text)
     if observations is None:
         log.warning("reflect: LLM returned invalid JSON: %.200s", text)
-        return []
+        return new_offset, []
 
     now = time.time()
     valid: list[Observation] = []
@@ -226,4 +206,4 @@ def reflect(
                 "category": str(obs.get("category", "observation")),
                 "source": "auto",
             })
-    return valid
+    return new_offset, valid

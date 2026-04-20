@@ -17,22 +17,19 @@ def test_fresh_init(tmp_path: Path) -> None:
     ensure_workspace(tmp_path)
 
     assert (tmp_path / ".pip").is_dir()
-    assert (tmp_path / ".pip" / "skills").is_dir()
     assert (tmp_path / ".pip" / "agents" / "pip-boy").is_dir()
     assert (tmp_path / ".pip" / "agents" / "pip-boy" / "observations").is_dir()
     assert (tmp_path / ".pip" / "agents" / "pip-boy" / "users").is_dir()
-    assert (tmp_path / ".pip" / "agents" / "pip-boy" / "transcripts").is_dir()
-    assert (tmp_path / ".pip" / "agents" / "pip-boy" / "tasks").is_dir()
-    assert (tmp_path / ".pip" / "agents" / "pip-boy" / "team").is_dir()
-    assert (tmp_path / ".pip" / "agents" / "pip-boy" / "team" / "inbox").is_dir()
+    # Phase 4.5: transcripts now live under ~/.claude/projects/ (CC native),
+    # so Pip no longer creates its own ``transcripts/`` directory.
+    assert not (tmp_path / ".pip" / "agents" / "pip-boy" / "transcripts").exists()
 
     assert not (tmp_path / "AGENTS.md").exists()
 
-    models = tmp_path / ".pip" / "models.json"
-    assert models.exists()
-    data = json.loads(models.read_text(encoding="utf-8"))
-    assert isinstance(data, list)
-    assert any(m["id"] == "claude-sonnet-4-6" for m in data)
+    assert not (tmp_path / ".pip" / "models.json").exists()
+    assert not (tmp_path / ".pip" / "keys.json").exists()
+    assert not (tmp_path / ".pip" / "agents" / "pip-boy" / "tasks").exists()
+    assert not (tmp_path / ".pip" / "agents" / "pip-boy" / "team").exists()
 
     assert (tmp_path / ".env").exists()
     assert (tmp_path / ".pip" / "owner.md").exists()
@@ -46,7 +43,6 @@ def test_fresh_init(tmp_path: Path) -> None:
     assert manifest_path.exists()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert "version" in manifest
-    assert ".pip/models.json" in manifest["files"]
     assert ".pip/agents/pip-boy/persona.md" in manifest["files"]
 
 
@@ -112,22 +108,6 @@ def test_env_not_overwritten(tmp_path: Path) -> None:
     assert "sk-secret" in text
 
 
-def test_scaffold_migration_updates_unmodified(tmp_path: Path) -> None:
-    """If upstream template changed and user hasn't modified the file, auto-update."""
-    (tmp_path / ".git").mkdir()
-    ensure_workspace(tmp_path)
-
-    manifest_path = tmp_path / ".pip" / _MANIFEST_NAME
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["files"][".pip/models.json"]["scaffold_hash"]
-
-    models_path = tmp_path / ".pip" / "models.json"
-    original_content = models_path.read_text(encoding="utf-8")
-
-    ensure_workspace(tmp_path)
-    assert models_path.read_text(encoding="utf-8") == original_content
-
-
 def test_scaffold_migration_skips_modified(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -162,7 +142,7 @@ def test_legacy_flat_persona_preserved_on_upgrade(tmp_path: Path) -> None:
     agents.mkdir(parents=True)
 
     custom_persona = (
-        "---\nname: Pip-Boy\nmodel: claude-opus-4-6\nmax_tokens: 4096\n---\n"
+        "---\nname: Pip-Boy\nmodel: claude-opus-4-6\n---\n"
         "Custom system prompt from user.\n"
     )
     (agents / "pip-boy.md").write_text(custom_persona, encoding="utf-8")
@@ -187,7 +167,6 @@ def test_legacy_flat_persona_preserved_on_upgrade(tmp_path: Path) -> None:
     assert persona_path.exists()
     content = persona_path.read_text(encoding="utf-8")
     assert "Custom system prompt from user." in content
-    assert "max_tokens: 4096" in content
 
     manifest = json.loads(
         (pip / _MANIFEST_NAME).read_text(encoding="utf-8"),
@@ -218,28 +197,37 @@ def test_legacy_memory_migrated_to_agents(tmp_path: Path) -> None:
     assert (agent_dir / "observations" / "2026-01-01.jsonl").exists()
 
 
-def test_legacy_users_tasks_team_transcripts_migrated(tmp_path: Path) -> None:
-    """Legacy top-level .pip/users/, tasks/, team/, transcripts/ should migrate
-    into the default agent's directory."""
+def test_legacy_users_migrated(tmp_path: Path) -> None:
+    """Legacy top-level ``.pip/users/`` migrates into the default agent."""
     (tmp_path / ".git").mkdir()
     pip = tmp_path / ".pip"
 
     (pip / "users").mkdir(parents=True)
     (pip / "users" / "alice.md").write_text("# Alice\n", encoding="utf-8")
 
-    (pip / "tasks").mkdir(parents=True)
-    (pip / "tasks" / "plan.json").write_text("{}", encoding="utf-8")
-
-    (pip / "team").mkdir(parents=True)
-    (pip / "team" / "helper.md").write_text("---\nname: helper\n---\n", encoding="utf-8")
-
-    (pip / "transcripts").mkdir(parents=True)
-    (pip / "transcripts" / "1700000000.json").write_text("[]", encoding="utf-8")
-
     ensure_workspace(tmp_path)
 
     agent_dir = pip / "agents" / "pip-boy"
     assert (agent_dir / "users" / "alice.md").exists()
-    assert (agent_dir / "tasks" / "plan.json").exists()
-    assert (agent_dir / "team" / "helper.md").exists()
-    assert (agent_dir / "transcripts" / "1700000000.json").exists()
+    # Legacy top-level directory is cleaned up.
+    assert not (pip / "users").exists()
+
+
+def test_legacy_transcripts_directory_is_purged(tmp_path: Path) -> None:
+    """Phase 4.5: any legacy ``.pip/transcripts/`` or ``agents/<id>/transcripts/``
+    directory is deleted on init; contents are no longer carried forward."""
+    (tmp_path / ".git").mkdir()
+    pip = tmp_path / ".pip"
+
+    legacy = pip / "transcripts"
+    legacy.mkdir(parents=True)
+    (legacy / "1700000000.json").write_text("[]", encoding="utf-8")
+
+    per_agent = pip / "agents" / "pip-boy" / "transcripts"
+    per_agent.mkdir(parents=True)
+    (per_agent / "old.json").write_text("[]", encoding="utf-8")
+
+    ensure_workspace(tmp_path)
+
+    assert not legacy.exists()
+    assert not per_agent.exists()

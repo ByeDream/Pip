@@ -17,11 +17,9 @@ _SCAFFOLD_DIR = Path(__file__).resolve().parent
 _MANIFEST_NAME = ".scaffold_manifest.json"
 
 _SCAFFOLD_FILES: list[tuple[str, str]] = [
-    (".pip/models.json", "models.json"),
     (".pip/agents/pip-boy/persona.md", "pip-boy.md"),
     (".pip/agents/pip-boy/HEARTBEAT.md", "heartbeat.md"),
     (".pip/owner.md", "owner.md"),
-    (".pip/keys.json", "keys.json"),
     (".env", "env.example"),
 ]
 
@@ -120,17 +118,15 @@ def ensure_workspace(workdir: Path, *, default_agent_id: str = "pip-boy") -> Non
 
 
 def _ensure_dirs(workdir: Path, *, default_agent_id: str = "pip-boy") -> None:
+    # ``transcripts/`` is deliberately NOT created: Phase 4.5 moved session
+    # persistence into Claude Code's native ``~/.claude/projects/`` JSONL, and
+    # Pip no longer writes per-turn transcripts.
     dirs = [
         ".pip",
         ".pip/agents",
         f".pip/agents/{default_agent_id}",
         f".pip/agents/{default_agent_id}/observations",
         f".pip/agents/{default_agent_id}/users",
-        f".pip/agents/{default_agent_id}/transcripts",
-        f".pip/agents/{default_agent_id}/tasks",
-        f".pip/agents/{default_agent_id}/downloads",
-        f".pip/agents/{default_agent_id}/team",
-        f".pip/agents/{default_agent_id}/team/inbox",
     ]
     for rel in dirs:
         d = workdir / rel
@@ -190,49 +186,22 @@ def _migrate_legacy_layout(
                 shutil.copy2(md, dest)
         logger.info("Migrated .pip/users/ → agents/%s/users/", default_agent_id)
 
-    # Legacy .pip/tasks/ → default agent's tasks/
-    legacy_tasks = pip / "tasks"
-    if legacy_tasks.is_dir() and any(legacy_tasks.iterdir()):
-        target_tasks = default_dir / "tasks"
-        target_tasks.mkdir(parents=True, exist_ok=True)
-        for item in legacy_tasks.iterdir():
-            dest = target_tasks / item.name
-            if not dest.exists():
-                if item.is_dir():
-                    shutil.copytree(item, dest)
-                else:
-                    shutil.copy2(item, dest)
-        logger.info("Migrated .pip/tasks/ → agents/%s/tasks/", default_agent_id)
-
-    # Legacy .pip/team/ → default agent's team/
-    legacy_team = pip / "team"
-    if legacy_team.is_dir() and any(legacy_team.iterdir()):
-        target_team = default_dir / "team"
-        target_team.mkdir(parents=True, exist_ok=True)
-        for item in legacy_team.iterdir():
-            dest = target_team / item.name
-            if not dest.exists():
-                if item.is_dir():
-                    shutil.copytree(item, dest)
-                else:
-                    shutil.copy2(item, dest)
-        logger.info("Migrated .pip/team/ → agents/%s/team/", default_agent_id)
-
-    # Legacy .pip/transcripts/ → default agent's transcripts/
+    # Legacy .pip/transcripts/ is no longer migrated: Pip reflect now reads
+    # Claude Code's native JSONL under ``~/.claude/projects/``. Any residual
+    # directory from pre-0.4 is removed below.
     legacy_transcripts = pip / "transcripts"
-    if legacy_transcripts.is_dir() and any(legacy_transcripts.glob("*.json")):
-        target_transcripts = default_dir / "transcripts"
-        target_transcripts.mkdir(parents=True, exist_ok=True)
-        for f in legacy_transcripts.glob("*.json"):
-            dest = target_transcripts / f.name
-            if not dest.exists():
-                shutil.copy2(f, dest)
-        logger.info(
-            "Migrated .pip/transcripts/ → agents/%s/transcripts/", default_agent_id,
-        )
 
-    # Remove legacy directories after migration
-    for legacy in (legacy_memory, legacy_users, legacy_tasks, legacy_team, legacy_transcripts):
+    # Also delete the per-agent ``transcripts/`` directories that older
+    # versions created empty during ``_ensure_dirs``; they are cruft now.
+    legacy_per_agent_transcripts: list[Path] = []
+    if agents.is_dir():
+        for agent_dir in agents.iterdir():
+            if agent_dir.is_dir():
+                td = agent_dir / "transcripts"
+                if td.is_dir():
+                    legacy_per_agent_transcripts.append(td)
+
+    for legacy in (legacy_memory, legacy_users, legacy_transcripts, *legacy_per_agent_transcripts):
         if legacy.is_dir():
             shutil.rmtree(legacy, ignore_errors=True)
             logger.info("Removed legacy directory: %s", legacy)

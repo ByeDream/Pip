@@ -1,10 +1,8 @@
 """Multi-channel host for Pip-Boy.
 
 Routes inbound messages from CLI / WeChat / WeCom through the Claude Agent
-SDK, manages per-session state, and dispatches replies back to the
-originating channel.
-
-Replaces the legacy ``agent.py:run()`` with SDK-native agent execution.
+SDK, manages per-session state, and dispatches replies back to the originating
+channel.
 """
 
 from __future__ import annotations
@@ -16,7 +14,7 @@ import re
 import sys
 import threading
 from dataclasses import dataclass
-from pathlib import Path
+
 from pip_agent.agent_runner import QueryResult, run_query
 from pip_agent.channels import (
     Channel,
@@ -29,10 +27,10 @@ from pip_agent.channels import (
     wechat_poll_loop,
     wecom_ws_loop,
 )
-from pip_agent.config import settings
+from pip_agent.config import WORKDIR, settings
+from pip_agent.host_scheduler import HostScheduler
 from pip_agent.mcp_tools import McpContext
 from pip_agent.memory import MemoryStore
-from pip_agent.profiler import Profiler
 from pip_agent.routing import (
     AgentRegistry,
     Binding,
@@ -41,14 +39,11 @@ from pip_agent.routing import (
     normalize_agent_id,
     resolve_effective_config,
 )
-from pip_agent.tools import WORKDIR
-from pip_agent.worktree import WorktreeManager
 
 log = logging.getLogger(__name__)
 
 AGENTS_DIR = WORKDIR / ".pip" / "agents"
 BINDINGS_PATH = AGENTS_DIR / "bindings.json"
-BUILTIN_TEAM_DIR = Path(__file__).resolve().parent / "team"
 
 SESSION_STORE_PATH = WORKDIR / ".pip" / "sdk_sessions.json"
 
@@ -75,24 +70,40 @@ def _save_sessions(sessions: dict[str, str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Inbound message formatting
+# Prompt shaping
 # ---------------------------------------------------------------------------
 
 
 _LEADING_AT_RE = re.compile(r"^@\S*\s*")
+
+# Sentinel sender ids set by :class:`HostScheduler` when it injects a timed
+# message. Kept in sync with ``host_scheduler._Sender``.
+_CRON_SENDER = "__cron__"
+_HEARTBEAT_SENDER = "__heartbeat__"
 
 
 def _format_prompt(
     inbound: InboundMessage,
     memory_store: MemoryStore | None,
 ) -> str:
-    """Build the user-visible prompt string from an InboundMessage.
+    """Build the user-visible prompt from an InboundMessage.
 
-    CLI messages pass through as-is. Remote-channel messages are wrapped
-    in ``<user_query>`` XML with sender metadata so the agent can
-    distinguish callers.
+    Dispatch order matters:
+
+    1. **Scheduler-injected sentinels** — ``__cron__`` / ``__heartbeat__`` are
+       wrapped in ``<cron_task>`` / ``<heartbeat>`` regardless of channel, so
+       the agent can distinguish them from user messages even when the
+       originating channel is ``cli``.
+    2. **CLI messages** pass through bare (matches how developers type).
+    3. **Remote-channel messages** get ``<user_query>`` XML with sender
+       identity so the agent sees who is talking.
     """
     clean_text = _LEADING_AT_RE.sub("", inbound.text, count=1)
+
+    if inbound.sender_id == _CRON_SENDER:
+        return f"<cron_task>\n{clean_text}\n</cron_task>"
+    if inbound.sender_id == _HEARTBEAT_SENDER:
+        return f"<heartbeat>\n{clean_text}\n</heartbeat>"
 
     if inbound.channel == "cli":
         return clean_text
@@ -131,25 +142,23 @@ class _PerAgent:
     """Per-agent lazily-created service objects."""
 
     memory_store: MemoryStore
-    worktree_manager: WorktreeManager
-    transcripts_dir: Path
 
 
 class AgentHost:
-    """Multi-channel host that drives the SDK agent for every inbound message."""
+    """Multi-channel host driving the SDK agent for every inbound message."""
 
     def __init__(
         self,
         *,
         registry: AgentRegistry,
         binding_table: BindingTable,
-        profiler: Profiler,
         channel_mgr: ChannelManager,
+        scheduler: HostScheduler | None = None,
     ) -> None:
         self._registry = registry
         self._binding_table = binding_table
-        self._profiler = profiler
         self._channel_mgr = channel_mgr
+        self._scheduler = scheduler
 
         self._sessions = _load_sessions()
         self._agents: dict[str, _PerAgent] = {}
@@ -159,12 +168,7 @@ class AgentHost:
     def _get_agent_services(self, agent_id: str) -> _PerAgent:
         if agent_id not in self._agents:
             ms = MemoryStore(base_dir=AGENTS_DIR, agent_id=agent_id)
-            wm = WorktreeManager(WORKDIR, agent_id=agent_id)
-            td = AGENTS_DIR / agent_id / "transcripts"
-            td.mkdir(parents=True, exist_ok=True)
-            self._agents[agent_id] = _PerAgent(
-                memory_store=ms, worktree_manager=wm, transcripts_dir=td,
-            )
+            self._agents[agent_id] = _PerAgent(memory_store=ms)
         return self._agents[agent_id]
 
     def _build_mcp_ctx(
@@ -174,22 +178,21 @@ class AgentHost:
         sender_id: str,
         channel: Channel | None = None,
         peer_id: str = "",
+        session_id: str = "",
     ) -> McpContext:
         return McpContext(
             memory_store=svc.memory_store,
-            worktree_manager=svc.worktree_manager,
-            profiler=self._profiler,
             workdir=WORKDIR,
             model=model,
-            transcripts_dir=svc.transcripts_dir,
+            session_id=session_id,
             sender_id=sender_id,
             channel=channel,
             peer_id=peer_id,
+            scheduler=self._scheduler,
         )
 
     async def process_inbound(self, inbound: InboundMessage) -> None:
         """Route one inbound message through the SDK agent and reply."""
-        # Resolve agent
         if inbound.agent_id:
             agent_id = inbound.agent_id
             binding = None
@@ -208,7 +211,6 @@ class AgentHost:
 
         svc = self._get_agent_services(eff.id)
 
-        # Build session key
         sk = build_session_key(
             agent_id=eff.id,
             channel=inbound.channel,
@@ -218,7 +220,6 @@ class AgentHost:
             dm_scope=eff.effective_dm_scope,
         )
 
-        # System prompt with memory enrichment
         base_prompt = eff.system_prompt(workdir=str(WORKDIR))
         user_text = inbound.text if isinstance(inbound.text, str) else ""
         system_prompt = svc.memory_store.enrich_prompt(
@@ -236,15 +237,15 @@ class AgentHost:
         if inbound.is_group and inbound.guild_id:
             reply_peer = inbound.guild_id
 
-        # Typing indicator
         if inbound.channel == "wechat" and isinstance(ch, WeChatChannel):
             ch.send_typing(inbound.peer_id)
 
+        current_session = self._sessions.get(sk)
         mcp_ctx = self._build_mcp_ctx(
             svc, eff.effective_model, inbound.sender_id,
             channel=ch, peer_id=reply_peer,
+            session_id=current_session or "",
         )
-        current_session = self._sessions.get(sk)
 
         async with self._semaphore:
             try:
@@ -277,11 +278,9 @@ class AgentHost:
             if inbound.channel == "cli" and not settings.verbose:
                 print(f"\n{result.text}")
             elif inbound.channel == "cli":
-                print()  # verbose mode already streamed text
+                print()
             elif ch:
                 send_with_retry(ch, reply_peer, result.text)
-
-        self._profiler.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +291,7 @@ class AgentHost:
 def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
     """Blocking multi-channel entry point.
 
-    Starts channel threads, then enters an async event loop that processes
+    Starts channel threads, then enters an asyncio event loop that processes
     inbound messages through the SDK agent.
     """
     sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
@@ -306,8 +305,6 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
     registry = AgentRegistry(AGENTS_DIR)
     binding_table = BindingTable()
     binding_table.load(BINDINGS_PATH)
-    default_agent = registry.default_agent()
-    profiler = Profiler()
 
     channel_mgr = ChannelManager()
     cli_channel = CLIChannel()
@@ -320,7 +317,6 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
 
     state_dir = WORKDIR / ".pip"
 
-    # -- WeChat --
     wechat_channel: WeChatChannel | None = None
     if mode != "cli":
         try:
@@ -355,7 +351,6 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
         except Exception as exc:
             print(f"  [wechat] Init failed: {exc}")
 
-    # -- WeCom --
     if settings.wecom_bot_id and settings.wecom_bot_secret:
         try:
             wecom_channel = WecomChannel(
@@ -374,11 +369,19 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
         except Exception as exc:
             print(f"  [wecom] Init failed: {exc}")
 
+    scheduler = HostScheduler(
+        agents_dir=AGENTS_DIR,
+        msg_queue=msg_queue,
+        q_lock=q_lock,
+        stop_event=stop_event,
+    )
+    scheduler.start()
+
     host = AgentHost(
         registry=registry,
         binding_table=binding_table,
-        profiler=profiler,
         channel_mgr=channel_mgr,
+        scheduler=scheduler,
     )
 
     from pip_agent import __version__
@@ -397,82 +400,59 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
         "============================================"
     )
 
-    has_remote = len(channel_mgr.list_channels()) > 1
-
+    # The scheduler and all remote channels push into ``msg_queue``, so the
+    # main loop always drains that queue (even in CLI-only mode).
     async def _run() -> None:
         loop = asyncio.get_running_loop()
 
-        if has_remote:
-            # Multi-channel: stdin reader thread feeds into msg_queue
-            def _stdin_reader() -> None:
-                while not stop_event.is_set():
-                    try:
-                        line = sys.stdin.readline()
-                    except (EOFError, OSError):
-                        break
-                    if not line:
-                        break
-                    text = line.strip()
-                    if text:
-                        with q_lock:
-                            msg_queue.append(InboundMessage(
-                                text=text,
-                                sender_id="cli-user",
-                                channel="cli",
-                                peer_id="cli-user",
-                            ))
-
-            stdin_t = threading.Thread(target=_stdin_reader, daemon=True)
-            stdin_t.start()
-            print("  (multi-channel mode: type and press Enter)")
-
-            while not stop_event.is_set():
-                with q_lock:
-                    batch = msg_queue[:]
-                    msg_queue.clear()
-
-                tasks = []
-                for inbound in batch:
-                    if inbound.text.strip().lower() in ("/exit", "exit"):
-                        stop_event.set()
-                        break
-                    tasks.append(
-                        loop.create_task(host.process_inbound(inbound)),
-                    )
-
-                if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-
-                if stop_event.is_set():
-                    break
-                await asyncio.sleep(0.3)
-        else:
-            # CLI-only: blocking readline REPL
-            try:
-                import readline  # noqa: F401
-            except ImportError:
-                pass
-
+        def _stdin_reader() -> None:
             while not stop_event.is_set():
                 try:
-                    user_input = await loop.run_in_executor(
-                        None, lambda: input("> ").strip(),
-                    )
-                except (EOFError, KeyboardInterrupt):
+                    line = sys.stdin.readline()
+                except (EOFError, OSError):
                     break
-
-                if not user_input:
-                    continue
-                if user_input.lower() in ("/exit", "exit"):
+                if not line:
                     break
+                text = line.strip()
+                if text:
+                    with q_lock:
+                        msg_queue.append(InboundMessage(
+                            text=text,
+                            sender_id="cli-user",
+                            channel="cli",
+                            peer_id="cli-user",
+                        ))
 
-                inbound = InboundMessage(
-                    text=user_input,
-                    sender_id="cli-user",
-                    channel="cli",
-                    peer_id="cli-user",
+        stdin_t = threading.Thread(target=_stdin_reader, daemon=True)
+        stdin_t.start()
+        print("  (type and press Enter; /exit to quit)")
+
+        while not stop_event.is_set():
+            with q_lock:
+                batch = msg_queue[:]
+                msg_queue.clear()
+
+            tasks = []
+            for inbound in batch:
+                # Only real interactive CLI input can terminate the host; a
+                # cron payload that happens to say "/exit" must not kill us.
+                if (
+                    inbound.channel == "cli"
+                    and inbound.sender_id == "cli-user"
+                    and inbound.text.strip().lower() in ("/exit", "exit")
+                ):
+                    stop_event.set()
+                    break
+                tasks.append(
+                    loop.create_task(host.process_inbound(inbound)),
                 )
-                await host.process_inbound(inbound)
+
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            if stop_event.is_set():
+                break
+            await asyncio.sleep(0.3)
 
     try:
         asyncio.run(_run())
@@ -480,6 +460,7 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
         pass
     finally:
         stop_event.set()
+        scheduler.stop()
         channel_mgr.close_all()
         for t in bg_threads:
             t.join(timeout=5.0)

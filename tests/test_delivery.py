@@ -1,19 +1,15 @@
-"""Tests for reliable delivery: send_with_retry and cron error wiring."""
+"""Tests for reliable multi-channel delivery (``send_with_retry``).
+
+Cron-service delivery tests live with the rewritten ``host_scheduler.py``
+(Phase 5 / Phase 11).
+"""
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from pip_agent.channels import BACKOFF_SCHEDULE, Channel, CLIChannel, send_with_retry
-from pip_agent.scheduler import CRON_AUTO_DISABLE_THRESHOLD, CronService
 
-# ---------------------------------------------------------------------------
-# send_with_retry
-# ---------------------------------------------------------------------------
 
 class _MockChannel(Channel):
     """Channel that fails a configurable number of times then succeeds."""
@@ -59,7 +55,7 @@ class TestSendWithRetry:
     @patch("pip_agent.channels.time.sleep")
     def test_chunks_long_text(self, mock_sleep):
         ch = _MockChannel(fail_count=0)
-        ch.name = "wechat"  # limit=2000, so 3000 chars will be split
+        ch.name = "wechat"
         text = "A" * 3000
         assert send_with_retry(ch, "user", text) is True
         assert ch._attempts >= 2
@@ -67,14 +63,10 @@ class TestSendWithRetry:
     @patch("pip_agent.channels.time.sleep")
     def test_partial_failure(self, mock_sleep):
         """If one chunk fails permanently, returns False but still sends others."""
-        call_count = 0
-
         class _PartialChannel(Channel):
             name = "test"
 
             def send(self, to: str, text: str, **kw) -> bool:
-                nonlocal call_count
-                call_count += 1
                 if "FAIL" in text:
                     return False
                 return True
@@ -83,58 +75,3 @@ class TestSendWithRetry:
         text = "OK chunk\n\n" + "FAIL" * 500
         result = send_with_retry(ch, "user", text)
         assert result is False
-
-
-# ---------------------------------------------------------------------------
-# CronService.report_outcome
-# ---------------------------------------------------------------------------
-
-class TestCronReportOutcome:
-    @pytest.fixture
-    def cron_svc(self, tmp_path: Path):
-        agent_dir = tmp_path / "test-agent"
-        agent_dir.mkdir()
-        cron_file = agent_dir / "CRON.json"
-        cron_file.write_text(json.dumps({
-            "jobs": [
-                {
-                    "id": "test-job",
-                    "name": "Test Job",
-                    "enabled": True,
-                    "schedule": {"kind": "every", "every_seconds": 3600},
-                    "payload": {"kind": "agent_turn", "message": "do stuff"},
-                    "source": {"channel": "cli", "peer_id": "cli-user", "sender_id": ""},
-                    "delete_after_run": False,
-                    "consecutive_errors": 0,
-                },
-            ],
-        }), encoding="utf-8")
-        return CronService(tmp_path)
-
-    def test_success_resets_errors(self, cron_svc: CronService):
-        job = cron_svc.jobs[0]
-        job.consecutive_errors = 3
-        cron_svc.report_outcome(job.id, success=True)
-        assert job.consecutive_errors == 0
-
-    def test_failure_increments_errors(self, cron_svc: CronService):
-        job = cron_svc.jobs[0]
-        cron_svc.report_outcome(job.id, success=False)
-        assert job.consecutive_errors == 1
-
-    def test_auto_disable_on_threshold(self, cron_svc: CronService):
-        job = cron_svc.jobs[0]
-        for _ in range(CRON_AUTO_DISABLE_THRESHOLD):
-            cron_svc.report_outcome(job.id, success=False)
-        assert job.enabled is False
-        assert job.consecutive_errors == CRON_AUTO_DISABLE_THRESHOLD
-
-    def test_persists_to_disk(self, cron_svc: CronService):
-        job = cron_svc.jobs[0]
-        cron_svc.report_outcome(job.id, success=False)
-        data = json.loads(cron_svc.cron_file.read_text(encoding="utf-8"))
-        assert data["jobs"][0]["consecutive_errors"] == 1
-
-    def test_unknown_job_is_noop(self, cron_svc: CronService):
-        cron_svc.report_outcome("nonexistent", success=False)
-        assert cron_svc.jobs[0].consecutive_errors == 0
