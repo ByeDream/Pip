@@ -51,24 +51,28 @@ _BUILTIN_TOOLS: list[str] = [
 def _build_env() -> dict[str, str]:
     """Collect env vars to forward to the Claude Code CLI subprocess.
 
-    Proxy-aware: when ``anthropic_base_url`` is set the API key is forwarded as
-    ``ANTHROPIC_AUTH_TOKEN`` (Bearer scheme) and experimental betas are
-    disabled, which common proxies reject.
+    Credential resolution + the proxy rule live in
+    ``pip_agent.anthropic_client.resolve_anthropic_credential`` — this
+    function just translates the resolved credential into the env var names
+    the CC CLI expects. DO NOT duplicate the proxy rule here; if you need to
+    change how bearer vs. x-api-key is decided, change it in one place.
 
     Pip-Boy does not forward any search or tool-specific keys — those are
     handled by Claude Code's own config.
     """
-    from pip_agent.config import settings
+    from pip_agent.anthropic_client import resolve_anthropic_credential
 
     env: dict[str, str] = {}
-    if settings.anthropic_api_key:
-        if settings.anthropic_base_url:
-            env["ANTHROPIC_AUTH_TOKEN"] = settings.anthropic_api_key
+    cred = resolve_anthropic_credential()
+    if cred is not None:
+        if cred.bearer:
+            env["ANTHROPIC_AUTH_TOKEN"] = cred.token
         else:
-            env["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
-    if settings.anthropic_base_url:
-        env["ANTHROPIC_BASE_URL"] = settings.anthropic_base_url
-        env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
+            env["ANTHROPIC_API_KEY"] = cred.token
+        if cred.base_url:
+            env["ANTHROPIC_BASE_URL"] = cred.base_url
+            # Experimental betas are rejected by most corporate proxies.
+            env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
     return env
 
 

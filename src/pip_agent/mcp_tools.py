@@ -125,6 +125,7 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
                 "Run at least one turn with Claude Code first."
             )
 
+        from pip_agent.anthropic_client import build_anthropic_client
         from pip_agent.memory.reflect import reflect_from_jsonl
         from pip_agent.memory.transcript_source import locate_session_jsonl
 
@@ -133,6 +134,16 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
             return _text(
                 f"Reflection skipped: transcript for session {ctx.session_id[:8]} "
                 f"not found under ~/.claude/projects/."
+            )
+
+        # Check credentials up front so the response can distinguish
+        # "ran + empty" from "skipped for lack of credentials" from "crashed".
+        client = build_anthropic_client()
+        if client is None:
+            return _text(
+                "Reflection skipped: no ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN "
+                "configured. Set one in `.env` (or as an environment variable) "
+                "so reflect can make direct Anthropic calls."
             )
 
         state = ctx.memory_store.load_state()
@@ -145,6 +156,7 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
                 start_offset=start_offset,
                 agent_id=ctx.memory_store.agent_id,
                 model=ctx.model,
+                client=client,
             )
         except Exception as exc:  # noqa: BLE001
             return _error(f"Reflection failed: {exc}")
@@ -161,7 +173,13 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
             return _text(
                 f"Reflection complete: extracted {len(observations)} observations."
             )
-        return _text("Reflection complete: no new observations found.")
+        if new_offset == start_offset:
+            return _text(
+                "Reflection complete: no new transcript content since last run."
+            )
+        return _text(
+            "Reflection complete: LLM produced no new observations from the delta."
+        )
 
     return [
         SdkMcpTool(

@@ -76,7 +76,8 @@ class TestPreCompactHook:
             encoding="utf-8",
         )
 
-        # Stub reflect_from_jsonl so the hook doesn't try to hit an LLM.
+        # Stub reflect_from_jsonl so the hook doesn't try to hit an LLM, and
+        # pretend credentials are configured so build_anthropic_client succeeds.
         def fake_reflect(transcript_path, *, start_offset, agent_id, **kw):
             return 42, [{
                 "ts": 1.0,
@@ -85,7 +86,16 @@ class TestPreCompactHook:
                 "source": "auto",
             }]
 
-        with patch("pip_agent.memory.reflect.reflect_from_jsonl", side_effect=fake_reflect):
+        with (
+            patch(
+                "pip_agent.anthropic_client.build_anthropic_client",
+                return_value=object(),
+            ),
+            patch(
+                "pip_agent.memory.reflect.reflect_from_jsonl",
+                side_effect=fake_reflect,
+            ),
+        ):
             cb = _pre_compact_hook(memory_store)
             _run(cb({
                 "session_id": "sess-123",
@@ -107,7 +117,16 @@ class TestPreCompactHook:
         def raising_reflect(*a, **kw):
             raise RuntimeError("boom")
 
-        with patch("pip_agent.memory.reflect.reflect_from_jsonl", side_effect=raising_reflect):
+        with (
+            patch(
+                "pip_agent.anthropic_client.build_anthropic_client",
+                return_value=object(),
+            ),
+            patch(
+                "pip_agent.memory.reflect.reflect_from_jsonl",
+                side_effect=raising_reflect,
+            ),
+        ):
             cb = _pre_compact_hook(memory_store)
             _run(cb({
                 "session_id": "sess-xyz",
@@ -116,6 +135,31 @@ class TestPreCompactHook:
 
         state = memory_store.load_state()
         assert "last_reflect_jsonl_offset" not in state
+
+    def test_skips_reflect_when_no_credentials(
+        self, memory_store, tmp_path, caplog,
+    ):
+        # When no Anthropic creds are configured, reflect must be skipped
+        # cleanly — not blow up, not advance the cursor, not pretend to run.
+        path = tmp_path / "session.jsonl"
+        path.write_text('{"role":"user","content":"hi"}\n', encoding="utf-8")
+
+        caplog.set_level("INFO", logger="pip_agent.hooks")
+        with patch(
+            "pip_agent.anthropic_client.build_anthropic_client", return_value=None,
+        ):
+            cb = _pre_compact_hook(memory_store)
+            _run(cb({
+                "session_id": "sess-nokey",
+                "transcript_path": str(path),
+            }, None, None))
+
+        state = memory_store.load_state()
+        assert "last_reflect_jsonl_offset" not in state
+        assert "last_reflect_at" not in state
+        # But the pre-compact stamp is still recorded so /status can show it.
+        assert state["last_pre_compact_session_id"] == "sess-nokey"
+        assert any("no ANTHROPIC" in r.message for r in caplog.records)
 
     def test_no_memory_store_is_noop(self, tmp_path):
         cb = _pre_compact_hook(None)

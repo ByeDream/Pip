@@ -87,7 +87,17 @@ def _pre_compact_hook(memory_store: MemoryStore | None):
             return {}
 
         try:
+            from pip_agent.anthropic_client import build_anthropic_client
             from pip_agent.memory.reflect import reflect_from_jsonl
+
+            client = build_anthropic_client()
+            if client is None:
+                log.info(
+                    "PreCompact: reflect skipped for session=%s — "
+                    "no ANTHROPIC_API_KEY/AUTH_TOKEN configured",
+                    session_id[:8],
+                )
+                return {}
 
             offsets: dict[str, int] = state.get(_OFFSET_KEY) or {}
             start_offset = int(offsets.get(session_id, 0))
@@ -95,6 +105,7 @@ def _pre_compact_hook(memory_store: MemoryStore | None):
                 path,
                 start_offset=start_offset,
                 agent_id=memory_store.agent_id,
+                client=client,
             )
             if observations:
                 memory_store.write_observations(observations)

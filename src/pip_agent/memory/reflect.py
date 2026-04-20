@@ -18,13 +18,13 @@ cursor so each run only sees newly-appended lines.
 from __future__ import annotations
 
 import logging
-import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
 
+from pip_agent.anthropic_client import build_anthropic_client
 from pip_agent.memory.transcript_source import load_formatted
 from pip_agent.types import Observation
 
@@ -94,34 +94,6 @@ def _get_reflect_system() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Client factory
-# ---------------------------------------------------------------------------
-
-
-def _default_anthropic_client() -> anthropic.Anthropic | None:
-    """Build an Anthropic client from env vars, or return ``None`` if unavailable.
-
-    Reflection is best-effort: if no credentials are present we log and skip
-    rather than crash the host. We honour the same env vars Claude Code uses
-    so users under a proxy (``ANTHROPIC_BASE_URL`` + ``ANTHROPIC_AUTH_TOKEN``)
-    get reflect "for free".
-    """
-    api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")
-    base_url = os.getenv("ANTHROPIC_BASE_URL")
-    if not api_key:
-        log.info("reflect: no ANTHROPIC_API_KEY/AUTH_TOKEN; skipping")
-        return None
-    try:
-        kwargs: dict[str, str] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        return anthropic.Anthropic(**kwargs)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("reflect: cannot build Anthropic client: %s", exc)
-        return None
-
-
-# ---------------------------------------------------------------------------
 # Reflect
 # ---------------------------------------------------------------------------
 
@@ -159,7 +131,7 @@ def reflect_from_jsonl(
     if not formatted.strip():
         return new_offset, []
 
-    llm = client or _default_anthropic_client()
+    llm = client or build_anthropic_client()
     if llm is None:
         return start_offset, []
 

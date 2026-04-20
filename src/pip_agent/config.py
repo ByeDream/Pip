@@ -30,7 +30,13 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # ``ANTHROPIC_API_KEY`` is the direct Anthropic credential;
+    # ``ANTHROPIC_AUTH_TOKEN`` is the proxy-style token Claude Code itself
+    # honours. Either works for reflect's direct LLM calls — we try them in
+    # order and fall back to ``os.environ`` for users who set them outside
+    # ``.env``.
     anthropic_api_key: str = Field(default="")
+    anthropic_auth_token: str = Field(default="")
     anthropic_base_url: str = Field(default="")
 
     verbose: bool = Field(default=True)
