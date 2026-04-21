@@ -146,6 +146,23 @@ _HEARTBEAT_OK_RE = re.compile(
 )
 
 
+def _agent_id_from_session_key(sk: str) -> str:
+    """Return the ``agent_id`` component of a session key, or ``""``.
+
+    Session keys are built by :func:`routing.build_session_key` with an
+    ``"agent:<agent_id>:..."`` prefix. This helper is a minimal reverse —
+    if the format ever diverges from ``agent:*`` it returns empty rather
+    than raise, so callers can log and skip instead of bringing down the
+    shutdown path.
+    """
+    if not sk.startswith("agent:"):
+        return ""
+    parts = sk.split(":", 2)
+    if len(parts) < 2:
+        return ""
+    return parts[1]
+
+
 def _format_prompt(
     inbound: InboundMessage,
     memory_store: MemoryStore | None,
@@ -304,6 +321,112 @@ class AgentHost:
         self._sessions.pop(sk, None)
         _save_sessions(self._sessions)
         return None
+
+    async def flush_and_rotate(self) -> None:
+        """On-exit memory handoff: reflect every live session, then rotate.
+
+        Called from the CLI's ``/exit`` handler (and any future clean-shutdown
+        path) as the last thing before the event loop stops. For each
+        ``(session_key, session_id)`` in :attr:`_sessions`:
+
+        1. Resolve the session's JSONL via ``locate_session_jsonl``. If the
+           file is already gone, skip — nothing left to reflect.
+        2. Invoke ``reflect_and_persist`` (same helper PreCompact and the
+           reflect MCP tool use), which extracts up to 5 observations,
+           appends them to ``observations.jsonl``, and advances the cursor
+           in ``state.json``.
+        3. Regardless of reflect outcome, drop the session id from the
+           in-memory map so the NEXT launch starts a fresh SDK session.
+           This is the "session rotation" half of Q5 in §11.3 — it's what
+           lets us cap JSONL growth without losing memory continuity:
+           observations survive, conversation bytes don't.
+
+        Design points worth pinning:
+
+        * **Best-effort per session, never fatal.** A failure on one
+          session key must not block rotation on the others; a user's
+          shutdown takes priority over any single reflect pass.
+        * **Reflect runs in a thread executor.** ``reflect_from_jsonl``
+          is synchronous (anthropic SDK is blocking), and /exit is the
+          one path where we genuinely want to wait for it — but blocking
+          the event loop means channel close callbacks and the scheduler
+          stop signal can't interleave. ``asyncio.to_thread`` gives us
+          "wait for reflect" without "freeze the loop".
+        * **Rotation happens even if reflect_and_persist raised.** The
+          user pressed /exit; our job is to hand control back. Worst
+          case a failed reflect leaves the cursor where it was, so the
+          next trigger (PreCompact or the next /exit) retries the same
+          delta — that's the Q8 contract.
+        """
+        if not self._sessions:
+            return
+
+        try:
+            from pip_agent.anthropic_client import build_anthropic_client
+            from pip_agent.memory.reflect import reflect_and_persist
+        except Exception:  # pragma: no cover — memory pkg is bundled
+            log.exception("flush_and_rotate: memory package import failed")
+            self._sessions.clear()
+            _save_sessions(self._sessions)
+            return
+
+        client = build_anthropic_client()
+        snapshot = dict(self._sessions)
+
+        if client is None:
+            log.info(
+                "flush_and_rotate: rotating %d session(s) but skipping "
+                "reflect — no ANTHROPIC_API_KEY/AUTH_TOKEN configured",
+                len(snapshot),
+            )
+        else:
+            log.info(
+                "flush_and_rotate: reflecting %d session(s) on exit",
+                len(snapshot),
+            )
+
+            def _reflect_one(sk: str, sid: str) -> None:
+                path = locate_session_jsonl(sid)
+                if path is None:
+                    log.info(
+                        "flush_and_rotate: transcript for %s missing; "
+                        "skipping reflect", sid[:8],
+                    )
+                    return
+                agent_id = _agent_id_from_session_key(sk)
+                if not agent_id:
+                    log.warning(
+                        "flush_and_rotate: cannot derive agent_id from %r; "
+                        "skipping reflect", sk,
+                    )
+                    return
+                try:
+                    svc = self._get_agent_services(agent_id)
+                    start_offset, new_offset, obs_count = reflect_and_persist(
+                        memory_store=svc.memory_store,
+                        session_id=sid,
+                        transcript_path=path,
+                        client=client,
+                    )
+                    log.info(
+                        "flush_and_rotate: session=%s obs=%d offset=%d→%d",
+                        sid[:8], obs_count, start_offset, new_offset,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # Per-session failure isolated: log and keep going.
+                    log.warning(
+                        "flush_and_rotate: reflect failed for session=%s: %s",
+                        sid[:8], exc,
+                    )
+
+            for sk, sid in snapshot.items():
+                await asyncio.to_thread(_reflect_one, sk, sid)
+
+        # Rotation: clear the whole map regardless of reflect outcome.
+        # The JSONL files themselves are not touched — CC owns those —
+        # but the next turn will mint a fresh session_id.
+        self._sessions.clear()
+        _save_sessions(self._sessions)
 
     def _build_mcp_ctx(
         self,
@@ -692,6 +815,17 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
                     and inbound.sender_id == "cli-user"
                     and inbound.text.strip().lower() in ("/exit", "exit")
                 ):
+                    # Shutdown handoff: reflect every live session and
+                    # rotate so next launch starts clean. See
+                    # ``AgentHost.flush_and_rotate`` for the contract.
+                    print("  Powering down — reflecting session memory...")
+                    try:
+                        await host.flush_and_rotate()
+                    except Exception:  # noqa: BLE001
+                        # /exit must never be blocked by reflect. The
+                        # cursor-does-not-advance contract means a crash
+                        # here is picked up on the next PreCompact anyway.
+                        log.exception("flush_and_rotate failed during /exit")
                     stop_event.set()
                     break
                 log.info(

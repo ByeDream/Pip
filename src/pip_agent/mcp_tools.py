@@ -126,7 +126,7 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
             )
 
         from pip_agent.anthropic_client import build_anthropic_client
-        from pip_agent.memory.reflect import reflect_from_jsonl
+        from pip_agent.memory.reflect import reflect_and_persist
         from pip_agent.memory.transcript_source import locate_session_jsonl
 
         path = locate_session_jsonl(ctx.session_id)
@@ -146,32 +146,20 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
                 "so reflect can make direct Anthropic calls."
             )
 
-        state = ctx.memory_store.load_state()
-        offsets: dict[str, int] = state.get("last_reflect_jsonl_offset") or {}
-        start_offset = int(offsets.get(ctx.session_id, 0))
-
         try:
-            new_offset, observations = reflect_from_jsonl(
-                path,
-                start_offset=start_offset,
-                agent_id=ctx.memory_store.agent_id,
-                model=ctx.model,
+            start_offset, new_offset, obs_count = reflect_and_persist(
+                memory_store=ctx.memory_store,
+                session_id=ctx.session_id,
+                transcript_path=path,
                 client=client,
+                model=ctx.model,
             )
         except Exception as exc:  # noqa: BLE001
             return _error(f"Reflection failed: {exc}")
 
-        if observations:
-            ctx.memory_store.write_observations(observations)
-        if new_offset != start_offset:
-            offsets[ctx.session_id] = new_offset
-            state["last_reflect_jsonl_offset"] = offsets
-            state["last_reflect_at"] = time.time()
-            ctx.memory_store.save_state(state)
-
-        if observations:
+        if obs_count:
             return _text(
-                f"Reflection complete: extracted {len(observations)} observations."
+                f"Reflection complete: extracted {obs_count} observations."
             )
         if new_offset == start_offset:
             return _text(

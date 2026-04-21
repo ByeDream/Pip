@@ -29,8 +29,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-_OFFSET_KEY = "last_reflect_jsonl_offset"
-
 
 # ---------------------------------------------------------------------------
 # PreCompact — drives reflection
@@ -88,7 +86,7 @@ def _pre_compact_hook(memory_store: MemoryStore | None):
 
         try:
             from pip_agent.anthropic_client import build_anthropic_client
-            from pip_agent.memory.reflect import reflect_from_jsonl
+            from pip_agent.memory.reflect import reflect_and_persist
 
             client = build_anthropic_client()
             if client is None:
@@ -99,24 +97,15 @@ def _pre_compact_hook(memory_store: MemoryStore | None):
                 )
                 return {}
 
-            offsets: dict[str, int] = state.get(_OFFSET_KEY) or {}
-            start_offset = int(offsets.get(session_id, 0))
-            new_offset, observations = reflect_from_jsonl(
-                path,
-                start_offset=start_offset,
-                agent_id=memory_store.agent_id,
+            start_offset, new_offset, obs_count = reflect_and_persist(
+                memory_store=memory_store,
+                session_id=session_id,
+                transcript_path=path,
                 client=client,
             )
-            if observations:
-                memory_store.write_observations(observations)
-            if new_offset != start_offset:
-                offsets[session_id] = new_offset
-                state[_OFFSET_KEY] = offsets
-                state["last_reflect_at"] = time.time()
-                memory_store.save_state(state)
             log.info(
                 "PreCompact: reflect session=%s obs=%d offset=%d→%d trigger=%s",
-                session_id[:8], len(observations), start_offset, new_offset,
+                session_id[:8], obs_count, start_offset, new_offset,
                 input_data.get("trigger", "?"),
             )
         except Exception as exc:  # noqa: BLE001

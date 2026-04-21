@@ -208,3 +208,70 @@ def reflect_from_jsonl(
             # as highest-signal first).
             break
     return new_offset, valid
+
+
+# ---------------------------------------------------------------------------
+# State-aware wrapper — reflect + persist observations + advance cursor
+# ---------------------------------------------------------------------------
+
+OFFSET_STATE_KEY = "last_reflect_jsonl_offset"
+"""Key under which per-session byte cursors live in ``state.json``.
+
+Public constant so PreCompact hook, /exit flush, and the reflect MCP tool
+can all read/write the same map without any risk of key drift. Schema:
+``{session_id: int}``.
+"""
+
+
+def reflect_and_persist(
+    *,
+    memory_store,  # MemoryStore — avoid circular import at module load
+    session_id: str,
+    transcript_path: Path | str,
+    client: anthropic.Anthropic | None = None,
+    model: str = "",
+) -> tuple[int, int, int]:
+    """Reflect a session's delta, persist observations, advance the cursor.
+
+    Single entry point shared by three call sites (PreCompact hook, the
+    ``reflect`` MCP tool, and ``AgentHost.flush_and_rotate`` on /exit),
+    so the state-key name, advance-only cursor semantics, and
+    failure-does-not-advance-cursor contract stay in one place.
+
+    Contract:
+
+    * If ``reflect_from_jsonl`` raises or the cursor did not advance,
+      nothing is written to the memory store.
+    * Observations are ``write_observations``-appended only when the LLM
+      returned at least one.
+    * State is rewritten only when ``new_offset != start_offset``, so a
+      zero-delta pass is a true no-op (no state churn, no ``state.json``
+      rewrite that would invalidate mtime-based caches).
+
+    Returns ``(start_offset, new_offset, obs_count)`` so callers can log
+    and report consistently.
+    """
+    from pip_agent.memory.reflect import reflect_from_jsonl
+
+    state = memory_store.load_state()
+    offsets: dict[str, int] = dict(state.get(OFFSET_STATE_KEY) or {})
+    start_offset = int(offsets.get(session_id, 0))
+
+    new_offset, observations = reflect_from_jsonl(
+        Path(transcript_path),
+        start_offset=start_offset,
+        agent_id=memory_store.agent_id,
+        model=model,
+        client=client,
+    )
+
+    if observations:
+        memory_store.write_observations(observations)
+
+    if new_offset != start_offset:
+        offsets[session_id] = new_offset
+        state[OFFSET_STATE_KEY] = offsets
+        state["last_reflect_at"] = time.time()
+        memory_store.save_state(state)
+
+    return start_offset, new_offset, len(observations)

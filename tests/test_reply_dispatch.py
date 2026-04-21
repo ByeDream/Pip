@@ -437,3 +437,330 @@ class TestSessionLockMap:
         host = self._host()
         lock = AgentHost._get_session_lock(host, "sk-1")
         assert isinstance(lock, asyncio.Lock)
+
+
+class TestAgentIdFromSessionKey:
+    """Session-key → agent_id inverse used by flush_and_rotate."""
+
+    def test_simple_peer_key(self):
+        from pip_agent.agent_host import _agent_id_from_session_key
+
+        assert _agent_id_from_session_key(
+            "agent:pip-boy:cli:peer:cli-user"
+        ) == "pip-boy"
+
+    def test_group_scoped_key(self):
+        from pip_agent.agent_host import _agent_id_from_session_key
+
+        assert _agent_id_from_session_key(
+            "agent:pip-boy:wecom:guild:g1:peer:u1"
+        ) == "pip-boy"
+
+    def test_main_scope_key(self):
+        from pip_agent.agent_host import _agent_id_from_session_key
+
+        assert _agent_id_from_session_key(
+            "agent:pip-boy:wecom:main"
+        ) == "pip-boy"
+
+    def test_malformed_returns_empty(self):
+        from pip_agent.agent_host import _agent_id_from_session_key
+
+        assert _agent_id_from_session_key("") == ""
+        assert _agent_id_from_session_key("not-a-session-key") == ""
+        assert _agent_id_from_session_key("agent:") == ""
+
+
+class TestFlushAndRotate:
+    """On-exit reflect + session rotation.
+
+    The contract from docs/sdk-contract-notes.md §11.2 (Q5): reflect every
+    live session, persist observations, then clear the in-memory map so
+    the next launch mints fresh session ids.
+    """
+
+    def _build_host(self, tmp_path: Path, sessions: dict[str, str]):
+        """Minimal AgentHost assembled by hand — same trick as the other
+        test classes in this module. Avoids spinning a ChannelManager /
+        HostScheduler that ``flush_and_rotate`` doesn't touch anyway.
+        """
+        from types import SimpleNamespace
+
+        from pip_agent import agent_host as mod
+        from pip_agent.memory import MemoryStore
+
+        agents_dir = tmp_path / ".pip" / "agents"
+        (agents_dir / "pip-boy").mkdir(parents=True)
+        mem = MemoryStore(base_dir=agents_dir, agent_id="pip-boy")
+
+        host = SimpleNamespace(
+            _sessions=dict(sessions),
+            _agents={},
+            _get_agent_services=lambda aid: SimpleNamespace(memory_store=mem),
+        )
+        return host, mem, mod
+
+    def test_noop_when_no_sessions(self, tmp_path: Path):
+        import asyncio
+
+        host, _, _ = self._build_host(tmp_path, sessions={})
+
+        # Should return without touching anything — no network calls,
+        # no state writes. Running under asyncio.run also confirms we're
+        # actually awaitable.
+        asyncio.run(AgentHost.flush_and_rotate(host))
+
+        assert host._sessions == {}
+
+    def test_reflect_then_rotate_happy_path(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        import asyncio
+        from unittest.mock import MagicMock
+
+        sk = "agent:pip-boy:cli:peer:cli-user"
+        host, mem, mod = self._build_host(tmp_path, sessions={sk: "sid-123"})
+
+        save_calls: list[dict] = []
+        monkeypatch.setattr(
+            mod, "_save_sessions", lambda s: save_calls.append(dict(s)),
+        )
+        monkeypatch.setattr(
+            mod, "locate_session_jsonl", lambda _sid: tmp_path / "fake.jsonl",
+        )
+        monkeypatch.setattr(
+            "pip_agent.anthropic_client.build_anthropic_client",
+            lambda: object(),
+        )
+        fake_persist = MagicMock(return_value=(0, 100, 3))
+        monkeypatch.setattr(
+            "pip_agent.memory.reflect.reflect_and_persist", fake_persist,
+        )
+
+        asyncio.run(AgentHost.flush_and_rotate(host))
+
+        fake_persist.assert_called_once()
+        kwargs = fake_persist.call_args.kwargs
+        assert kwargs["session_id"] == "sid-123"
+        assert kwargs["memory_store"] is mem
+
+        # Rotation: sessions map must be empty AND persisted empty.
+        assert host._sessions == {}
+        assert save_calls and save_calls[-1] == {}
+
+    def test_missing_transcript_still_rotates(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        import asyncio
+        from unittest.mock import MagicMock
+
+        sk = "agent:pip-boy:cli:peer:cli-user"
+        host, _, mod = self._build_host(tmp_path, sessions={sk: "sid-123"})
+
+        save_calls: list[dict] = []
+        monkeypatch.setattr(
+            mod, "_save_sessions", lambda s: save_calls.append(dict(s)),
+        )
+        monkeypatch.setattr(mod, "locate_session_jsonl", lambda _sid: None)
+        monkeypatch.setattr(
+            "pip_agent.anthropic_client.build_anthropic_client",
+            lambda: object(),
+        )
+        fake_persist = MagicMock()
+        monkeypatch.setattr(
+            "pip_agent.memory.reflect.reflect_and_persist", fake_persist,
+        )
+
+        asyncio.run(AgentHost.flush_and_rotate(host))
+
+        fake_persist.assert_not_called()
+        assert host._sessions == {}
+        assert save_calls and save_calls[-1] == {}
+
+    def test_reflect_exception_does_not_block_rotation(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """A reflect crash on one session must still rotate all sessions.
+
+        The user typed /exit. Our job is to hand control back — not to
+        die on some unrelated LLM transport hiccup.
+        """
+        import asyncio
+
+        sk1 = "agent:pip-boy:cli:peer:user-a"
+        sk2 = "agent:pip-boy:cli:peer:user-b"
+        host, _, mod = self._build_host(
+            tmp_path, sessions={sk1: "sid-A", sk2: "sid-B"},
+        )
+
+        save_calls: list[dict] = []
+        monkeypatch.setattr(
+            mod, "_save_sessions", lambda s: save_calls.append(dict(s)),
+        )
+        monkeypatch.setattr(
+            mod, "locate_session_jsonl", lambda _sid: tmp_path / "x.jsonl",
+        )
+        monkeypatch.setattr(
+            "pip_agent.anthropic_client.build_anthropic_client",
+            lambda: object(),
+        )
+
+        calls: list[str] = []
+
+        def _persist(*, memory_store, session_id, transcript_path, client,
+                     model=""):
+            calls.append(session_id)
+            if session_id == "sid-A":
+                raise RuntimeError("simulated outage")
+            return (0, 50, 1)
+
+        monkeypatch.setattr(
+            "pip_agent.memory.reflect.reflect_and_persist", _persist,
+        )
+
+        asyncio.run(AgentHost.flush_and_rotate(host))
+
+        # Both sessions were attempted (one failed, one succeeded).
+        assert set(calls) == {"sid-A", "sid-B"}
+        # Rotation happened regardless.
+        assert host._sessions == {}
+        assert save_calls and save_calls[-1] == {}
+
+    def test_no_credentials_skips_reflect_but_still_rotates(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        import asyncio
+        from unittest.mock import MagicMock
+
+        sk = "agent:pip-boy:cli:peer:cli-user"
+        host, _, mod = self._build_host(tmp_path, sessions={sk: "sid-X"})
+
+        save_calls: list[dict] = []
+        monkeypatch.setattr(
+            mod, "_save_sessions", lambda s: save_calls.append(dict(s)),
+        )
+        monkeypatch.setattr(
+            "pip_agent.anthropic_client.build_anthropic_client",
+            lambda: None,
+        )
+        fake_persist = MagicMock()
+        monkeypatch.setattr(
+            "pip_agent.memory.reflect.reflect_and_persist", fake_persist,
+        )
+
+        asyncio.run(AgentHost.flush_and_rotate(host))
+
+        # Without credentials reflect is never called — but rotation
+        # MUST still happen so next launch starts fresh.
+        fake_persist.assert_not_called()
+        assert host._sessions == {}
+        assert save_calls and save_calls[-1] == {}
+
+
+class TestReflectAndPersist:
+    """Shared state-aware wrapper — used by PreCompact, /exit, and MCP."""
+
+    def _store(self, tmp_path: Path):
+        from pip_agent.memory import MemoryStore
+
+        agents_dir = tmp_path / ".pip" / "agents"
+        (agents_dir / "pip-boy").mkdir(parents=True)
+        return MemoryStore(base_dir=agents_dir, agent_id="pip-boy")
+
+    def test_zero_delta_no_state_write(self, tmp_path: Path, monkeypatch):
+        from pip_agent.memory.reflect import (
+            OFFSET_STATE_KEY,
+            reflect_and_persist,
+        )
+
+        store = self._store(tmp_path)
+        store.save_state({OFFSET_STATE_KEY: {"sess": 42}})
+
+        monkeypatch.setattr(
+            "pip_agent.memory.reflect.reflect_from_jsonl",
+            lambda *a, **kw: (42, []),  # cursor unchanged, no obs
+        )
+
+        # Drop the save_state so we can detect any spurious write.
+        writes: list[dict] = []
+        original_save = store.save_state
+        store.save_state = lambda s: (writes.append(dict(s)), original_save(s))  # type: ignore[method-assign]
+
+        start, end, n = reflect_and_persist(
+            memory_store=store,
+            session_id="sess",
+            transcript_path=tmp_path / "nope.jsonl",
+            client=object(),
+        )
+
+        assert (start, end, n) == (42, 42, 0)
+        # The zero-delta branch must NOT call save_state — otherwise we
+        # churn state.json on every idle PreCompact.
+        assert writes == []
+
+    def test_observations_persisted_and_cursor_advanced(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from pip_agent.memory.reflect import (
+            OFFSET_STATE_KEY,
+            reflect_and_persist,
+        )
+
+        store = self._store(tmp_path)
+
+        monkeypatch.setattr(
+            "pip_agent.memory.reflect.reflect_from_jsonl",
+            lambda *a, **kw: (
+                200,
+                [{
+                    "ts": 1.0, "text": "user prefers terse replies",
+                    "category": "preference", "source": "auto",
+                }],
+            ),
+        )
+
+        start, end, n = reflect_and_persist(
+            memory_store=store,
+            session_id="sess",
+            transcript_path=tmp_path / "x.jsonl",
+            client=object(),
+        )
+
+        assert (start, end, n) == (0, 200, 1)
+        assert store.load_state()[OFFSET_STATE_KEY]["sess"] == 200
+        # Observation actually written to disk.
+        assert store.load_all_observations()
+
+    def test_failure_contract_cursor_not_advanced(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Q8: if ``reflect_from_jsonl`` returns (start, []) — e.g. because
+        the LLM raised — we must not advance the cursor.
+
+        The helper relies on the core's "advance-only" contract; this
+        locks in that the wrapper doesn't paper over it with a stray
+        state write.
+        """
+        from pip_agent.memory.reflect import (
+            OFFSET_STATE_KEY,
+            reflect_and_persist,
+        )
+
+        store = self._store(tmp_path)
+        store.save_state({OFFSET_STATE_KEY: {"sess": 10}})
+
+        monkeypatch.setattr(
+            "pip_agent.memory.reflect.reflect_from_jsonl",
+            lambda *a, **kw: (10, []),  # transport failure simulation
+        )
+
+        start, end, n = reflect_and_persist(
+            memory_store=store,
+            session_id="sess",
+            transcript_path=tmp_path / "x.jsonl",
+            client=object(),
+        )
+
+        assert (start, end, n) == (10, 10, 0)
+        # Cursor is exactly where we left it — next trigger retries.
+        assert store.load_state()[OFFSET_STATE_KEY]["sess"] == 10
