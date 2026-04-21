@@ -309,3 +309,82 @@ class TestIsEphemeralSender:
     )
     def test_everything_else_keeps_session(self, sender):
         assert _is_ephemeral_sender(sender) is False
+
+
+class TestReapStaleSession:
+    """Regression: deleting a session JSONL must not fatal the next turn.
+
+    Before this check, passing a dead session id into
+    ``run_query(resume=...)`` made the CC subprocess exit 1, which the
+    SDK surfaced as ``ClaudeSDKError: Command failed with exit code 1``
+    and the user saw a fatal error the moment they typed anything after
+    hand-deleting a stale JSONL (or after CC's ``/clear``). Self-heal
+    contract: the id silently drops, next turn starts fresh.
+    """
+
+    def _host(self, sessions: dict[str, str]) -> object:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(_sessions=dict(sessions))
+
+    def test_live_session_is_returned_untouched(self, monkeypatch, tmp_path):
+        import pip_agent.agent_host as mod
+
+        jsonl = tmp_path / "live.jsonl"
+        jsonl.write_text("{}", "utf-8")
+        monkeypatch.setattr(mod, "locate_session_jsonl", lambda sid: jsonl)
+        save_calls: list[dict] = []
+        monkeypatch.setattr(
+            mod, "_save_sessions", lambda s: save_calls.append(dict(s)),
+        )
+
+        host = self._host({"agent:pip:cli:peer:u": "live-uuid"})
+        result = AgentHost._reap_stale_session(host, "agent:pip:cli:peer:u")
+
+        assert result == "live-uuid"
+        assert host._sessions == {"agent:pip:cli:peer:u": "live-uuid"}
+        assert save_calls == []  # no persistence churn on the happy path
+
+    def test_missing_session_is_dropped_and_persisted(
+        self, monkeypatch, caplog,
+    ):
+        import pip_agent.agent_host as mod
+
+        monkeypatch.setattr(mod, "locate_session_jsonl", lambda sid: None)
+        save_calls: list[dict] = []
+        monkeypatch.setattr(
+            mod, "_save_sessions", lambda s: save_calls.append(dict(s)),
+        )
+
+        host = self._host({
+            "agent:pip:cli:peer:u": "dead-uuid",
+            "agent:pip:cli:peer:other": "keep-uuid",
+        })
+
+        with caplog.at_level("WARNING", logger="pip_agent.agent_host"):
+            result = AgentHost._reap_stale_session(host, "agent:pip:cli:peer:u")
+
+        assert result is None
+        assert host._sessions == {"agent:pip:cli:peer:other": "keep-uuid"}
+        assert save_calls == [{"agent:pip:cli:peer:other": "keep-uuid"}]
+        assert any(
+            "missing on disk" in rec.message for rec in caplog.records
+        )
+
+    def test_no_session_in_map_is_noop(self, monkeypatch):
+        import pip_agent.agent_host as mod
+
+        def _boom(_sid):  # locate must not be called if there's no id
+            raise AssertionError("locate_session_jsonl should be skipped")
+
+        monkeypatch.setattr(mod, "locate_session_jsonl", _boom)
+        save_calls: list[dict] = []
+        monkeypatch.setattr(
+            mod, "_save_sessions", lambda s: save_calls.append(dict(s)),
+        )
+
+        host = self._host({})
+        result = AgentHost._reap_stale_session(host, "agent:pip:cli:peer:u")
+
+        assert result is None
+        assert save_calls == []

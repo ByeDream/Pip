@@ -32,6 +32,7 @@ from pip_agent.config import WORKDIR, settings
 from pip_agent.host_scheduler import HostScheduler
 from pip_agent.mcp_tools import McpContext
 from pip_agent.memory import MemoryStore
+from pip_agent.memory.transcript_source import locate_session_jsonl
 from pip_agent.routing import (
     AgentRegistry,
     Binding,
@@ -234,6 +235,35 @@ class AgentHost:
             self._agents[agent_id] = _PerAgent(memory_store=ms)
         return self._agents[agent_id]
 
+    def _reap_stale_session(self, sk: str) -> str | None:
+        """Return the session id for ``sk`` iff its JSONL is still on disk.
+
+        A user can delete the JSONL out from under us — either by hand
+        (happens) or by CC's own ``/clear`` (also happens). The in-memory
+        ``_sessions`` map has no way to know the id went dead. Passing a dead
+        id into ``run_query(resume=...)`` makes the CC subprocess print
+        ``No conversation found with session ID: <uuid>``, exit 1, and the
+        SDK surfaces that as a ``ClaudeSDKError`` that kills the whole turn.
+        From the user's seat: "我发一句你好就爆 fatal error".
+
+        Pre-flight the glob once per turn. If the file is gone, drop the id
+        from the map and persist, so this turn (and subsequent ones) start
+        fresh. ``locate_session_jsonl`` is a single directory glob — cheap
+        even with a large ``projects/`` root.
+        """
+        sid = self._sessions.get(sk)
+        if not sid:
+            return None
+        if locate_session_jsonl(sid) is not None:
+            return sid
+        log.warning(
+            "Session %s for %s is missing on disk — starting fresh",
+            sid, sk,
+        )
+        self._sessions.pop(sk, None)
+        _save_sessions(self._sessions)
+        return None
+
     def _build_mcp_ctx(
         self,
         svc: _PerAgent,
@@ -303,7 +333,7 @@ class AgentHost:
         if inbound.channel == "wechat" and isinstance(ch, WeChatChannel):
             ch.send_typing(inbound.peer_id)
 
-        current_session = self._sessions.get(sk)
+        current_session = self._reap_stale_session(sk)
         is_heartbeat = inbound.sender_id == _HEARTBEAT_SENDER
         # Scheduler-injected senders skip SDK session persistence —
         # see :func:`_is_ephemeral_sender` for the full rationale and
