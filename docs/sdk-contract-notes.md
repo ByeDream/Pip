@@ -296,14 +296,16 @@ contract in `agent_host.py`.
 
 ### 11.4 What has to change
 
-| Area | Change |
-|---|---|
-| `memory/reflect.py` | Prompt rewrite — cap at 5 observations, lock the `{ts, text, category, source}` shape (this is already what the function returns — just make the prompt side match so the LLM can't surprise us). Add the Q7 explicit entry short-circuit + a unit test "reflect called twice back-to-back doesn't call the LLM the second time". Add the Q8 unit test "LLM exception leaves `start_offset` untouched in the returned tuple". |
-| `agent_host.py` | On `/exit`: call reflect synchronously before teardown (re-using the same `reflect_from_jsonl` path PreCompact uses, not a divergent copy). |
-| `agent_host.py` | After reflect: rotate SDK session (new `session_id`, archive old JSONL path), update `_sessions[sk]`. (Q5) |
-| `host_scheduler.py` | Re-introduce **idle-hour Dream trigger** (observations → memories → axioms — this is what the old `DREAM_HOUR` logic ran). Enqueue a `__cron__` inbound when `now.hour ∈ [DREAM_HOUR_START, DREAM_HOUR_END]` AND `len(observations) ≥ DREAM_MIN_OBS` AND `idle ≥ DREAM_INACTIVE_MINUTES`. Dream does NOT call reflect — reflect is upstream and already populated observations.jsonl by the time Dream runs. |
-| `config.py` | Resurrect `dream_hour_start` / `dream_min_observations` / `dream_inactive_minutes` (currently dead text in `env.example`). No new reflect-related settings — PreCompact + /exit don't need tunables. |
-| `hooks.py` | No change. PreCompact is already wired correctly (`_pre_compact_hook`). |
+Implementation status (Apr 2026):
+
+| Area | Change | Status |
+|---|---|---|
+| `memory/reflect.py` | Prompt rewrite — cap at 5, explicit Q7 entry short-circuit, Q8 unit tests. Hard Python cap at `_MAX_OBSERVATIONS_PER_PASS=5`. | ✅ done |
+| `memory/reflect.py` | Extract `reflect_and_persist` helper (state-key, advance-only cursor, observation persistence) so PreCompact, /exit, and the reflect MCP tool all share one implementation. Public constant `OFFSET_STATE_KEY`. | ✅ done |
+| `agent_host.py` | `flush_and_rotate()` — on /exit: reflect every live session, then clear `_sessions` unconditionally. Reflect runs on `asyncio.to_thread`; failure on one session does not block rotation of the others. | ✅ done |
+| `host_scheduler.py` | Revive idle-hour Dream trigger — 5 gates (window, in-flight, same-window re-entry via state, min observations, idle minutes), one-shot daemon-thread worker so the 5 s tick keeps flowing across the 30–90 s consolidate+distill pass. Guard is always released in `finally`. | ✅ done |
+| `config.py` | `dream_hour_start` / `dream_hour_end` / `dream_min_observations` / `dream_inactive_minutes` settings, documented in `env.example` with the full trigger contract. | ✅ done |
+| `hooks.py` | No change — PreCompact already wired. Refactored to call the new `reflect_and_persist` shared helper. | ✅ done |
 
 ### 11.5 Explicitly out of scope (for now)
 
