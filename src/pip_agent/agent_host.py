@@ -312,12 +312,20 @@ class AgentHost:
         # 3 min one over the course of a day. ``stream_text=not is_heartbeat``
         # remains a separate concern (HEARTBEAT_OK silencing).
         is_ephemeral = _is_ephemeral_sender(inbound.sender_id)
+        # Two distinct concepts, intentionally decoupled:
+        #
+        # * ``session_for_turn`` controls SDK *resume* — whether this turn's
+        #   context is built from an existing JSONL. ``None`` for ephemeral
+        #   senders so cron / heartbeat don't load and don't append.
+        # * ``ctx_session_id`` is the session id made visible to Pip-Boy's
+        #   own MCP tools (``reflect`` in particular). It must point at the
+        #   *user's* session JSONL even for ephemeral turns, because the
+        #   whole point of an "at 2 am run reflect" cron is for that cron
+        #   to process the user conversation that the cron itself never
+        #   participated in. Zeroing this out would silently break
+        #   cron-driven memory maintenance.
         session_for_turn: str | None = None if is_ephemeral else current_session
-        # mcp_ctx carries the session_id to the ``reflect`` MCP tool so
-        # it can locate the JSONL. For ephemeral turns reflect would skip
-        # anyway (no session → no transcript), but we pass an empty
-        # string to be explicit and keep the two layers in sync.
-        ctx_session_id = "" if is_ephemeral else (current_session or "")
+        ctx_session_id = current_session or ""
 
         mcp_ctx = self._build_mcp_ctx(
             svc, eff.effective_model, inbound.sender_id,
