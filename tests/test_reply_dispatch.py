@@ -60,9 +60,7 @@ class TestHeartbeatSentinelSilencing:
         "HEARTBEAT OK",
         "Heartbeat-Ok",
     ])
-    def test_sentinel_variants_are_swallowed(self, text, capsys, caplog, monkeypatch):
-        from pip_agent import agent_host
-        monkeypatch.setattr(agent_host.settings, "verbose", False)
+    def test_sentinel_variants_are_swallowed(self, text, capsys, caplog):
         caplog.set_level("INFO")
 
         AgentHost._dispatch_reply(
@@ -75,12 +73,12 @@ class TestHeartbeatSentinelSilencing:
         assert capsys.readouterr().out == "", f"expected silent stdout for {text!r}"
         assert any("heartbeat sentinel" in r.message.lower() for r in caplog.records)
 
-    def test_substantive_heartbeat_reply_goes_to_cli(self, capsys, monkeypatch):
+    def test_substantive_heartbeat_reply_goes_to_cli(self, capsys):
         # A heartbeat saying "hey, you have 3 uncommitted files" must NOT be
-        # silenced — that is the whole value of heartbeats.
-        from pip_agent import agent_host
-        monkeypatch.setattr(agent_host.settings, "verbose", False)
-
+        # silenced — that is the whole value of heartbeats. ``process_inbound``
+        # calls ``run_query`` with ``stream_text=False`` for heartbeats so the
+        # sentinel can be post-filtered, which means dispatch is the sole
+        # source of heartbeat output and must print the full text itself.
         AgentHost._dispatch_reply(
             inbound=_heartbeat(),
             result=QueryResult(text="You have 3 uncommitted files on main."),
@@ -91,36 +89,8 @@ class TestHeartbeatSentinelSilencing:
         out = capsys.readouterr().out
         assert "3 uncommitted files" in out
 
-    def test_substantive_heartbeat_reply_prints_in_verbose_mode(
-        self, capsys, monkeypatch,
-    ):
-        # Regression: when the host runs with VERBOSE=true, user-input text is
-        # streamed by agent_runner so dispatch only appends a newline. Heartbeat
-        # replies are DIFFERENT — ``process_inbound`` disables streaming for
-        # them (so the sentinel can be silenced) which means dispatch is the
-        # sole source of output. Previously this branch called ``print()`` and
-        # swallowed the text; the bug was "HEARTBEAT_OK" leaking four times per
-        # minute to the CLI when the user tried the short-interval test.
-        from pip_agent import agent_host
-        monkeypatch.setattr(agent_host.settings, "verbose", True)
-
-        AgentHost._dispatch_reply(
-            inbound=_heartbeat(),
-            result=QueryResult(text="Reminder: standup in 10 min."),
-            ch=None,
-            reply_peer="cli-user",
-            session_key="k",
-        )
-        out = capsys.readouterr().out
-        assert "standup in 10 min" in out
-
-    def test_heartbeat_reply_with_ok_as_substring_is_not_swallowed(
-        self, capsys, monkeypatch,
-    ):
+    def test_heartbeat_reply_with_ok_as_substring_is_not_swallowed(self, capsys):
         # Word "ok" appearing inside a real message must not match the sentinel.
-        from pip_agent import agent_host
-        monkeypatch.setattr(agent_host.settings, "verbose", False)
-
         AgentHost._dispatch_reply(
             inbound=_heartbeat(),
             result=QueryResult(text="Everything ok, but HEARTBEAT_OK? no, say hi."),
@@ -195,11 +165,14 @@ class TestHeartbeatSentinelSilencing:
 
 
 class TestCliReply:
-    def test_user_text_reaches_stdout(self, capsys, monkeypatch):
-        # Make sure verbose mode isn't hiding the expected branch.
-        from pip_agent import agent_host
-        monkeypatch.setattr(agent_host.settings, "verbose", False)
-
+    def test_user_text_terminates_line_without_reprinting(self, capsys):
+        # Non-heartbeat CLI text is streamed live by ``agent_runner`` via
+        # ``TextBlock`` — by the time ``_dispatch_reply`` runs, every
+        # character is already on stdout. Re-printing ``result.text`` here
+        # would show the reply twice. Dispatch therefore only emits a
+        # terminating newline so the next ``>>>`` prompt starts on a fresh
+        # line. This test locks that contract: *don't* re-print, *do*
+        # produce a newline.
         AgentHost._dispatch_reply(
             inbound=_cli_user(),
             result=QueryResult(text="Hello!"),
@@ -208,7 +181,11 @@ class TestCliReply:
             session_key="k",
         )
         out = capsys.readouterr().out
-        assert "Hello!" in out
+        assert "Hello!" not in out, (
+            "dispatch must not re-print streamed text — streaming happens "
+            "upstream in agent_runner"
+        )
+        assert out == "\n", f"expected a lone newline, got {out!r}"
 
     def test_user_error_reaches_stdout(self, capsys):
         AgentHost._dispatch_reply(
@@ -244,10 +221,13 @@ class TestRemoteChannel:
 
 
 class TestCronNotSilenced:
-    def test_cron_text_goes_through_cli(self, capsys, monkeypatch):
-        from pip_agent import agent_host
-        monkeypatch.setattr(agent_host.settings, "verbose", False)
-
+    def test_cron_text_does_not_reprint_streamed_content(self, capsys):
+        # Cron inbounds go through ``run_query`` with streaming enabled (same
+        # path as a regular user message — only heartbeats disable stream).
+        # Dispatch therefore must NOT re-print text but must still emit a
+        # trailing newline so cron output doesn't collide with the next
+        # prompt. Silencing cron entirely would defeat the whole point of
+        # the scheduler.
         AgentHost._dispatch_reply(
             inbound=_cron(),
             result=QueryResult(text="Daily report ready"),
@@ -256,7 +236,10 @@ class TestCronNotSilenced:
             session_key="k",
         )
         out = capsys.readouterr().out
-        assert "Daily report ready" in out
+        assert "Daily report ready" not in out, (
+            "cron text was streamed upstream; re-printing here duplicates it"
+        )
+        assert out == "\n"
 
     def test_cron_text_goes_through_remote_channel(self, monkeypatch):
         sent: list[tuple[str, str]] = []

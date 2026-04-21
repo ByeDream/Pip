@@ -85,8 +85,7 @@ async def run_query(
     session_id: str | None = None,
     system_prompt_append: str = "",
     cwd: str | Path | None = None,
-    verbose: bool = False,
-    stream_text: bool | None = None,
+    stream_text: bool = True,
 ) -> QueryResult:
     """Run a single agent turn via the Claude Agent SDK.
 
@@ -106,18 +105,24 @@ async def run_query(
         memory enrichment, and user profile context.
     cwd:
         Working directory for the agent.
-    verbose:
-        If True, show tool-use traces on stdout. Also gates the default
-        value of ``stream_text`` when the caller does not pass it.
     stream_text:
-        If True, stream ``TextBlock`` content to stdout as it arrives. Defaults
-        to ``verbose``. Callers that need to post-process the final text
-        (e.g. ``AgentHost`` silencing the ``HEARTBEAT_OK`` sentinel) must pass
-        ``False`` — once characters are on the wire there is nothing the host
-        can do to unprint them.
+        If True (default), stream ``TextBlock`` content to stdout as it
+        arrives — the normal interactive-CLI experience. Callers that need
+        to post-process the final text (e.g. ``AgentHost`` silencing the
+        ``HEARTBEAT_OK`` sentinel) must pass ``False`` — once characters are
+        on the wire there is nothing the host can do to unprint them.
+
+    Notes
+    -----
+    Tool-use traces (``[tool: NAME {...}]``) and the ``Session:`` / ``Done:``
+    summary logs are *always* emitted. They are part of the interactive CLI
+    contract, not debug-only output. If you want them quiet, lower the
+    logger level globally (``VERBOSE=false`` ⇒ root at WARNING, which drops
+    the two ``log.info`` calls below; the ``print`` for tool-use has no
+    logger gate because a user staring at a silent 30-second tool-chain
+    cannot tell the difference between "agent is thinking" and "agent
+    crashed").
     """
-    if stream_text is None:
-        stream_text = verbose
     mcp_server = build_mcp_server(mcp_ctx)
     effective_cwd = str(cwd) if cwd else str(mcp_ctx.workdir)
 
@@ -152,10 +157,12 @@ async def run_query(
                 for block in message.content:
                     if isinstance(block, TextBlock) and stream_text:
                         print(block.text, end="", flush=True)
-                    elif isinstance(block, ToolUseBlock) and verbose:
-                        # Surface tool calls so CLI users can see whether the
-                        # agent actually reached for ``memory_search`` /
-                        # ``Bash`` / etc. — text-only streaming hid this.
+                    elif isinstance(block, ToolUseBlock):
+                        # Tool-use traces are always surfaced: a user staring
+                        # at a silent 30-second tool-chain cannot distinguish
+                        # "agent is thinking" from "agent crashed". This is a
+                        # UX contract, not debug output — do NOT gate on
+                        # ``VERBOSE``.
                         args_preview = str(block.input)[:80]
                         print(
                             f"\n  [tool: {block.name} {args_preview}]",
@@ -165,8 +172,7 @@ async def run_query(
             elif isinstance(message, SystemMessage):
                 if message.subtype == "init":
                     result.session_id = message.data.get("session_id")
-                    if verbose:
-                        log.info("Session: %s", result.session_id)
+                    log.info("Session: %s", result.session_id)
 
             elif isinstance(message, ResultMessage):
                 result.text = message.result
@@ -175,13 +181,12 @@ async def run_query(
                 result.num_turns = message.num_turns
                 if message.is_error:
                     result.error = message.result
-                if verbose:
-                    log.info(
-                        "Done: turns=%d cost=$%.4f stop=%s",
-                        message.num_turns,
-                        message.total_cost_usd or 0,
-                        message.stop_reason,
-                    )
+                log.info(
+                    "Done: turns=%d cost=$%.4f stop=%s",
+                    message.num_turns,
+                    message.total_cost_usd or 0,
+                    message.stop_reason,
+                )
 
     except ClaudeSDKError as exc:
         result.error = str(exc)

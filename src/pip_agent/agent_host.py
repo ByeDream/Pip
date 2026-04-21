@@ -268,12 +268,12 @@ class AgentHost:
                     session_id=current_session,
                     system_prompt_append=system_prompt,
                     cwd=WORKDIR,
-                    verbose=settings.verbose,
                     # Heartbeats must NOT stream: we need to inspect the full
-                    # reply before deciding whether to print (so we can silence
-                    # the HEARTBEAT_OK sentinel). Tool-use traces still show
-                    # under ``verbose`` via ``run_query``.
-                    stream_text=settings.verbose and not is_heartbeat,
+                    # reply before deciding whether to print (so we can
+                    # silence the HEARTBEAT_OK sentinel). Everything else
+                    # streams unconditionally — streaming is an interactive
+                    # contract, not a debug toggle.
+                    stream_text=not is_heartbeat,
                 )
             except Exception as exc:
                 log.error("SDK query failed for %s: %s", sk, exc)
@@ -342,10 +342,13 @@ class AgentHost:
 
         if result.text:
             if inbound.channel == "cli":
-                # Heartbeats never stream (see docstring), so print full text.
-                # User/cron inbounds in verbose mode were already streamed by
-                # agent_runner — just terminate the line.
-                if is_heartbeat or not settings.verbose:
+                # Heartbeats never stream (see docstring), so dispatch is the
+                # sole source of their output — print full text. User / cron
+                # inbounds were streamed live by ``agent_runner`` regardless
+                # of VERBOSE (streaming is an interactive UX contract, not a
+                # debug toggle), so dispatch only needs to terminate the
+                # line before the next ``>>>`` prompt.
+                if is_heartbeat:
                     print(f"\n{result.text}")
                 else:
                     print()

@@ -39,7 +39,12 @@ class Settings(BaseSettings):
     anthropic_auth_token: str = Field(default="")
     anthropic_base_url: str = Field(default="")
 
-    verbose: bool = Field(default=True)
+    # Controls *only* the logging threshold — see
+    # ``pip_agent.__main__._configure_logging``. Streaming agent replies
+    # and ``[tool: ...]`` traces are part of the interactive CLI contract
+    # and are NOT gated by this flag. Flip to ``true`` when you need the
+    # internal log firehose (scheduler ticks, memory pipeline, SDK init).
+    verbose: bool = Field(default=False)
 
     wecom_bot_id: str = Field(default="")
     wecom_bot_secret: str = Field(default="")
