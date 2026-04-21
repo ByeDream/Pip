@@ -103,6 +103,13 @@ class InboundMessage:
     agent_id: str = ""          # routing override: skip binding_table.resolve
     raw: dict = field(default_factory=dict)
     attachments: list[Attachment] = field(default_factory=list)
+    # Host-scheduler coalescing key. Empty for user/channel messages. For
+    # scheduler-injected payloads it identifies the "logical job" so
+    # :class:`HostScheduler` can refuse to stack a second copy on the queue
+    # while the first is still pending or in flight. ``AgentHost`` must call
+    # ``scheduler.ack(source_job_id)`` after processing so subsequent ticks
+    # can re-enqueue. See ``host_scheduler._pending_key_*`` for the format.
+    source_job_id: str = ""
 
 
 # ---------------------------------------------------------------------------

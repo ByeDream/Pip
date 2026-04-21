@@ -13,6 +13,7 @@ import logging
 import re
 import sys
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 from pip_agent.agent_runner import QueryResult, run_query
@@ -80,6 +81,40 @@ _LEADING_AT_RE = re.compile(r"^@\S*\s*")
 # message. Kept in sync with ``host_scheduler._Sender``.
 _CRON_SENDER = "__cron__"
 _HEARTBEAT_SENDER = "__heartbeat__"
+
+
+@dataclass
+class _NullTracked:
+    """Placeholder for the ``scheduler.track`` yielded value when no
+    scheduler is wired in (test harnesses, a future lean-mode host).
+
+    Keeps :meth:`AgentHost.process_inbound` uniform: it always has a
+    ``tracked.failure()`` call site, regardless of whether the scheduler is
+    actually present. Without this sentinel, every call site would need a
+    separate ``if scheduler is not None`` branch and we'd be right back
+    to implicit-contract territory.
+    """
+
+    def failure(self, message: str = "") -> None:
+        return None
+
+
+def _inbound_sort_key(inbound: InboundMessage) -> tuple[int, int]:
+    """Sort key that bubbles user / channel messages ahead of scheduler ones.
+
+    Order within each tier is stable (all zeros), so FIFO is preserved.
+    Tiers:
+
+    * 0 — human- or channel-originated (CLI users, WeChat, WeCom).
+    * 1 — cron jobs.
+    * 2 — heartbeats (lowest priority — they are background keepalives
+      whose only job is to exist *when nothing else is happening*).
+    """
+    if inbound.sender_id == _HEARTBEAT_SENDER:
+        return (2, 0)
+    if inbound.sender_id == _CRON_SENDER:
+        return (1, 0)
+    return (0, 0)
 
 # "Nothing to report" sentinel documented in ``scaffold/heartbeat.md``. When the
 # heartbeat reply matches this (case-insensitive, tolerant of common wrappers
@@ -259,39 +294,58 @@ class AgentHost:
 
         is_heartbeat = inbound.sender_id == _HEARTBEAT_SENDER
 
-        async with self._semaphore:
-            try:
-                result: QueryResult = await run_query(
-                    prompt=prompt,
-                    mcp_ctx=mcp_ctx,
-                    model=eff.effective_model,
-                    session_id=current_session,
-                    system_prompt_append=system_prompt,
-                    cwd=WORKDIR,
-                    # Heartbeats must NOT stream: we need to inspect the full
-                    # reply before deciding whether to print (so we can
-                    # silence the HEARTBEAT_OK sentinel). Everything else
-                    # streams unconditionally — streaming is an interactive
-                    # contract, not a debug toggle.
-                    stream_text=not is_heartbeat,
-                )
-            except Exception as exc:
-                log.error("SDK query failed for %s: %s", sk, exc)
-                if ch:
-                    send_with_retry(ch, reply_peer, f"[error] {exc}")
-                return
-
-        if result.session_id:
-            self._sessions[sk] = result.session_id
-            _save_sessions(self._sessions)
-
-        self._dispatch_reply(
-            inbound=inbound,
-            result=result,
-            ch=ch,
-            reply_peer=reply_peer,
-            session_key=sk,
+        # ``track`` owns the scheduler-side bookkeeping: coalesce-key
+        # release on exit (so the next tick can fire again) and cron
+        # ``consecutive_errors`` accounting. It is a no-op for inbounds
+        # without a ``source_job_id`` (user / channel messages), so we
+        # wrap every inbound unconditionally. See
+        # :meth:`HostScheduler.track` for the contract.
+        tracker = (
+            self._scheduler.track(inbound)
+            if self._scheduler is not None
+            else nullcontext(_NullTracked())
         )
+        with tracker as tracked:
+            async with self._semaphore:
+                try:
+                    result: QueryResult = await run_query(
+                        prompt=prompt,
+                        mcp_ctx=mcp_ctx,
+                        model=eff.effective_model,
+                        session_id=current_session,
+                        system_prompt_append=system_prompt,
+                        cwd=WORKDIR,
+                        # Heartbeats must NOT stream: we need to inspect the
+                        # full reply before deciding whether to print (so we
+                        # can silence the HEARTBEAT_OK sentinel). Everything
+                        # else streams unconditionally — streaming is an
+                        # interactive contract, not a debug toggle.
+                        stream_text=not is_heartbeat,
+                    )
+                except Exception as exc:
+                    log.error("SDK query failed for %s: %s", sk, exc)
+                    tracked.failure(f"SDK query failed: {exc}")
+                    if ch:
+                        send_with_retry(ch, reply_peer, f"[error] {exc}")
+                    return
+
+            if result.error:
+                # Soft failure — ``run_query`` returned normally but the
+                # SDK reported a tool / API error. Count it toward the
+                # cron auto-disable streak just like a raised exception.
+                tracked.failure(result.error)
+
+            if result.session_id:
+                self._sessions[sk] = result.session_id
+                _save_sessions(self._sessions)
+
+            self._dispatch_reply(
+                inbound=inbound,
+                result=result,
+                ch=ch,
+                reply_peer=reply_peer,
+                session_key=sk,
+            )
 
     @staticmethod
     def _dispatch_reply(
@@ -366,9 +420,12 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
 
     Starts channel threads, then enters an asyncio event loop that processes
     inbound messages through the SDK agent.
+
+    UTF-8 console setup (for Windows CJK input) is not done here — it must
+    happen *before* :mod:`logging` is configured, so
+    :func:`pip_agent.console_io.force_utf8_console` is called from
+    ``__main__.main()`` instead. See that module's docstring for why.
     """
-    sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-    sys.stdin.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
 
     from pip_agent.scaffold import ensure_workspace
 
@@ -505,6 +562,14 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
                 batch = msg_queue[:]
                 msg_queue.clear()
 
+            # User-originated messages go first. With the scheduler's new
+            # coalescing there is at most one in-flight cron/heartbeat per
+            # key at a time, but if the user types while a batch has a cron
+            # payload in it we still want the human message to run ahead of
+            # the keepalive.
+            if batch:
+                batch.sort(key=_inbound_sort_key)
+
             tasks = []
             for inbound in batch:
                 # Only real interactive CLI input can terminate the host; a
@@ -516,6 +581,13 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
                 ):
                     stop_event.set()
                     break
+                log.info(
+                    "Picked up %s from %s/%s: %r",
+                    inbound.sender_id,
+                    inbound.channel,
+                    inbound.peer_id,
+                    inbound.text[:80],
+                )
                 tasks.append(
                     loop.create_task(host.process_inbound(inbound)),
                 )

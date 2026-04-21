@@ -15,7 +15,9 @@ from unittest.mock import patch
 
 from pip_agent.channels import InboundMessage
 from pip_agent.host_scheduler import (
+    _CRON_AUTO_DISABLE_THRESHOLD,
     HostScheduler,
+    _HeartbeatState,
     _in_active_window,
     _next_cron_fire,
     _next_fire_at,
@@ -256,7 +258,12 @@ class TestHeartbeatTick:
         (tmp_path / "agents" / "pip-boy" / "HEARTBEAT.md").write_text(
             "check memory", encoding="utf-8",
         )
-        sched._tick(time.time())
+        # Pre-seed state so the first tick is past the interval — otherwise
+        # the "don't fire on startup" guard (see ``_HeartbeatState`` docstring)
+        # swallows tick #1.
+        now = time.time()
+        sched._heartbeat_state["pip-boy"] = _HeartbeatState(last_fire_at=now - 120)
+        sched._tick(now)
         assert len(queue) == 1
         assert queue[0].sender_id == _Sender.HEARTBEAT
         assert queue[0].text == "check memory"
@@ -270,8 +277,10 @@ class TestHeartbeatTick:
         (tmp_path / "agents" / "pip-boy" / "HEARTBEAT.md").write_text(
             "ping", encoding="utf-8",
         )
-        sched._tick(time.time())
-        sched._tick(time.time())  # same tick, no double-fire
+        now = time.time()
+        sched._heartbeat_state["pip-boy"] = _HeartbeatState(last_fire_at=now - 120)
+        sched._tick(now)
+        sched._tick(now)  # same tick, no double-fire
         assert len(queue) == 1
 
     @patch("pip_agent.host_scheduler.settings")
@@ -286,3 +295,350 @@ class TestHeartbeatTick:
         early = datetime(2026, 4, 20, 3, 0, 0).timestamp()
         sched._tick(early)
         assert queue == []
+
+    @patch("pip_agent.host_scheduler.settings")
+    def test_heartbeat_does_not_fire_on_first_tick(
+        self, mock_settings, tmp_path: Path
+    ):
+        """Regression: the first tick after startup must NOT fire the heartbeat.
+
+        Cold-start SDK latency (subprocess spawn + JSONL transcript load) can
+        be 30-90 s. If the heartbeat fires on tick #1 it front-runs the user's
+        first message and burns that latency on a keepalive. ``_HeartbeatState``
+        seeds ``last_fire_at`` with the current time to keep tick #1 quiet.
+        """
+        mock_settings.heartbeat_interval = 60
+        mock_settings.heartbeat_active_start = 0
+        mock_settings.heartbeat_active_end = 24
+        sched, queue, _ = _make_sched(tmp_path)
+        (tmp_path / "agents" / "pip-boy" / "HEARTBEAT.md").write_text(
+            "ping", encoding="utf-8",
+        )
+
+        sched._tick(time.time())
+
+        assert queue == []
+        # State must exist so tick #2 computes the interval from real elapsed.
+        assert "pip-boy" in sched._heartbeat_state
+
+    @patch("pip_agent.host_scheduler.settings")
+    def test_heartbeat_fires_after_interval_on_second_tick(
+        self, mock_settings, tmp_path: Path
+    ):
+        """Tick #2, once the interval has actually elapsed, must fire."""
+        mock_settings.heartbeat_interval = 60
+        mock_settings.heartbeat_active_start = 0
+        mock_settings.heartbeat_active_end = 24
+        sched, queue, _ = _make_sched(tmp_path)
+        (tmp_path / "agents" / "pip-boy" / "HEARTBEAT.md").write_text(
+            "ping", encoding="utf-8",
+        )
+        t0 = time.time()
+        sched._tick(t0)  # seeds state, does not fire
+        sched._tick(t0 + 61)  # interval elapsed — should fire
+
+        assert len(queue) == 1
+        assert queue[0].sender_id == _Sender.HEARTBEAT
+
+
+class TestCronCoalescing:
+    """Regression tests for the "every-30s job floods the queue" bug.
+
+    Without coalescing, a cron with ``every: 30s`` whose turn takes 40s
+    stacks one new payload per tick and buries any user message under N
+    copies of the same cron. The scheduler must refuse to enqueue while a
+    previous copy of the same job is either still in the queue or still
+    executing inside ``AgentHost.process_inbound``; :meth:`HostScheduler.ack`
+    is the handshake that releases the next fire.
+    """
+
+    def test_cron_message_carries_source_job_id(self, tmp_path: Path):
+        sched, queue, _ = _make_sched(tmp_path)
+        sched.add_job(
+            name="beep", schedule_kind="every", schedule_config={"seconds": 60},
+            message="ping", channel="cli", peer_id="cli-user",
+            sender_id="owner", agent_id="pip-boy",
+        )
+        jobs = sched._load_jobs("pip-boy")
+        jid = jobs[0]["id"]
+        jobs[0]["next_fire_at"] = time.time() - 1
+        sched._save_jobs("pip-boy", jobs)
+
+        sched._tick(time.time())
+
+        assert len(queue) == 1
+        assert queue[0].source_job_id == f"cron:{jid}"
+
+    def test_second_tick_coalesces_while_first_unacked(self, tmp_path: Path):
+        """No ack between fires → second fire is suppressed, queue stays at 1."""
+        sched, queue, _ = _make_sched(tmp_path)
+        sched.add_job(
+            name="beep", schedule_kind="every", schedule_config={"seconds": 1},
+            message="ping", channel="cli", peer_id="cli-user",
+            sender_id="owner", agent_id="pip-boy",
+        )
+        # Fire once.
+        jobs = sched._load_jobs("pip-boy")
+        jobs[0]["next_fire_at"] = time.time() - 1
+        sched._save_jobs("pip-boy", jobs)
+        sched._tick(time.time())
+        assert len(queue) == 1
+
+        # Simulate 2 seconds passing. The scheduler tick would normally
+        # enqueue again — but the host hasn't ack'd the first message yet.
+        jobs = sched._load_jobs("pip-boy")
+        jobs[0]["next_fire_at"] = time.time() - 1
+        sched._save_jobs("pip-boy", jobs)
+        sched._tick(time.time())
+
+        assert len(queue) == 1, "second tick must coalesce while first is pending"
+
+    def test_track_exit_releases_coalesce(self, tmp_path: Path):
+        """After ``with scheduler.track(inbound)`` exits, the next tick fires."""
+        sched, queue, _ = _make_sched(tmp_path)
+        sched.add_job(
+            name="beep", schedule_kind="every", schedule_config={"seconds": 1},
+            message="ping", channel="cli", peer_id="cli-user",
+            sender_id="owner", agent_id="pip-boy",
+        )
+        jobs = sched._load_jobs("pip-boy")
+        jid = jobs[0]["id"]
+        jobs[0]["next_fire_at"] = time.time() - 1
+        sched._save_jobs("pip-boy", jobs)
+        sched._tick(time.time())
+        assert len(queue) == 1
+
+        # Host "processed" it — release via the context manager.
+        inbound = queue.pop(0)
+        with sched.track(inbound):
+            pass
+
+        jobs = sched._load_jobs("pip-boy")
+        jobs[0]["next_fire_at"] = time.time() - 1
+        sched._save_jobs("pip-boy", jobs)
+        sched._tick(time.time())
+
+        assert len(queue) == 1
+        assert queue[0].source_job_id == f"cron:{jid}"
+
+    def test_two_different_cron_jobs_do_not_coalesce(self, tmp_path: Path):
+        """Coalesce key is per-job — two distinct jobs fire independently."""
+        sched, queue, _ = _make_sched(tmp_path)
+        sched.add_job(
+            name="a", schedule_kind="every", schedule_config={"seconds": 60},
+            message="A", channel="cli", peer_id="cli-user",
+            sender_id="owner", agent_id="pip-boy",
+        )
+        sched.add_job(
+            name="b", schedule_kind="every", schedule_config={"seconds": 60},
+            message="B", channel="cli", peer_id="cli-user",
+            sender_id="owner", agent_id="pip-boy",
+        )
+        jobs = sched._load_jobs("pip-boy")
+        for j in jobs:
+            j["next_fire_at"] = time.time() - 1
+        sched._save_jobs("pip-boy", jobs)
+
+        sched._tick(time.time())
+
+        assert len(queue) == 2
+        texts = sorted(m.text for m in queue)
+        assert texts == ["A", "B"]
+
+    def test_track_with_empty_key_is_noop(self, tmp_path: Path):
+        """User messages have source_job_id="" — track must accept that."""
+        sched, _, _ = _make_sched(tmp_path)
+        inbound = InboundMessage(text="hi", sender_id="cli-user")
+        with sched.track(inbound):
+            pass  # must not raise and must not touch pending set
+
+
+class TestHeartbeatCoalescing:
+    @patch("pip_agent.host_scheduler.settings")
+    def test_heartbeat_carries_source_job_id(self, mock_settings, tmp_path: Path):
+        mock_settings.heartbeat_interval = 60
+        mock_settings.heartbeat_active_start = 0
+        mock_settings.heartbeat_active_end = 24
+        sched, queue, _ = _make_sched(tmp_path)
+        (tmp_path / "agents" / "pip-boy" / "HEARTBEAT.md").write_text(
+            "ping", encoding="utf-8",
+        )
+        now = time.time()
+        sched._heartbeat_state["pip-boy"] = _HeartbeatState(last_fire_at=now - 120)
+        sched._tick(now)
+
+        assert len(queue) == 1
+        assert queue[0].source_job_id == "hb:pip-boy"
+
+    @patch("pip_agent.host_scheduler.settings")
+    def test_heartbeat_coalesces_while_unacked(
+        self, mock_settings, tmp_path: Path,
+    ):
+        mock_settings.heartbeat_interval = 60
+        mock_settings.heartbeat_active_start = 0
+        mock_settings.heartbeat_active_end = 24
+        sched, queue, _ = _make_sched(tmp_path)
+        (tmp_path / "agents" / "pip-boy" / "HEARTBEAT.md").write_text(
+            "ping", encoding="utf-8",
+        )
+        t0 = time.time()
+        sched._heartbeat_state["pip-boy"] = _HeartbeatState(last_fire_at=t0 - 120)
+        sched._tick(t0)
+        assert len(queue) == 1
+
+        # Another full interval passes. Without ack, second tick must NOT
+        # stack another copy.
+        sched._tick(t0 + 61)
+
+        assert len(queue) == 1, "heartbeat must coalesce while previous unacked"
+
+    @patch("pip_agent.host_scheduler.settings")
+    def test_heartbeat_fires_again_after_track_exit(
+        self, mock_settings, tmp_path: Path,
+    ):
+        mock_settings.heartbeat_interval = 60
+        mock_settings.heartbeat_active_start = 0
+        mock_settings.heartbeat_active_end = 24
+        sched, queue, _ = _make_sched(tmp_path)
+        (tmp_path / "agents" / "pip-boy" / "HEARTBEAT.md").write_text(
+            "ping", encoding="utf-8",
+        )
+        t0 = time.time()
+        sched._heartbeat_state["pip-boy"] = _HeartbeatState(last_fire_at=t0 - 120)
+        sched._tick(t0)
+        assert len(queue) == 1
+
+        with sched.track(queue.pop(0)):
+            pass
+
+        sched._tick(t0 + 61)
+
+        assert len(queue) == 1
+        assert queue[0].source_job_id == "hb:pip-boy"
+
+
+class TestInboundSortKey:
+    """User messages must drain before cron / heartbeat in the same batch."""
+
+    def test_user_beats_cron_and_heartbeat(self):
+        from pip_agent.agent_host import _inbound_sort_key
+        from pip_agent.channels import InboundMessage
+
+        hb = InboundMessage(text="ping", sender_id=_Sender.HEARTBEAT)
+        cron = InboundMessage(text="beep", sender_id=_Sender.CRON)
+        user = InboundMessage(text="hi", sender_id="cli-user")
+
+        batch = [hb, cron, user]
+        batch.sort(key=_inbound_sort_key)
+
+        assert batch[0] is user
+        assert batch[1] is cron
+        assert batch[2] is hb
+
+
+class TestCronAutoDisable:
+    """A cron job that keeps failing must eventually turn itself off."""
+
+    def _make_failing_cron(self, tmp_path: Path) -> tuple[HostScheduler, list, str]:
+        sched, queue, _ = _make_sched(tmp_path)
+        sched.add_job(
+            name="flaky", schedule_kind="every", schedule_config={"seconds": 60},
+            message="does not matter", channel="cli", peer_id="cli-user",
+            sender_id="owner", agent_id="pip-boy",
+        )
+        jid = sched._load_jobs("pip-boy")[0]["id"]
+        return sched, queue, jid
+
+    def test_success_resets_counter(self, tmp_path: Path):
+        sched, _, jid = self._make_failing_cron(tmp_path)
+        jobs = sched._load_jobs("pip-boy")
+        jobs[0]["consecutive_errors"] = 3
+        sched._save_jobs("pip-boy", jobs)
+
+        inbound = InboundMessage(
+            text="x", sender_id=_Sender.CRON, agent_id="pip-boy",
+            source_job_id=f"cron:{jid}",
+        )
+        with sched.track(inbound):
+            pass  # success
+
+        assert sched._load_jobs("pip-boy")[0]["consecutive_errors"] == 0
+
+    def test_failure_increments_counter(self, tmp_path: Path):
+        sched, _, jid = self._make_failing_cron(tmp_path)
+
+        inbound = InboundMessage(
+            text="x", sender_id=_Sender.CRON, agent_id="pip-boy",
+            source_job_id=f"cron:{jid}",
+        )
+        with sched.track(inbound) as t:
+            t.failure("boom")
+
+        job = sched._load_jobs("pip-boy")[0]
+        assert job["consecutive_errors"] == 1
+        assert job["enabled"] is True  # still below threshold
+
+    def test_exception_counts_as_failure(self, tmp_path: Path):
+        sched, _, jid = self._make_failing_cron(tmp_path)
+
+        inbound = InboundMessage(
+            text="x", sender_id=_Sender.CRON, agent_id="pip-boy",
+            source_job_id=f"cron:{jid}",
+        )
+        try:
+            with sched.track(inbound):
+                raise RuntimeError("SDK exploded")
+        except RuntimeError:
+            pass  # re-raise is intentional — host's own error handling still runs
+
+        assert sched._load_jobs("pip-boy")[0]["consecutive_errors"] == 1
+
+    def test_auto_disable_at_threshold(self, tmp_path: Path):
+        sched, _, jid = self._make_failing_cron(tmp_path)
+
+        inbound = InboundMessage(
+            text="x", sender_id=_Sender.CRON, agent_id="pip-boy",
+            source_job_id=f"cron:{jid}",
+        )
+        for _ in range(_CRON_AUTO_DISABLE_THRESHOLD):
+            with sched.track(inbound) as t:
+                t.failure("nope")
+
+        job = sched._load_jobs("pip-boy")[0]
+        assert job["consecutive_errors"] == _CRON_AUTO_DISABLE_THRESHOLD
+        assert job["enabled"] is False
+
+    def test_disabled_job_stops_firing(self, tmp_path: Path):
+        """Once auto-disabled, the scheduler must stop enqueuing it."""
+        sched, queue, jid = self._make_failing_cron(tmp_path)
+
+        inbound = InboundMessage(
+            text="x", sender_id=_Sender.CRON, agent_id="pip-boy",
+            source_job_id=f"cron:{jid}",
+        )
+        for _ in range(_CRON_AUTO_DISABLE_THRESHOLD):
+            with sched.track(inbound) as t:
+                t.failure("nope")
+
+        # Force the next_fire_at well into the past, then tick.
+        jobs = sched._load_jobs("pip-boy")
+        jobs[0]["next_fire_at"] = time.time() - 1
+        sched._save_jobs("pip-boy", jobs)
+        sched._tick(time.time())
+
+        assert queue == [], "disabled cron must not enqueue"
+
+    def test_heartbeat_does_not_update_cron_counters(self, tmp_path: Path):
+        """Heartbeat track() must not mutate any cron.json."""
+        sched, _, jid = self._make_failing_cron(tmp_path)
+        before = sched._load_jobs("pip-boy")
+
+        hb = InboundMessage(
+            text="ping", sender_id=_Sender.HEARTBEAT, agent_id="pip-boy",
+            source_job_id="hb:pip-boy",
+        )
+        with sched.track(hb) as t:
+            t.failure("irrelevant")
+
+        after = sched._load_jobs("pip-boy")
+        assert before == after, "heartbeat failures must not touch cron state"

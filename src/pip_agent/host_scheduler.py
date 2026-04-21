@@ -35,6 +35,8 @@ import logging
 import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -50,15 +52,75 @@ _TICK_SECONDS = 5.0
 _CRON_FILE = "cron.json"
 _HEARTBEAT_FILE = "HEARTBEAT.md"
 
+# Cron auto-disable: after this many consecutive failed runs, flip
+# ``enabled=False`` on the job so we stop burning an SDK cold start every
+# interval on something that is broken. The count resets to 0 on the first
+# successful run. ``run_job`` / ``remove_job`` / ``update_job`` can always
+# flip it back on manually.
+_CRON_AUTO_DISABLE_THRESHOLD = 5
+
 
 class _Sender:
     CRON = "__cron__"
     HEARTBEAT = "__heartbeat__"
 
 
+def _pending_key_cron(job_id: str) -> str:
+    """Coalesce key for a cron job.
+
+    Cron jobs are uniquely identified by their 8-char ``id``, so the key is
+    per-job. Two different cron jobs can be in-flight simultaneously; the
+    same job cannot.
+    """
+    return f"cron:{job_id}"
+
+
+def _pending_key_heartbeat(agent_id: str) -> str:
+    """Coalesce key for a heartbeat.
+
+    Heartbeats are a per-agent signal (one ``HEARTBEAT.md`` per agent
+    directory), so the key is per-agent.
+    """
+    return f"hb:{agent_id}"
+
+
+@dataclass
+class _TrackedInbound:
+    """Handle yielded by :meth:`HostScheduler.track`.
+
+    ``failure(msg)`` marks the current run as a logical failure so the
+    scheduler will (a) bump the cron job's ``consecutive_errors`` counter
+    and (b) auto-disable at :data:`_CRON_AUTO_DISABLE_THRESHOLD`. Only
+    ``AgentHost.process_inbound`` should call it directly; uncaught
+    exceptions inside the ``with`` block also count as failure.
+    """
+
+    inbound: InboundMessage
+    failed: bool = False
+    error: str = ""
+
+    def failure(self, message: str = "") -> None:
+        self.failed = True
+        if message:
+            self.error = message
+
+
 @dataclass
 class _HeartbeatState:
-    last_fire_at: float = 0.0
+    """Per-agent heartbeat bookkeeping.
+
+    ``last_fire_at`` is seeded with the current epoch when the state is first
+    created, NOT ``0.0``. Rationale: the very first SDK turn after startup
+    is a cold start (typically 30–90 s while Claude Code spins up its
+    subprocess and loads the JSONL transcript). If ``last_fire_at`` defaulted
+    to ``0.0``, the ``elapsed >= interval`` check would pass on tick #1 and
+    the heartbeat would immediately front-run the user — the cold-start
+    latency gets burned on a background keepalive while the user's first
+    ``你好`` sits in the queue. Seeding with ``now`` delays the first fire
+    by ``heartbeat_interval`` seconds, which is what the user expects.
+    """
+
+    last_fire_at: float
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +273,17 @@ class HostScheduler:
         # File I/O needs its own lock so add/remove/update from the MCP thread
         # doesn't collide with the ticker thread re-reading jobs.
         self._io_lock = threading.Lock()
+        # Coalescing: set of "pending keys" — job_ids (cron) or agent_ids
+        # (heartbeat) whose previous payload is still sitting in the host
+        # queue or executing inside ``process_inbound``. While a key is in
+        # here we refuse to enqueue another copy. ``ack()`` drains it once
+        # the host is done. Without this, an "every 30s" cron whose turn
+        # takes 40s builds an unbounded backlog — observed live with a
+        # heartbeat-test job where user messages were starved behind ~10
+        # piled-up cron payloads. See :meth:`ack` and the regression test
+        # ``TestCronCoalescing``.
+        self._pending: set[str] = set()
+        self._pending_lock = threading.Lock()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -271,6 +344,9 @@ class HostScheduler:
             "created_at": now,
             "next_fire_at": fire_at,
             "last_fire_at": 0,
+            # Tracked by ``_finalize_tracked``. Bumps on run failure, resets
+            # on success, auto-disables at ``_CRON_AUTO_DISABLE_THRESHOLD``.
+            "consecutive_errors": 0,
         }
         with self._io_lock:
             jobs = self._load_jobs(agent_id)
@@ -329,6 +405,109 @@ class HostScheduler:
                 out.extend(self._load_jobs(agent_dir.name))
         return out
 
+    @contextmanager
+    def track(
+        self, inbound: InboundMessage,
+    ) -> Iterator["_TrackedInbound"]:
+        """Context manager that owns the scheduler-side bookkeeping for one
+        inbound.
+
+        Replaces the old ``ack(source_job_id)`` API. The old design put a
+        contract on every caller — "you must call ack in a finally block
+        for every scheduler-injected inbound, otherwise the coalesce key
+        leaks and that cron job silently stops firing forever" — which is
+        exactly the kind of implicit coupling that breaks under later
+        refactors. Here the guarantee is enforced by Python: exit the
+        ``with`` block (normally or via exception) and the key is released.
+
+        The yielded handle lets the caller mark a *logical* failure even
+        when no exception was raised (e.g. ``QueryResult.error`` is set
+        but ``run_query`` returned normally). That failure signal drives
+        the cron auto-disable counter — see
+        :meth:`_finalize_tracked` and
+        :data:`_CRON_AUTO_DISABLE_THRESHOLD`.
+
+        Usage (from :meth:`AgentHost.process_inbound`)::
+
+            with self._scheduler.track(inbound) as tracked:
+                result = await run_query(...)
+                if result.error:
+                    tracked.failure(result.error)
+                self._dispatch_reply(...)
+
+        No-op for inbounds with empty ``source_job_id`` (user / channel
+        messages). Safe to use around every inbound unconditionally.
+        """
+        tracked = _TrackedInbound(inbound=inbound)
+        try:
+            yield tracked
+        except BaseException as exc:
+            # An uncaught exception mid-turn is also a cron failure. Record
+            # it before the finally, then re-raise so the caller's own
+            # error handling still fires.
+            tracked.failure(f"{type(exc).__name__}: {exc}")
+            raise
+        finally:
+            self._finalize_tracked(tracked)
+
+    def _finalize_tracked(self, tracked: "_TrackedInbound") -> None:
+        """Release coalesce key + update cron error counter on ``with`` exit."""
+        inbound = tracked.inbound
+        key = inbound.source_job_id
+        if not key:
+            return
+        with self._pending_lock:
+            self._pending.discard(key)
+        if key.startswith("cron:") and inbound.agent_id:
+            job_id = key[len("cron:") :]
+            self._record_cron_outcome(
+                agent_id=inbound.agent_id,
+                job_id=job_id,
+                failed=tracked.failed,
+                error=tracked.error,
+            )
+
+    def _record_cron_outcome(
+        self,
+        *,
+        agent_id: str,
+        job_id: str,
+        failed: bool,
+        error: str,
+    ) -> None:
+        """Bump / reset ``consecutive_errors``; auto-disable past threshold.
+
+        Called from inside ``track()``'s finally. Heartbeats do not go
+        through here — they have no "disable" state beyond removing the
+        ``HEARTBEAT.md`` file.
+        """
+        with self._io_lock:
+            jobs = self._load_jobs(agent_id)
+            dirty = False
+            for job in jobs:
+                if job.get("id") != job_id:
+                    continue
+                errs = int(job.get("consecutive_errors", 0) or 0)
+                if failed:
+                    errs += 1
+                    job["consecutive_errors"] = errs
+                    if errs >= _CRON_AUTO_DISABLE_THRESHOLD:
+                        job["enabled"] = False
+                        log.warning(
+                            "Cron job '%s' (id=%s) auto-disabled after "
+                            "%d consecutive errors: %s",
+                            job.get("name", ""), job_id, errs, error or "(no message)",
+                        )
+                elif errs:
+                    job["consecutive_errors"] = 0
+                else:
+                    # No change needed — don't rewrite the file.
+                    break
+                dirty = True
+                break
+            if dirty:
+                self._save_jobs(agent_id, jobs)
+
     # -- internals -----------------------------------------------------------
 
     def _run(self) -> None:
@@ -361,15 +540,37 @@ class HostScheduler:
             fire_at = float(job.get("next_fire_at") or 0)
             if fire_at <= 0 or fire_at > now:
                 continue
-            self._enqueue(
-                InboundMessage(
-                    text=job.get("message", ""),
-                    sender_id=_Sender.CRON,
-                    channel=job.get("channel") or "cli",
-                    peer_id=job.get("peer_id") or "cli-user",
-                    agent_id=agent_id,
+
+            jid = str(job.get("id") or "")
+            pending_key = _pending_key_cron(jid)
+            with self._pending_lock:
+                coalesced = pending_key in self._pending
+                if not coalesced:
+                    self._pending.add(pending_key)
+
+            if coalesced:
+                # Previous run of this job is still in the host queue or
+                # mid-process. Don't stack another copy — that's what let
+                # user messages get buried behind N cron payloads. Still
+                # advance ``next_fire_at`` below so the same tick doesn't
+                # retry this branch every 5 s; effectively we're dropping
+                # this interval rather than reshuffling the schedule.
+                log.warning(
+                    "HostScheduler coalesced cron '%s' (id=%s) for agent=%s "
+                    "— previous run still pending (queue depth=%d)",
+                    job.get("name", ""), jid, agent_id, len(self._msg_queue),
                 )
-            )
+            else:
+                self._enqueue(
+                    InboundMessage(
+                        text=job.get("message", ""),
+                        sender_id=_Sender.CRON,
+                        channel=job.get("channel") or "cli",
+                        peer_id=job.get("peer_id") or "cli-user",
+                        agent_id=agent_id,
+                        source_job_id=pending_key,
+                    )
+                )
             job["last_fire_at"] = now
             kind = job.get("schedule_kind", "")
             if kind == "at":
@@ -398,16 +599,40 @@ class HostScheduler:
         if not _in_active_window(now):
             return
 
-        state = self._heartbeat_state.setdefault(agent_dir.name, _HeartbeatState())
+        state = self._heartbeat_state.setdefault(
+            agent_dir.name, _HeartbeatState(last_fire_at=now)
+        )
         if now - state.last_fire_at < interval:
             return
+
+        agent_id = agent_dir.name
+        pending_key = _pending_key_heartbeat(agent_id)
+        with self._pending_lock:
+            if pending_key in self._pending:
+                # Same coalescing story as cron: previous heartbeat hasn't
+                # been ack'd yet. Skip this tick but advance ``last_fire_at``
+                # so we don't hammer the check every 5 s.
+                log.warning(
+                    "HostScheduler coalesced heartbeat for agent=%s "
+                    "— previous run still pending (queue depth=%d)",
+                    agent_id, len(self._msg_queue),
+                )
+                state.last_fire_at = now
+                return
+            self._pending.add(pending_key)
 
         try:
             payload = hb_file.read_text("utf-8").strip()
         except OSError as exc:
             log.warning("Cannot read %s: %s", hb_file, exc)
+            # Release the pending slot we just reserved; this heartbeat
+            # will never be ack'd otherwise.
+            with self._pending_lock:
+                self._pending.discard(pending_key)
             return
         if not payload:
+            with self._pending_lock:
+                self._pending.discard(pending_key)
             return
 
         self._enqueue(
@@ -416,7 +641,8 @@ class HostScheduler:
                 sender_id=_Sender.HEARTBEAT,
                 channel="cli",
                 peer_id="cli-user",
-                agent_id=agent_dir.name,
+                agent_id=agent_id,
+                source_job_id=pending_key,
             )
         )
         state.last_fire_at = now
@@ -424,9 +650,10 @@ class HostScheduler:
     def _enqueue(self, inbound: InboundMessage) -> None:
         with self._q_lock:
             self._msg_queue.append(inbound)
+            depth = len(self._msg_queue)
         log.info(
-            "HostScheduler enqueued %s for agent=%s",
-            inbound.sender_id, inbound.agent_id,
+            "HostScheduler enqueued %s for agent=%s (queue depth=%d, key=%s)",
+            inbound.sender_id, inbound.agent_id, depth, inbound.source_job_id,
         )
 
     def _iter_agent_dirs(self) -> list[Path]:
