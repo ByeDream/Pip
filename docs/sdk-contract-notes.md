@@ -220,3 +220,86 @@ If a future Pip-Boy mode ever keeps a long-lived `claude.exe` subprocess
 alive across turns (e.g. a "supervised agent" mode with bidirectional
 streaming), this env flag becomes **revisitable** — not wrong, just
 worth reconsidering. Until then, leave it on.
+
+## 11. Memory pipeline redesign (DESIGN — not yet implemented)
+
+Status: **design doc, not code**. Captured here so we don't lose the
+thread; wire it up after the current regression round.
+
+### 11.1 Why the current split is wrong
+
+Today we run two memory systems in parallel:
+
+1. **SDK session resume** (`resume=<session_id>`) — every user turn,
+   the full JSONL transcript is re-read from disk, re-tokenized, and
+   re-shipped to the model. Growth is unbounded. The cold-cache penalty
+   on a 60 MB JSONL is measured in minutes.
+2. **Pip-Boy memory pipeline** (`memory/reflect.py`,
+   `memory/consolidate.py`) — observations → memories → axioms,
+   injected by the host into `system_prompt_append` every turn.
+
+(1) is what CC gives us by default. (2) is what Pip-Boy was built for.
+Run both and the model sees the same information **twice**, at
+different granularities, at the cost of the more expensive one (the
+raw JSONL replay) keeping grow.
+
+`_is_ephemeral_sender` (in `agent_host.py`) already stops cron and
+heartbeat turns from polluting the user's JSONL. Note the deliberate
+two-layer split there: `session_for_turn=None` keeps the SDK from
+resuming, but `ctx_session_id` still carries the user's session id
+into MCP tools — otherwise a "2 am cron calls reflect" flow would
+silently skip (reflect needs the user's JSONL path). The next step
+is to make the pipeline
+**authoritative** for long-term memory and let the JSONL serve only
+its legitimate purpose: crash-recovery of an in-flight conversation.
+
+### 11.2 The unified flow
+
+```
+user turn N ──┐
+user turn N+1 ┼── JSONL (SDK session, grows until reflect)
+user turn N+2 ┘
+              │
+              │ (a) /exit  →  reflect()
+              │ (b) heartbeat fires a prompt  →  "reflect if N≥threshold"
+              ▼
+        observations.jsonl  ──┐
+                              │ Dream (idle-night cron, sufficient obs)
+                              ▼
+                         memories.json  ──┐
+                                          │ distill
+                                          ▼
+                                      axioms.md
+```
+
+### 11.3 Decisions (locked in this session)
+
+| # | Decision | Rationale |
+|---|---|---|
+| Q1 | Reflect output **≤ 5 observations** per call | Hard cap; forces the model to pick the high-signal ones instead of dumping the transcript. |
+| Q2 | Dream = existing L2/L3 code (`consolidate` + `distill_axioms`); auto-trigger = idle-hour + enough observations | Algorithm is done and tested (old Pip). Only the **trigger** needs to come back — it was deleted during the lean rewrite in favour of "agent schedules itself via `cron_create`", which turned out to waste cold-starts. |
+| Q3/Q4 | **Keep axioms in our own `axioms.md`**, inject via `system_prompt_append`. Do NOT write to CC's native `~/.claude/projects/<cwd>/memory/` | We want the option to run multiple Pip-Boy agents against the same cwd (e.g. `pip-boy` + `dev-assistant`). CC's memory folder is keyed by cwd, not agent, so using it would force memory-sharing across agents. Until multi-agent is a real product need, stay with the current per-agent `.pip/agents/<id>/axioms.md`. |
+| Q5 | Reflect is atomic via **session rotation**: mint a new `session_id`, archive the old JSONL, observations extracted from the archive | Avoids "truncate the live JSONL" races. On crash mid-reflect, the archive is still intact and the next start just picks up the new (empty) session. |
+| Q6 | Heartbeat nudge = **direct instruction**, not "decide for yourself" | "Reflect now" collapses into one turn; "should you reflect?" costs a turn just to reach the same decision. Cold-start budget matters. |
+
+### 11.4 What has to change
+
+| Area | Change |
+|---|---|
+| `memory/reflect.py` | Re-read prompt — cap at 5 observations, require `{timestamp, type, content, weight}` shape (old Pip schema). |
+| `agent_host.py` | On `/exit`: call `reflect()` synchronously before teardown. |
+| `agent_host.py` | After reflect: rotate SDK session (new `session_id`, archive old JSONL path), update `_sessions[sk]`. |
+| `host_scheduler.py` | Re-introduce **idle-hour Dream trigger**: if `now.hour ∈ [DREAM_HOUR_START, DREAM_HOUR_END]` and `len(observations) ≥ DREAM_MIN_OBS` and `idle ≥ DREAM_INACTIVE_MINUTES`, enqueue a `__cron__` inbound that calls `consolidate()` then `distill_axioms()`. |
+| `config.py` | Resurrect `dream_hour_start` / `dream_min_observations` / `dream_inactive_minutes` settings (currently dead text in `env.example`). |
+| Heartbeat prompt | If `len(observations) ≥ REFLECT_THRESHOLD`: append a direct-instruction line "Call `reflect` now." to the heartbeat body. Otherwise the current "HEARTBEAT_OK if nothing to do" prompt. |
+
+### 11.5 Explicitly out of scope (for now)
+
+- Using CC's `~/.claude/projects/<cwd>/memory/` for axiom auto-injection
+  (blocked on multi-agent isolation; revisit when L2 per-agent
+  `CLAUDE_CONFIG_DIR` lands).
+- Any form of mid-turn "compact" — reflect rotates, it doesn't summarize
+  in place.
+- Auto-reflecting at a token threshold mid-conversation — user turn
+  latency must stay predictable; reflect only happens on exit or on an
+  explicit heartbeat instruction.
