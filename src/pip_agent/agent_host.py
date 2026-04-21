@@ -50,6 +50,35 @@ BINDINGS_PATH = AGENTS_DIR / "bindings.json"
 SESSION_STORE_PATH = WORKDIR / ".pip" / "sdk_sessions.json"
 
 
+@dataclass(slots=True)
+class FlushSummary:
+    """Outcome of :meth:`AgentHost.flush_and_rotate`.
+
+    Exists so the caller (today: the CLI ``/exit`` path) can print an
+    *honest* status line instead of the old unconditional "reflecting…"
+    message, which fired even when there was literally nothing in
+    ``_sessions`` to reflect. See `tests/test_reply_dispatch.py::
+    TestFlushAndRotate` for the contract.
+
+    Fields:
+
+    * ``rotated`` — sessions that were dropped from the in-memory map.
+      This is the number that matters for correctness of the next
+      launch ("did we actually clear state?").
+    * ``reflected`` — sessions where ``reflect_and_persist`` was
+      *invoked* (client present AND transcript file located). A value
+      less than ``rotated`` means some sessions were rotated without
+      reflect — either the JSONL was gone or credentials were missing.
+    * ``observations`` — total observations written across all
+      reflected sessions. Zero is a valid outcome (Q7 zero-delta
+      guard short-circuits without an LLM call).
+    """
+
+    rotated: int = 0
+    reflected: int = 0
+    observations: int = 0
+
+
 # ---------------------------------------------------------------------------
 # Session persistence
 # ---------------------------------------------------------------------------
@@ -322,7 +351,7 @@ class AgentHost:
         _save_sessions(self._sessions)
         return None
 
-    async def flush_and_rotate(self) -> None:
+    async def flush_and_rotate(self) -> FlushSummary:
         """On-exit memory handoff: reflect every live session, then rotate.
 
         Called from the CLI's ``/exit`` handler (and any future clean-shutdown
@@ -358,20 +387,24 @@ class AgentHost:
           next trigger (PreCompact or the next /exit) retries the same
           delta — that's the Q8 contract.
         """
+        summary = FlushSummary()
+
         if not self._sessions:
-            return
+            return summary
 
         try:
             from pip_agent.anthropic_client import build_anthropic_client
             from pip_agent.memory.reflect import reflect_and_persist
         except Exception:  # pragma: no cover — memory pkg is bundled
             log.exception("flush_and_rotate: memory package import failed")
+            summary.rotated = len(self._sessions)
             self._sessions.clear()
             _save_sessions(self._sessions)
-            return
+            return summary
 
         client = build_anthropic_client()
         snapshot = dict(self._sessions)
+        summary.rotated = len(snapshot)
 
         if client is None:
             log.info(
@@ -385,6 +418,12 @@ class AgentHost:
                 len(snapshot),
             )
 
+            # ``_reflect_one`` bumps ``summary`` only on the happy path —
+            # a missing transcript / missing agent_id / reflect crash all
+            # fall through rotating the session without counting it as
+            # "reflected". That's intentional: ``summary.reflected`` is
+            # "did an LLM call actually happen for this session", which
+            # is what the CLI status line needs to not lie to the user.
             def _reflect_one(sk: str, sid: str) -> None:
                 path = locate_session_jsonl(sid)
                 if path is None:
@@ -412,6 +451,8 @@ class AgentHost:
                         "flush_and_rotate: session=%s obs=%d offset=%d→%d",
                         sid[:8], obs_count, start_offset, new_offset,
                     )
+                    summary.reflected += 1
+                    summary.observations += obs_count
                 except Exception as exc:  # noqa: BLE001
                     # Per-session failure isolated: log and keep going.
                     log.warning(
@@ -427,6 +468,7 @@ class AgentHost:
         # but the next turn will mint a fresh session_id.
         self._sessions.clear()
         _save_sessions(self._sessions)
+        return summary
 
     def _build_mcp_ctx(
         self,
@@ -818,14 +860,32 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
                     # Shutdown handoff: reflect every live session and
                     # rotate so next launch starts clean. See
                     # ``AgentHost.flush_and_rotate`` for the contract.
-                    print("  Powering down — reflecting session memory...")
+                    # The status line is chosen *after* we know what
+                    # actually happened — old code printed "reflecting…"
+                    # unconditionally, which mis-sold the no-op case as
+                    # real work. See ``FlushSummary``.
                     try:
-                        await host.flush_and_rotate()
+                        summary = await host.flush_and_rotate()
                     except Exception:  # noqa: BLE001
                         # /exit must never be blocked by reflect. The
                         # cursor-does-not-advance contract means a crash
                         # here is picked up on the next PreCompact anyway.
                         log.exception("flush_and_rotate failed during /exit")
+                        summary = FlushSummary()
+                    if summary.reflected:
+                        print(
+                            f"  Powering down — reflected "
+                            f"{summary.reflected} session(s), "
+                            f"wrote {summary.observations} observation(s)."
+                        )
+                    elif summary.rotated:
+                        print(
+                            f"  Powering down — rotated "
+                            f"{summary.rotated} session(s) "
+                            f"(reflect skipped)."
+                        )
+                    else:
+                        print("  Powering down.")
                     stop_event.set()
                     break
                 log.info(

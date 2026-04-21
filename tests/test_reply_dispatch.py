@@ -507,10 +507,14 @@ class TestFlushAndRotate:
 
         # Should return without touching anything — no network calls,
         # no state writes. Running under asyncio.run also confirms we're
-        # actually awaitable.
-        asyncio.run(AgentHost.flush_and_rotate(host))
+        # actually awaitable. The empty summary is what the CLI uses to
+        # pick the "Powering down." (no reflect, no rotation) branch.
+        summary = asyncio.run(AgentHost.flush_and_rotate(host))
 
         assert host._sessions == {}
+        assert summary.rotated == 0
+        assert summary.reflected == 0
+        assert summary.observations == 0
 
     def test_reflect_then_rotate_happy_path(
         self, tmp_path: Path, monkeypatch,
@@ -537,7 +541,7 @@ class TestFlushAndRotate:
             "pip_agent.memory.reflect.reflect_and_persist", fake_persist,
         )
 
-        asyncio.run(AgentHost.flush_and_rotate(host))
+        summary = asyncio.run(AgentHost.flush_and_rotate(host))
 
         fake_persist.assert_called_once()
         kwargs = fake_persist.call_args.kwargs
@@ -547,6 +551,12 @@ class TestFlushAndRotate:
         # Rotation: sessions map must be empty AND persisted empty.
         assert host._sessions == {}
         assert save_calls and save_calls[-1] == {}
+
+        # Summary reflects what actually happened — one session rotated,
+        # one reflect call made, 3 observations persisted.
+        assert summary.rotated == 1
+        assert summary.reflected == 1
+        assert summary.observations == 3
 
     def test_missing_transcript_still_rotates(
         self, tmp_path: Path, monkeypatch,
@@ -571,11 +581,16 @@ class TestFlushAndRotate:
             "pip_agent.memory.reflect.reflect_and_persist", fake_persist,
         )
 
-        asyncio.run(AgentHost.flush_and_rotate(host))
+        summary = asyncio.run(AgentHost.flush_and_rotate(host))
 
         fake_persist.assert_not_called()
         assert host._sessions == {}
         assert save_calls and save_calls[-1] == {}
+        # Transcript gone: session is rotated but reflect did not run,
+        # so the CLI will print the "rotated N (reflect skipped)" line.
+        assert summary.rotated == 1
+        assert summary.reflected == 0
+        assert summary.observations == 0
 
     def test_reflect_exception_does_not_block_rotation(
         self, tmp_path: Path, monkeypatch,
@@ -618,13 +633,18 @@ class TestFlushAndRotate:
             "pip_agent.memory.reflect.reflect_and_persist", _persist,
         )
 
-        asyncio.run(AgentHost.flush_and_rotate(host))
+        summary = asyncio.run(AgentHost.flush_and_rotate(host))
 
         # Both sessions were attempted (one failed, one succeeded).
         assert set(calls) == {"sid-A", "sid-B"}
         # Rotation happened regardless.
         assert host._sessions == {}
         assert save_calls and save_calls[-1] == {}
+        # Only the healthy session counts as "reflected"; the crashed
+        # one is rotated but not tallied into observations.
+        assert summary.rotated == 2
+        assert summary.reflected == 1
+        assert summary.observations == 1
 
     def test_no_credentials_skips_reflect_but_still_rotates(
         self, tmp_path: Path, monkeypatch,
@@ -648,13 +668,19 @@ class TestFlushAndRotate:
             "pip_agent.memory.reflect.reflect_and_persist", fake_persist,
         )
 
-        asyncio.run(AgentHost.flush_and_rotate(host))
+        summary = asyncio.run(AgentHost.flush_and_rotate(host))
 
         # Without credentials reflect is never called — but rotation
         # MUST still happen so next launch starts fresh.
         fake_persist.assert_not_called()
         assert host._sessions == {}
         assert save_calls and save_calls[-1] == {}
+        # Summary distinguishes "rotated but reflect skipped" from
+        # "no sessions at all" — this is the branch that drives the
+        # CLI's "(reflect skipped)" status line.
+        assert summary.rotated == 1
+        assert summary.reflected == 0
+        assert summary.observations == 0
 
 
 class TestReflectAndPersist:
