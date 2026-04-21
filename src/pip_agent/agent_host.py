@@ -226,8 +226,49 @@ class AgentHost:
 
         self._sessions = _load_sessions()
         self._agents: dict[str, _PerAgent] = {}
+
+        # Two-layer concurrency control:
+        #
+        # * ``_session_locks`` — one ``asyncio.Lock`` per session key, created
+        #   on first use. Guarantees that two messages targeting the *same*
+        #   session run sequentially. The canonical case this fixes is a
+        #   group chat: members A and B reply to the bot at the same instant,
+        #   both resolve to the same ``agent:pip:wecom:peer:<gid>`` session
+        #   key, and without the lock their turns can interleave — both
+        #   resume the SAME ``session_id``, then race to write it back. One
+        #   of the two sessions gets lost. The old global ``Semaphore(3)``
+        #   couldn't prevent this, because three different slots running the
+        #   same session is exactly the bug.
+        #
+        # * ``_semaphore`` — a global cap on how many CC subprocesses can
+        #   spawn concurrently, regardless of how many distinct sessions
+        #   have traffic. Every ``run_query`` loads the resumed JSONL into
+        #   a new process; unbounded parallelism on a day with 50 active
+        #   peers would torch RAM and swap. Keep the cap.
+        #
+        # Acquisition order is session-lock FIRST, global-semaphore SECOND
+        # (see ``process_inbound``). That way a session's second message
+        # waits on its own lock while unrelated sessions keep flowing
+        # through the semaphore, and the semaphore is never wasted on a
+        # turn that still has to wait for the same-session predecessor.
+        #
+        # Locks are never cleaned up: a few hundred bytes per distinct
+        # session key, and the key space is bounded by the number of
+        # peers we ever meet — negligible vs. the JSONL / memory-store
+        # data we already persist per session.
+        self._session_locks: dict[str, asyncio.Lock] = {}
         self._max_concurrent = 3
         self._semaphore = asyncio.Semaphore(self._max_concurrent)
+
+    def _get_session_lock(self, sk: str) -> asyncio.Lock:
+        """Return the per-session lock, creating it lazily."""
+        # asyncio runs on a single thread — no extra guard needed for
+        # the dict mutation.
+        lock = self._session_locks.get(sk)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[sk] = lock
+        return lock
 
     def _get_agent_services(self, agent_id: str) -> _PerAgent:
         if agent_id not in self._agents:
@@ -375,7 +416,7 @@ class AgentHost:
             else nullcontext(_NullTracked())
         )
         with tracker as tracked:
-            async with self._semaphore:
+            async with self._get_session_lock(sk), self._semaphore:
                 try:
                     result: QueryResult = await run_query(
                         prompt=prompt,

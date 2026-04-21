@@ -388,3 +388,52 @@ class TestReapStaleSession:
 
         assert result is None
         assert save_calls == []
+
+
+class TestSessionLockMap:
+    """Regression: same-session messages must serialize, different sessions
+    must not interfere.
+
+    The group-chat failure mode the lock fixes: members A and B reply to
+    the bot at the same instant; both resolve to the same
+    ``agent:pip:wecom:peer:<gid>`` session key; their turns interleave;
+    both resume the same SDK ``session_id``; the one that writes back
+    second wins and the other's turn is silently lost.
+
+    Testing the full interleave is expensive; what we can cheaply lock
+    in is the *mechanism*: two requests for the same key get the same
+    lock instance, two requests for different keys get distinct locks,
+    and the lock dict doesn't explode under repeated hits on the same
+    key. Actual mutual exclusion is an ``asyncio.Lock`` guarantee —
+    not ours to re-prove.
+    """
+
+    def _host(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(_session_locks={})
+
+    def test_same_key_returns_the_same_lock(self):
+        host = self._host()
+        a = AgentHost._get_session_lock(host, "sk-1")
+        b = AgentHost._get_session_lock(host, "sk-1")
+        assert a is b
+
+    def test_different_keys_get_distinct_locks(self):
+        host = self._host()
+        a = AgentHost._get_session_lock(host, "sk-1")
+        b = AgentHost._get_session_lock(host, "sk-2")
+        assert a is not b
+
+    def test_lock_dict_does_not_grow_on_repeat(self):
+        host = self._host()
+        for _ in range(10):
+            AgentHost._get_session_lock(host, "sk-1")
+        assert len(host._session_locks) == 1
+
+    def test_lock_is_an_asyncio_lock(self):
+        import asyncio
+
+        host = self._host()
+        lock = AgentHost._get_session_lock(host, "sk-1")
+        assert isinstance(lock, asyncio.Lock)
