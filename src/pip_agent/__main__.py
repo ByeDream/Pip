@@ -8,24 +8,48 @@ from pip_agent.config import ConfigError, settings
 def _configure_logging() -> None:
     """Route internal log records to stdout.
 
-    Without this, Python's default WARNING threshold silently drops every
-    ``log.info`` in the codebase — which hides scheduler ticks, heartbeat
-    sentinel suppression, session ids, SDK cost/turn summaries, MCP tool
-    calls, and the reflect pipeline. The only feedback users get is the
-    agent's own text output, which is useless when the agent legitimately
-    stays quiet (e.g. a ``HEARTBEAT_OK`` that was correctly silenced).
+    ``VERBOSE`` is the single "open the log firehose" switch. It controls
+    **only** the stdlib ``logging`` threshold — it does **not** gate
+    streaming agent replies or tool-use traces, because those are part of
+    the interactive CLI contract and must show regardless of log volume.
 
-    We keep chatty third-party libraries at WARNING so the stream stays
-    readable; bump them temporarily if you're debugging them specifically.
+    Layout (two tiers, no per-library pins):
+
+    * ``VERBOSE=true``
+        - root logger at ``INFO`` — third-party libs (``mcp``, ``httpx``,
+          ``httpcore``, ``claude_agent_sdk``, ``asyncio``, …) emit INFO+
+          only. Their DEBUG layers stay hidden, which keeps the output
+          readable and also silences the SDK's best-effort
+          ``OTEL trace context injection failed`` DEBUG traceback.
+        - ``pip_agent.*`` at ``DEBUG`` — scheduler ticks, heartbeat
+          sentinel suppression, memory pipeline state, hook invocations,
+          and every other ``log.debug`` we ship. This is the signal you
+          actually want from "firehose mode".
+    * ``VERBOSE=false`` (default)
+        - root logger at ``WARNING``. Errors, channel-level failures, and
+          the agent's own text output still show; the "plumbing is doing
+          its job" chatter does not. ``pip_agent.*`` inherits root, so
+          our DEBUG/INFO is hidden too.
+
+    Regression guard: ``tests/test_main_logging.py`` asserts that ``main()``
+    always passes through here before invoking ``run_host``. Historically,
+    multiple refactors silently dropped that call site — every ``log.*``
+    in the codebase went dark and the host looked dead.
     """
-    level = logging.INFO if settings.verbose else logging.WARNING
+    root_level = logging.INFO if settings.verbose else logging.WARNING
+    # ``force=True`` so we override any stale basicConfig left behind by an
+    # earlier import or a test harness (pytest's logging plugin installs its
+    # own root handler which would otherwise make this call a silent no-op).
     logging.basicConfig(
-        level=level,
+        level=root_level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         stream=sys.stdout,
+        force=True,
     )
-    for noisy in ("mcp", "anyio", "asyncio", "httpx", "httpcore", "urllib3"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+    if settings.verbose:
+        # Only Pip-Boy's own modules go to DEBUG; third parties stay at the
+        # root level (INFO) so their internals don't drown our signal.
+        logging.getLogger("pip_agent").setLevel(logging.DEBUG)
 
 
 def main(argv: list[str] | None = None) -> None:

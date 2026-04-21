@@ -171,7 +171,7 @@ pip install --upgrade pip-boy
 | `ANTHROPIC_BASE_URL` | No | *(api.anthropic.com)* | Custom API endpoint. When set, any credential is promoted to bearer mode for proxy gateways. |
 | `WECOM_BOT_ID` | No | — | WeCom bot ID for enterprise WeChat channel |
 | `WECOM_BOT_SECRET` | No | — | WeCom bot secret |
-| `VERBOSE` | No | `true` | Echo scheduler and heartbeat traces on the CLI |
+| `VERBOSE` | No | `false` | Open the internal log firehose: root at `INFO`, `pip_agent.*` bumped to `DEBUG`. Third-party libs ride root at `INFO` (no DEBUG floods). Streaming agent replies and `[tool: ...]` traces always show regardless. |
 
 At least one of `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` must be present. If neither is set, Pip-Boy lets Claude Code fall back to its own auth (`claude login` / system config).
 
