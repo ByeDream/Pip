@@ -1121,6 +1121,17 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
         stdin_t.start()
         print("  (type and press Enter; /exit to quit)")
 
+        # ``process_inbound`` tasks are fired and tracked, not awaited
+        # each tick. Awaiting would re-introduce the head-of-line bug
+        # where a slow WeChat turn (e.g. ``send_file`` uploading a
+        # multi-MB image) blocks a fresh WeCom ``hi`` from even being
+        # dispatched. Concurrency is already safe: :meth:`AgentHost
+        # .process_inbound` serialises same-session turns via a
+        # per-key lock and caps total SDK subprocesses with a global
+        # semaphore. At /exit-time we drain pending_tasks so reflect
+        # doesn't lose mid-flight observations.
+        pending_tasks: list[asyncio.Task[None]] = []
+
         while not stop_event.is_set():
             with q_lock:
                 batch = msg_queue[:]
@@ -1134,7 +1145,6 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
             if batch:
                 batch.sort(key=_inbound_sort_key)
 
-            tasks = []
             for inbound in batch:
                 # Only real interactive CLI input can terminate the host; a
                 # cron payload that happens to say "/exit" must not kill us.
@@ -1186,16 +1196,27 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
                     inbound.peer_id,
                     inbound.text[:80],
                 )
-                tasks.append(
+                pending_tasks.append(
                     loop.create_task(host.process_inbound(inbound)),
                 )
 
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            # Reap finished tasks so the list doesn't grow unbounded
+            # over a day of traffic. Exceptions were already logged by
+            # ``process_inbound`` itself; we just check ``.done()``.
+            if pending_tasks:
+                pending_tasks = [t for t in pending_tasks if not t.done()]
 
             if stop_event.is_set():
                 break
             await asyncio.sleep(0.3)
+
+        # Shutdown: drain any in-flight turns. Reflect during
+        # ``flush_and_rotate`` happens synchronously *before* we reach
+        # here, so this wait is purely about letting the user see the
+        # assistant's last streamed token and the channel's final
+        # ``send`` complete — not about memory consistency.
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
     try:
         asyncio.run(_run())
