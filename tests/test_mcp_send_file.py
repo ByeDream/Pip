@@ -52,9 +52,15 @@ class _FakeChannel:
     exposes via ``Channel.send_lock``.
     """
 
-    def __init__(self, *, name: str = "wecom", send_file_returns: bool = True):
+    def __init__(
+        self, *,
+        name: str = "wecom",
+        send_file_returns: bool = True,
+        send_image_returns: bool = True,
+    ):
         self.name = name
         self.send_file = MagicMock(return_value=send_file_returns)
+        self.send_image = MagicMock(return_value=send_image_returns)
         # ``Channel.send_lock`` is a plain ``threading.Lock`` (NOT
         # reentrant) in the production code, so mirror that here.
         # Non-reentrancy is what makes the lock-probe test work:
@@ -196,9 +202,12 @@ class TestChannelDispatch:
         }))
         assert result.get("is_error") is None
         text = _text_of(result)
-        assert "File sent" in text
+        # Status line declares the actual delivery path so the LLM
+        # knows whether the user saw an inline preview or an attachment.
+        assert "Sent" in text
         assert "ok.txt" in text
         assert "42" in text
+        assert "as file" in text
 
     def test_caption_and_filename_are_forwarded(self, tmp_path: Path):
         f = _make_file(tmp_path / "report.pdf", size=100)
@@ -232,6 +241,74 @@ class TestChannelDispatch:
         result = _run(_get_send_file(ctx)({"path": str(f)}))
         assert result.get("is_error") is True
         assert "ws disconnect" in _text_of(result)
+
+    def test_image_routes_to_send_image(self, tmp_path: Path):
+        # PNG magic bytes should trigger the send_image path so the
+        # recipient gets an inline preview instead of a file tile.
+        png = tmp_path / "pic.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+        ch = _FakeChannel()
+        ctx = McpContext(channel=ch, peer_id="u1", workdir=tmp_path)
+        result = _run(_get_send_file(ctx)({
+            "path": str(png), "caption": "look",
+        }))
+        assert result.get("is_error") is None
+        ch.send_image.assert_called_once()
+        ch.send_file.assert_not_called()
+        args, kwargs = ch.send_image.call_args
+        assert args[0] == "u1"
+        assert args[1].startswith(b"\x89PNG")
+        assert kwargs.get("caption") == "look"
+        assert "as image" in _text_of(result)
+
+    def test_jpeg_routes_to_send_image(self, tmp_path: Path):
+        jpg = tmp_path / "photo.jpg"
+        jpg.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 64)
+        ch = _FakeChannel()
+        ctx = McpContext(channel=ch, peer_id="u1", workdir=tmp_path)
+        result = _run(_get_send_file(ctx)({"path": str(jpg)}))
+        assert result.get("is_error") is None
+        ch.send_image.assert_called_once()
+        ch.send_file.assert_not_called()
+
+    def test_non_image_stays_on_send_file(self, tmp_path: Path):
+        # PDF magic bytes — must NOT trigger the image path, even
+        # though the extension could mislead extension-based routing.
+        pdf = tmp_path / "doc.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n" + b"\x00" * 64)
+        ch = _FakeChannel()
+        ctx = McpContext(channel=ch, peer_id="u1", workdir=tmp_path)
+        result = _run(_get_send_file(ctx)({"path": str(pdf)}))
+        assert result.get("is_error") is None
+        ch.send_file.assert_called_once()
+        ch.send_image.assert_not_called()
+        assert "as file" in _text_of(result)
+
+    def test_mislabeled_extension_uses_magic_bytes(self, tmp_path: Path):
+        # ``foo.pdf`` with PNG magic bytes — detection is by content,
+        # not by name, so this still goes as image. Prevents a
+        # renamed-file trap.
+        f = tmp_path / "fake.pdf"
+        f.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+        ch = _FakeChannel()
+        ctx = McpContext(channel=ch, peer_id="u1", workdir=tmp_path)
+        _run(_get_send_file(ctx)({"path": str(f)}))
+        ch.send_image.assert_called_once()
+        ch.send_file.assert_not_called()
+
+    def test_send_image_failure_falls_back_to_send_file(self, tmp_path: Path):
+        # Channels that don't implement send_image (base Channel,
+        # WeChat today) return False. We must not strand the user —
+        # degrade to send_file so the bytes at least reach them.
+        png = tmp_path / "pic.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+        ch = _FakeChannel(send_image_returns=False)
+        ctx = McpContext(channel=ch, peer_id="u1", workdir=tmp_path)
+        result = _run(_get_send_file(ctx)({"path": str(png)}))
+        assert result.get("is_error") is None
+        ch.send_image.assert_called_once()
+        ch.send_file.assert_called_once()
+        assert "as file" in _text_of(result)
 
     def test_send_runs_under_send_lock(self, tmp_path: Path):
         """The handler must hold ``send_lock`` across the send so

@@ -434,26 +434,55 @@ def _channel_tools(ctx: McpContext) -> list[SdkMcpTool]:
 
         caption = args.get("caption", "") or ""
 
-        # ``ch.send_file`` is synchronous but internally dispatches into
+        # Images get routed through ``send_image`` so the recipient
+        # sees an inline preview instead of a filename tile — detection
+        # is by magic bytes (not extension) so a .jpg that is really a
+        # zip doesn't get mis-routed. Channels that don't override
+        # ``send_image`` (e.g. WeChat today) fall back through the
+        # ``ok is False`` branch below, which retries via ``send_file``
+        # so the LLM still gets delivery instead of a hard failure.
+        from pip_agent.channels import _detect_image_mime
+
+        is_image = bool(_detect_image_mime(file_data))
+
+        # ``ch.send_*`` is synchronous but internally dispatches into
         # the channel's own event loop — it's a blocking wait. Offload
         # to a thread so the MCP handler does not stall the SDK event
         # loop (which is also processing streaming assistant output for
         # the same turn).
-        def _blocking_send() -> bool:
+        def _blocking_send_image() -> bool:
+            with ch.send_lock:
+                return ch.send_image(peer, file_data, caption=caption)
+
+        def _blocking_send_file() -> bool:
             with ch.send_lock:
                 return ch.send_file(
                     peer, file_data,
                     filename=path.name, caption=caption,
                 )
 
+        sent_as = "image" if is_image else "file"
         try:
-            ok = await asyncio.to_thread(_blocking_send)
+            if is_image:
+                ok = await asyncio.to_thread(_blocking_send_image)
+                # WeChat + base Channel return False from send_image
+                # (no override). Don't let the LLM's "send me that
+                # image" intent fail silently on those channels —
+                # gracefully downgrade to send_file, which at least
+                # delivers the bytes.
+                if not ok:
+                    sent_as = "file"
+                    ok = await asyncio.to_thread(_blocking_send_file)
+            else:
+                ok = await asyncio.to_thread(_blocking_send_file)
         except Exception as exc:  # noqa: BLE001
             log.exception("send_file crashed for %s", path)
             return _error(f"send_file crashed: {exc}")
 
         if ok:
-            return _text(f"File sent: {path.name} ({size} bytes)")
+            return _text(
+                f"Sent {path.name} ({size} bytes) as {sent_as}."
+            )
         return _error(f"Channel refused to send {path.name}.")
 
     return [
@@ -462,7 +491,10 @@ def _channel_tools(ctx: McpContext) -> list[SdkMcpTool]:
             description=(
                 "Send a local file to the current conversation through "
                 "the active messaging channel. Reads the file from disk "
-                "and delivers it via the channel (e.g. WeCom). Not "
+                "and delivers it via the channel (e.g. WeCom). Image "
+                "files (PNG/JPEG/GIF/WEBP) are auto-detected by magic "
+                "bytes and sent as inline images for preview; all "
+                "other file types are sent as attachments. Not "
                 "available on CLI. Relative paths resolve against the "
                 "agent's workdir."
             ),
