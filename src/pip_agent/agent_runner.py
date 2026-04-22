@@ -41,14 +41,14 @@ class QueryResult:
     num_turns: int = 0
 
 
-_BUILTIN_TOOLS: list[str] = [
-    "Bash", "Read", "Write", "Edit", "MultiEdit",
-    "Glob", "Grep",
-    "WebSearch", "WebFetch",
-    "Task", "TodoWrite", "Skill",
-    "NotebookEdit",
-    "mcp__pip__*",
-]
+# No hardcoded allowed-tools list: the Host deliberately does NOT
+# customise CC's tool surface. The SDK treats an empty ``allowed_tools``
+# (the default) as "use the CLI's built-in default set", and the
+# ``mcp_servers`` wiring registers our ``mcp__pip__*`` tools alongside
+# those automatically. Maintaining a whitelist here meant CC silently
+# losing access to any tool CC itself added after this list was last
+# edited — a clear violation of "Pip is a host, not a CC policy
+# author". See H6 in ``code_review_plan_133b34c7.plan.md``.
 
 
 def _build_env() -> dict[str, str]:
@@ -181,7 +181,6 @@ async def run_query(
             if system_prompt_append
             else None
         ),
-        allowed_tools=_BUILTIN_TOOLS,
         permission_mode="bypassPermissions",
         setting_sources=["project", "user"],
         env=_build_env(),

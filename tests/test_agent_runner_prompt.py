@@ -62,7 +62,7 @@ def _run(coro):
 
 class _FakeQuery:
     """Drop-in replacement for ``claude_agent_sdk.query`` that records
-    the prompt it saw and returns an empty result stream.
+    the prompt + options it saw and returns an empty result stream.
 
     We DON'T try to emulate the full SDK message lifecycle — the
     runner has its own tests elsewhere for ``ResultMessage`` /
@@ -72,9 +72,11 @@ class _FakeQuery:
 
     def __init__(self) -> None:
         self.captured_prompt: Any = None
+        self.captured_options: Any = None
 
     def __call__(self, *, prompt, options):  # noqa: D401
         self.captured_prompt = prompt
+        self.captured_options = options
 
         async def _empty_stream():
             # Surface at least a ResultMessage so run_query's loop
@@ -144,6 +146,34 @@ class TestBlockListPromptWrapped:
         assert env["session_id"] == ""
         # Content passes through unchanged, preserving order.
         assert env["message"] == {"role": "user", "content": blocks}
+
+    def test_no_custom_tool_whitelist_is_passed(self, tmp_path):
+        """H6 regression guard: the Host must not narrow CC's tool set.
+
+        Options default ``allowed_tools=[]``; the SDK only emits the
+        ``--allowedTools`` CLI flag when the list is truthy. If the
+        whitelist ever sneaks back in, CC silently loses any tool
+        added after the last time that list was edited. Assert that
+        ``allowed_tools`` is either empty or absent on the options
+        we hand the SDK. MCP tools (``mcp__pip__*``) are wired via
+        ``mcp_servers`` and never need listing in ``allowed_tools``.
+        """
+        fake = _FakeQuery()
+        ctx = McpContext(workdir=tmp_path)
+        with patch.object(agent_runner, "query", fake):
+            _run(agent_runner.run_query(
+                prompt="ping",
+                mcp_ctx=ctx,
+                stream_text=False,
+            ))
+        allowed = getattr(fake.captured_options, "allowed_tools", [])
+        assert not allowed, (
+            "Host should not customise CC's tool whitelist; "
+            "CC picks the default set when allowed_tools is empty."
+        )
+        # MCP wiring must still reach the subprocess — losing this would
+        # silently break every ``mcp__pip__*`` tool.
+        assert "pip" in fake.captured_options.mcp_servers
 
     def test_empty_block_list_still_wraps(self, tmp_path):
         # An empty list would be nonsense input but shouldn't crash —

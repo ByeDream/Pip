@@ -107,6 +107,68 @@ class MemoryStore:
                         continue
         return result
 
+    def purge_observations_through(self, cutoff_ts: float) -> int:
+        """Hard-delete observations with ``ts <= cutoff_ts``.
+
+        Used by Dream after a successful consolidate/axiom pass:
+        observations are an intermediate product — once their insight
+        has been merged into ``memories.json`` they have no further
+        value and keeping them around makes consolidate re-weight the
+        same old signal every night (the regression that motivated
+        H5).
+
+        Strategy: rewrite each daily ``observations/*.jsonl`` minus the
+        lines whose parsed ``ts`` is at or before the cutoff. Files that
+        end up empty are unlinked. Files that fail to parse a given
+        line are preserved (we never destroy bytes we can't understand
+        — a malformed line is always better kept than silently lost).
+
+        The cutoff approach (rather than deleting entire files) means
+        observations written by a concurrent ``reflect`` call while
+        Dream was running — whose ``ts`` is strictly greater than
+        ``cutoff_ts`` — survive this purge intact.
+
+        Returns the number of observation lines removed.
+        """
+        from pip_agent.fileutil import atomic_write
+
+        obs_dir = self.agent_dir / "observations"
+        if not obs_dir.is_dir():
+            return 0
+        purged = 0
+        with self._io_lock:
+            for fp in sorted(obs_dir.glob("*.jsonl")):
+                try:
+                    raw = fp.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                kept_lines: list[str] = []
+                for line in raw.splitlines():
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        obs = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        # Preserve unparseable bytes — they're not ours
+                        # to delete on a semantic cutoff.
+                        kept_lines.append(line)
+                        continue
+                    if isinstance(obs, dict) and float(obs.get("ts", 0)) <= cutoff_ts:
+                        purged += 1
+                        continue
+                    kept_lines.append(line)
+                try:
+                    if kept_lines:
+                        atomic_write(fp, "\n".join(kept_lines) + "\n")
+                    else:
+                        fp.unlink()
+                except OSError as exc:
+                    log.warning(
+                        "purge_observations: failed to update %s: %s", fp, exc,
+                    )
+        return purged
+
     # ------------------------------------------------------------------
     # Memories (L2)
     # ------------------------------------------------------------------
@@ -364,7 +426,13 @@ class MemoryStore:
         lines.append("")
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_text("\n".join(lines), encoding="utf-8")
+        # Atomic write so a crash mid-flush (Ctrl+C, OOM, power loss)
+        # can't leave a user profile half-written. The file is the
+        # source of truth for identity binding, admin bit, and the
+        # aliases list — a truncated write would silently demote a
+        # user to "unregistered" on the next load.
+        from pip_agent.fileutil import atomic_write
+        atomic_write(target_path, "\n".join(lines))
         return f"Updated user profile ({target_path.name}): {', '.join(updated_keys)}"
 
     # ------------------------------------------------------------------
@@ -433,7 +501,11 @@ class MemoryStore:
                     break
             lines.insert(insert_idx, f"- **Admin:** {new_val}")
 
-        profile.write_text("\n".join(lines), encoding="utf-8")
+        # Atomic write mirrors ``update_user_profile``: a torn write
+        # here would revert the admin flag to its previous value (or
+        # worse, corrupt the whole profile) on the next load.
+        from pip_agent.fileutil import atomic_write
+        atomic_write(profile, "\n".join(lines))
         action = "Granted" if grant else "Revoked"
         return f"{action} admin for '{name}'."
 

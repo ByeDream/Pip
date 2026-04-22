@@ -239,6 +239,69 @@ class TestLoadFormatted:
         _, text = load_formatted(path, max_chars=100)
         assert "[truncated]" in text
 
+    def test_truncation_rolls_cursor_back_so_next_pass_sees_line(
+        self, tmp_path: Path,
+    ):
+        """Regression guard for H1.
+
+        Previously ``last_offset`` was written before the decision to
+        include the line, so a line that triggered the max_chars break
+        was silently dropped AND the cursor skipped past it. Net effect:
+        permanent data loss for any transcript that bursted past the
+        budget.
+
+        Contract now: when we already have content and the next line
+        would overflow, the cursor stays at the last included line so
+        the next reflect pass picks up the overflowing line.
+        """
+        path = tmp_path / "s.jsonl"
+        short = "short reply"
+        long = "x" * 400
+        _write_jsonl(path, [
+            {"role": "user", "content": short},
+            {"role": "assistant", "content": long},
+            {"role": "user", "content": "after overflow"},
+        ])
+
+        # First pass: small budget fits only the short line.
+        offset1, text1 = load_formatted(path, max_chars=50)
+        assert short in text1
+        assert long not in text1
+        assert "[truncated]" in text1
+
+        # Second pass from the first-pass cursor: must re-encounter the
+        # long line (i.e. cursor was NOT advanced past it).
+        offset2, text2 = load_formatted(
+            path, start_offset=offset1, max_chars=10_000,
+        )
+        assert long in text2
+        assert "after overflow" in text2
+        assert offset2 > offset1
+
+    def test_single_oversize_first_line_advances_to_unblock(
+        self, tmp_path: Path,
+    ):
+        """Degenerate case: one line is larger than the whole budget.
+
+        Rolling back would stall reflect forever on the same line. Emit
+        a truncated slice and advance past it so subsequent lines get
+        their shot.
+        """
+        path = tmp_path / "s.jsonl"
+        huge = "y" * 500
+        _write_jsonl(path, [
+            {"role": "user", "content": huge},
+            {"role": "assistant", "content": "follow-up"},
+        ])
+        offset1, text1 = load_formatted(path, max_chars=100)
+        assert "[truncated]" in text1
+        # Cursor advanced past the oversize line so the next pass can
+        # reach "follow-up".
+        _, text2 = load_formatted(
+            path, start_offset=offset1, max_chars=10_000,
+        )
+        assert "follow-up" in text2
+
 
 class TestLocateSessionJsonl:
     def test_returns_match_when_present(self, tmp_path: Path):

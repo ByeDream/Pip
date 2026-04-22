@@ -2,7 +2,7 @@ import argparse
 import logging
 import sys
 
-from pip_agent.config import ConfigError, settings
+from pip_agent.config import settings
 
 
 def _configure_logging() -> None:
@@ -77,12 +77,8 @@ def main(argv: list[str] | None = None) -> None:
     force_utf8_console()
     _configure_logging()
 
-    try:
-        from pip_agent.agent_host import run_host
-        run_host(mode=args.mode, bind_agent=args.bind)
-    except ConfigError as exc:
-        print(f"  [config error] {exc}", file=sys.stderr)
-        sys.exit(1)
+    from pip_agent.agent_host import run_host
+    run_host(mode=args.mode, bind_agent=args.bind)
 
 
 if __name__ == "__main__":

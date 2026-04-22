@@ -33,14 +33,14 @@ class TestSendWithRetry:
         assert send_with_retry(ch, "user", "hello") is True
         assert ch._attempts == 1
 
-    @patch("pip_agent.channels.time.sleep")
+    @patch("pip_agent.channels.base.time.sleep")
     def test_retries_on_failure(self, mock_sleep):
         ch = _MockChannel(fail_count=2)
         assert send_with_retry(ch, "user", "hello") is True
         assert ch._attempts == 3
         assert mock_sleep.call_count == 2
 
-    @patch("pip_agent.channels.time.sleep")
+    @patch("pip_agent.channels.base.time.sleep")
     def test_gives_up_after_max_retries(self, mock_sleep):
         ch = _MockChannel(fail_count=100)
         assert send_with_retry(ch, "user", "hello") is False
@@ -52,7 +52,7 @@ class TestSendWithRetry:
         captured = capsys.readouterr()
         assert "hello" in captured.out
 
-    @patch("pip_agent.channels.time.sleep")
+    @patch("pip_agent.channels.base.time.sleep")
     def test_chunks_long_text(self, mock_sleep):
         ch = _MockChannel(fail_count=0)
         ch.name = "wechat"
@@ -60,7 +60,7 @@ class TestSendWithRetry:
         assert send_with_retry(ch, "user", text) is True
         assert ch._attempts >= 2
 
-    @patch("pip_agent.channels.time.sleep")
+    @patch("pip_agent.channels.base.time.sleep")
     def test_partial_failure(self, mock_sleep):
         """If one chunk fails permanently, returns False but still sends others."""
         class _PartialChannel(Channel):

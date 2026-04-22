@@ -130,17 +130,20 @@ class TestQ8FailurePreservesCursor:
         assert new_offset == 0
         assert obs == []
 
-    def test_invalid_json_from_llm_advances_cursor_but_returns_empty(
+    def test_invalid_json_from_llm_preserves_cursor_for_retry(
         self, tmp_path,
     ):
-        # Distinct contract: the LLM *responded*, just with garbage.
-        # The delta has been reviewed, so the cursor moves forward;
-        # we just can't extract anything. This is deliberately NOT
-        # a Q8 case — Q8 is reserved for transport / API failures
-        # that a retry could plausibly fix.
+        # Plan M1 contract: a malformed JSON reply is usually a
+        # transient model hiccup (truncation, stray fence, wrong
+        # output shape), not a sign that this delta is unusable.
+        # Keep the cursor at ``start_offset`` so the next reflect
+        # pass sees the same delta and can try again. Advancing
+        # would silently drop whatever observations that chunk was
+        # supposed to yield. Upper bound on retry cost is capped by
+        # how often reflect actually runs (heartbeat / PreCompact /
+        # /exit / MCP).
         path = tmp_path / "sess.jsonl"
         _write_transcript(path, [_user_line("hi"), _assistant_line("hello")])
-        full_size = path.stat().st_size
 
         class _GarbageResp:
             content = [type("B", (), {"text": "not json at all"})()]
@@ -158,7 +161,7 @@ class TestQ8FailurePreservesCursor:
             client=_GarbageClient(),
         )
 
-        assert new_offset == full_size
+        assert new_offset == 0
         assert obs == []
 
 

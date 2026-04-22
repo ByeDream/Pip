@@ -7,6 +7,7 @@ branches can be exercised without spinning up the full SDK runtime.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -109,7 +110,7 @@ class TestHeartbeatSentinelSilencing:
     def test_heartbeat_sentinel_not_sent_to_remote_channel(self, monkeypatch):
         sent: list[tuple[str, str]] = []
 
-        def _fake_send(ch, peer, text):
+        def _fake_send(ch, peer, text, **kw):
             sent.append((peer, text))
             return True
 
@@ -134,7 +135,7 @@ class TestHeartbeatSentinelSilencing:
     def test_substantive_heartbeat_reply_goes_to_remote_channel(self, monkeypatch):
         sent: list[tuple[str, str]] = []
 
-        def _fake_send(ch, peer, text):
+        def _fake_send(ch, peer, text, **kw):
             sent.append((peer, text))
             return True
 
@@ -208,7 +209,7 @@ class TestRemoteChannel:
     def test_user_text_is_sent_via_channel(self, monkeypatch):
         sent: list[tuple[str, str]] = []
 
-        def _fake_send(ch, peer, text):
+        def _fake_send(ch, peer, text, **kw):
             sent.append((peer, text))
             return True
 
@@ -249,7 +250,7 @@ class TestCronNotSilenced:
     def test_cron_text_goes_through_remote_channel(self, monkeypatch):
         sent: list[tuple[str, str]] = []
 
-        def _fake_send(ch, peer, text):
+        def _fake_send(ch, peer, text, **kw):
             sent.append((peer, text))
             return True
 
@@ -332,7 +333,7 @@ class TestReapStaleSession:
 
         jsonl = tmp_path / "live.jsonl"
         jsonl.write_text("{}", "utf-8")
-        monkeypatch.setattr(mod, "locate_session_jsonl", lambda sid: jsonl)
+        monkeypatch.setattr(mod, "locate_session_jsonl", lambda sid, **_kw: jsonl)
         save_calls: list[dict] = []
         monkeypatch.setattr(
             mod, "_save_sessions", lambda s: save_calls.append(dict(s)),
@@ -350,7 +351,7 @@ class TestReapStaleSession:
     ):
         import pip_agent.agent_host as mod
 
-        monkeypatch.setattr(mod, "locate_session_jsonl", lambda sid: None)
+        monkeypatch.setattr(mod, "locate_session_jsonl", lambda sid, **_kw: None)
         save_calls: list[dict] = []
         monkeypatch.setattr(
             mod, "_save_sessions", lambda s: save_calls.append(dict(s)),
@@ -530,7 +531,8 @@ class TestFlushAndRotate:
             mod, "_save_sessions", lambda s: save_calls.append(dict(s)),
         )
         monkeypatch.setattr(
-            mod, "locate_session_jsonl", lambda _sid: tmp_path / "fake.jsonl",
+            mod, "locate_session_jsonl",
+            lambda _sid, **_kw: tmp_path / "fake.jsonl",
         )
         monkeypatch.setattr(
             "pip_agent.anthropic_client.build_anthropic_client",
@@ -571,7 +573,7 @@ class TestFlushAndRotate:
         monkeypatch.setattr(
             mod, "_save_sessions", lambda s: save_calls.append(dict(s)),
         )
-        monkeypatch.setattr(mod, "locate_session_jsonl", lambda _sid: None)
+        monkeypatch.setattr(mod, "locate_session_jsonl", lambda _sid, **_kw: None)
         monkeypatch.setattr(
             "pip_agent.anthropic_client.build_anthropic_client",
             lambda: object(),
@@ -613,7 +615,8 @@ class TestFlushAndRotate:
             mod, "_save_sessions", lambda s: save_calls.append(dict(s)),
         )
         monkeypatch.setattr(
-            mod, "locate_session_jsonl", lambda _sid: tmp_path / "x.jsonl",
+            mod, "locate_session_jsonl",
+            lambda _sid, **_kw: tmp_path / "x.jsonl",
         )
         monkeypatch.setattr(
             "pip_agent.anthropic_client.build_anthropic_client",
@@ -790,3 +793,143 @@ class TestReflectAndPersist:
         assert (start, end, n) == (10, 10, 0)
         # Cursor is exactly where we left it — next trigger retries.
         assert store.load_state()[OFFSET_STATE_KEY]["sess"] == 10
+
+    def test_two_phase_commit_clears_pending_on_happy_path(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Happy path: the stage marker must NOT linger in state.json.
+
+        Regression guard for H2: if the commit-phase pop is ever
+        removed, the next reflect call will drain the stage a second
+        time and duplicate observations forever.
+        """
+        from pip_agent.memory.reflect import (
+            PENDING_REFLECT_KEY,
+            reflect_and_persist,
+        )
+
+        store = self._store(tmp_path)
+
+        monkeypatch.setattr(
+            "pip_agent.memory.reflect.reflect_from_jsonl",
+            lambda *a, **kw: (
+                100,
+                [{
+                    "ts": 1.0, "text": "o", "category": "decision",
+                    "source": "auto",
+                }],
+            ),
+        )
+
+        reflect_and_persist(
+            memory_store=store,
+            session_id="sess",
+            transcript_path=tmp_path / "x.jsonl",
+            client=object(),
+        )
+
+        assert PENDING_REFLECT_KEY not in store.load_state()
+
+    def test_crash_between_stage_and_commit_is_recovered_on_next_run(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Simulate a crash *after* stage + append but *before* the
+        stage-clear save. On restart the pending bundle must be
+        drained, the cursor advanced, and no double-append caused.
+
+        Implementation detail: we manually plant a pending bundle
+        (that's what a crashed prior run would have left on disk) and
+        call ``reflect_and_persist`` with a no-op reflect (empty new
+        delta). Post-condition: pending is gone, the cursor matches
+        the staged offset, and observations from the bundle are on
+        disk exactly once.
+        """
+        from pip_agent.memory.reflect import (
+            OFFSET_STATE_KEY,
+            PENDING_REFLECT_KEY,
+            reflect_and_persist,
+        )
+
+        store = self._store(tmp_path)
+        staged_obs = [{
+            "ts": 2.0, "text": "staged before crash",
+            "category": "lesson", "source": "auto",
+        }]
+        store.save_state({
+            PENDING_REFLECT_KEY: {
+                "session_id": "sess",
+                "new_offset": 500,
+                "observations": staged_obs,
+            },
+        })
+
+        monkeypatch.setattr(
+            "pip_agent.memory.reflect.reflect_from_jsonl",
+            lambda *a, **kw: (500, []),  # cursor matches stage → no new work
+        )
+
+        reflect_and_persist(
+            memory_store=store,
+            session_id="sess",
+            transcript_path=tmp_path / "x.jsonl",
+            client=object(),
+        )
+
+        state = store.load_state()
+        assert PENDING_REFLECT_KEY not in state
+        assert state[OFFSET_STATE_KEY]["sess"] == 500
+        obs = store.load_all_observations()
+        assert len(obs) == 1
+        assert obs[0]["text"] == "staged before crash"
+
+    def test_stage_saved_before_observations_write(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """The pending marker must hit disk BEFORE observations are
+        appended. Otherwise a crash inside write_observations would
+        leave no trace for the drain to recover.
+        """
+        from pip_agent.memory.reflect import (
+            PENDING_REFLECT_KEY,
+            reflect_and_persist,
+        )
+
+        store = self._store(tmp_path)
+
+        monkeypatch.setattr(
+            "pip_agent.memory.reflect.reflect_from_jsonl",
+            lambda *a, **kw: (
+                300,
+                [{
+                    "ts": 3.0, "text": "o", "category": "decision",
+                    "source": "auto",
+                }],
+            ),
+        )
+
+        events: list[str] = []
+        original_save = store.save_state
+        original_write = store.write_observations
+
+        def traced_save(s):
+            if PENDING_REFLECT_KEY in s:
+                events.append("stage")
+            else:
+                events.append("commit")
+            original_save(s)
+
+        def traced_write(obs):
+            events.append("append")
+            original_write(obs)
+
+        store.save_state = traced_save  # type: ignore[method-assign]
+        store.write_observations = traced_write  # type: ignore[method-assign]
+
+        reflect_and_persist(
+            memory_store=store,
+            session_id="sess",
+            transcript_path=tmp_path / "x.jsonl",
+            client=object(),
+        )
+
+        assert events == ["stage", "append", "commit"]

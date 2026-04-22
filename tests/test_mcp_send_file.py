@@ -141,14 +141,15 @@ class TestInputValidation:
 
 
 class TestPathResolution:
-    def test_absolute_path_is_respected(self, tmp_path: Path):
-        f = _make_file(tmp_path / "abs.txt", size=32)
+    def test_absolute_path_inside_workdir_is_respected(self, tmp_path: Path):
+        # Absolute paths are allowed as long as they resolve inside the
+        # agent's workdir. See ``test_absolute_escape_is_rejected`` for
+        # the negative case.
+        workdir = tmp_path / "wd"
+        workdir.mkdir()
+        f = _make_file(workdir / "abs.txt", size=32)
         ch = _FakeChannel()
-        # workdir is unrelated on purpose — an absolute path must not
-        # be prepended.
-        ctx = McpContext(
-            channel=ch, peer_id="u1", workdir=tmp_path / "other",
-        )
+        ctx = McpContext(channel=ch, peer_id="u1", workdir=workdir)
         result = _run(_get_send_file(ctx)({"path": str(f)}))
         assert result.get("is_error") is None
         ch.send_file.assert_called_once()
@@ -165,6 +166,74 @@ class TestPathResolution:
         (_to, data), kwargs = ch.send_file.call_args[:2], ch.send_file.call_args.kwargs
         assert len(ch.send_file.call_args.args[1]) == 64
         assert kwargs.get("filename") == "doc.pdf"
+
+
+# ---------------------------------------------------------------------------
+# Path containment (plan M5 — defence in depth)
+# ---------------------------------------------------------------------------
+
+
+class TestPathContainment:
+    """``send_file`` is a file-read primitive driven by LLM-controlled
+    input, so the path must be clamped to the agent's workdir. Absolute
+    paths pointing outside, relative paths escaping via ``..``, and
+    symlinks escaping via a link target are all rejected. The LLM
+    never gets to read ``/etc/passwd`` or ``C:\\Users\\me\\.ssh\\...``
+    through this tool.
+    """
+
+    def test_absolute_escape_is_rejected(self, tmp_path: Path):
+        outside = tmp_path / "outside.txt"
+        outside.write_bytes(b"secret")
+        workdir = tmp_path / "wd"
+        workdir.mkdir()
+        ch = _FakeChannel()
+        ctx = McpContext(channel=ch, peer_id="u1", workdir=workdir)
+        result = _run(_get_send_file(ctx)({"path": str(outside)}))
+        assert result.get("is_error") is True
+        assert "escape" in _text_of(result).lower() or \
+               "workdir" in _text_of(result).lower()
+        ch.send_file.assert_not_called()
+
+    def test_relative_dotdot_escape_is_rejected(self, tmp_path: Path):
+        # Classic path-traversal: relative path that walks out of the
+        # workdir. Must be caught by the resolve() + relative_to()
+        # check even though ``..`` has no symlink dimension.
+        outside = tmp_path / "sibling.txt"
+        outside.write_bytes(b"hi")
+        workdir = tmp_path / "wd"
+        workdir.mkdir()
+        ch = _FakeChannel()
+        ctx = McpContext(channel=ch, peer_id="u1", workdir=workdir)
+        result = _run(_get_send_file(ctx)({"path": "../sibling.txt"}))
+        assert result.get("is_error") is True
+        assert "escape" in _text_of(result).lower() or \
+               "workdir" in _text_of(result).lower()
+        ch.send_file.assert_not_called()
+
+    def test_symlink_escape_is_rejected(self, tmp_path: Path):
+        # Symlinked file inside the workdir pointing to a file
+        # outside: without ``resolve()`` the containment check would
+        # let this through. ``os.symlink`` is flaky on Windows
+        # (requires admin or developer mode), so skip if the platform
+        # refuses to create one — the other two tests already cover
+        # the same invariant via different escape vectors.
+        import os
+        outside = tmp_path / "secret.txt"
+        outside.write_bytes(b"password")
+        workdir = tmp_path / "wd"
+        workdir.mkdir()
+        link = workdir / "shortcut.txt"
+        try:
+            os.symlink(outside, link)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks unavailable on this platform")
+
+        ch = _FakeChannel()
+        ctx = McpContext(channel=ch, peer_id="u1", workdir=workdir)
+        result = _run(_get_send_file(ctx)({"path": "shortcut.txt"}))
+        assert result.get("is_error") is True
+        ch.send_file.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

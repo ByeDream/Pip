@@ -11,11 +11,6 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
-class ConfigError(Exception):
-    """Raised when required configuration is missing or invalid."""
-
-
 WORKDIR: Path = Path.cwd()
 """Absolute path of the workspace Pip-Boy is running in.
 

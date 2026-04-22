@@ -140,9 +140,26 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
         return CommandResult(handled=False)
 
     # --- ACL gate ---
+    #
+    # Policy (plan M9):
+    #   * CLI is always owner.  The only way to reach the CLI prompt is
+    #     to have shell access on the host, so there is no useful threat
+    #     model where we would want to deny it.  This holds even when
+    #     ``memory_store`` is ``None`` (tests, early boot, etc.).
+    #   * Non-CLI channels fail **closed** when ``memory_store`` is
+    #     missing.  Without the store we cannot evaluate ``owner.md`` or
+    #     the admin flag on a user profile, and silently treating a
+    #     remote sender as "owner" would bypass the whole ACL surface.
+    #     Tests that need to exercise remote ACL paths must supply a
+    #     memory store (real or fake).
     ch, sid = ctx.inbound.channel, ctx.inbound.sender_id
     ms = ctx.memory_store
-    owner = ms.is_owner(ch, sid) if ms else (ch == "cli")
+    if ch == "cli":
+        owner = True
+    elif ms is None:
+        owner = False
+    else:
+        owner = ms.is_owner(ch, sid)
 
     if cmd not in _OPEN_COMMANDS:
         if cmd in _OWNER_ONLY_COMMANDS and not owner:
@@ -150,7 +167,9 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
                 handled=True, response="Permission denied: owner only.",
             )
         if not owner:
-            admin = ms.is_admin(ch, sid) if ms else False
+            # ``is_admin`` needs the memory store for the same reason
+            # ``is_owner`` does. Fail closed when it is unavailable.
+            admin = ms.is_admin(ch, sid) if ms is not None else False
             if not admin:
                 return CommandResult(
                     handled=True,

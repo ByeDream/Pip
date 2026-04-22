@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -128,7 +127,7 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
         from pip_agent.memory.reflect import reflect_and_persist
         from pip_agent.memory.transcript_source import locate_session_jsonl
 
-        path = locate_session_jsonl(ctx.session_id)
+        path = locate_session_jsonl(ctx.session_id, prefer_cwd=ctx.workdir)
         if path is None:
             return _text(
                 f"Reflection skipped: transcript for session {ctx.session_id[:8]} "
@@ -241,7 +240,7 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
 
 
 # ---------------------------------------------------------------------------
-# Cron tools — wiring to HostScheduler lands in Phase 5.
+# Cron tools — scheduled self-messaging via HostScheduler.
 # ---------------------------------------------------------------------------
 
 
@@ -249,7 +248,12 @@ def _cron_tools(ctx: McpContext) -> list[SdkMcpTool]:
 
     def _require_scheduler() -> str | None:
         if ctx.scheduler is None:
-            return "Scheduler not wired (pending Phase 5)."
+            # McpContext without a scheduler means this tool was
+            # invoked outside the running host (unit test / ad-hoc
+            # ``reflect`` MCP call). Cron jobs can't fire without one,
+            # so refuse explicitly rather than silently accepting a
+            # schedule that will never run.
+            return "Scheduler not available in this context."
         return None
 
     async def cron_add(args: dict[str, Any]) -> dict[str, Any]:
@@ -405,6 +409,36 @@ def _channel_tools(ctx: McpContext) -> list[SdkMcpTool]:
         # bit of flexibility here.
         if not path.is_absolute():
             path = ctx.workdir / path
+
+        # Path containment guard (plan M5 / defence-in-depth).
+        # The LLM chooses ``path``; a prompt-injection attempt could
+        # try to exfiltrate arbitrary host files via ``/etc/passwd``,
+        # ``C:\\Windows\\...`` or ``../../.ssh/id_rsa``. We clamp the
+        # whole tool to files that resolve inside the agent's
+        # workdir, which is where ``Read`` / ``Write`` also operate.
+        # Use ``resolve()`` (not ``absolute()``) so symlinks pointing
+        # outside the workdir are also rejected. ``strict=False`` is
+        # needed because the file might not exist yet — we check
+        # ``is_file()`` separately below, which returns a cleaner
+        # error message than ``resolve(strict=True)``.
+        try:
+            resolved_path = path.resolve(strict=False)
+            resolved_workdir = ctx.workdir.resolve(strict=False)
+        except OSError as exc:
+            return _error(f"Cannot resolve path {raw_path!r}: {exc}")
+
+        try:
+            resolved_path.relative_to(resolved_workdir)
+        except ValueError:
+            return _error(
+                "Path escapes workdir. ``send_file`` is restricted "
+                "to files inside the agent's workdir for safety.",
+            )
+
+        # All downstream operations use the resolved path so symlink
+        # tricks (``workdir/foo -> /etc/passwd``) don't open a hole
+        # between the containment check and ``read_bytes``.
+        path = resolved_path
 
         if not path.is_file():
             return _error(f"File not found: {path}")

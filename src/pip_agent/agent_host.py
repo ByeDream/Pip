@@ -16,7 +16,9 @@ import threading
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+from pip_agent import host_commands
 from pip_agent.agent_runner import QueryResult, run_query
 from pip_agent.channels import (
     Channel,
@@ -29,7 +31,6 @@ from pip_agent.channels import (
     wechat_poll_loop,
     wecom_ws_loop,
 )
-from pip_agent import host_commands
 from pip_agent.config import WORKDIR, settings
 from pip_agent.host_scheduler import HostScheduler
 from pip_agent.mcp_tools import McpContext
@@ -103,9 +104,16 @@ def _load_sessions() -> dict[str, str]:
 
 
 def _save_sessions(sessions: dict[str, str]) -> None:
-    SESSION_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SESSION_STORE_PATH.write_text(
-        json.dumps(sessions, indent=2, ensure_ascii=False), "utf-8",
+    # ``atomic_write`` (tmp + fsync + os.replace) prevents a crashed or
+    # power-cut write from leaving a half-written JSON blob on disk.
+    # ``_load_sessions`` swallows ``JSONDecodeError`` and returns ``{}``,
+    # so a partial write silently wipes every agent's session binding —
+    # exactly the kind of failure this path must not have.
+    from pip_agent.fileutil import atomic_write
+
+    atomic_write(
+        SESSION_STORE_PATH,
+        json.dumps(sessions, indent=2, ensure_ascii=False),
     )
 
 
@@ -480,6 +488,25 @@ class _PerAgent:
     memory_store: MemoryStore
 
 
+@dataclass(slots=True)
+class _PreparedTurn:
+    """Value bundle returned by :meth:`AgentHost._prepare_turn`.
+
+    Carries the state that :meth:`AgentHost._execute_turn` needs from
+    the pre-processing phase without re-plumbing 7 positional arguments
+    through every helper. Intentionally kept private — callers outside
+    ``agent_host`` have no business assembling one.
+    """
+
+    eff: Any  # resolve_effective_config return (AgentConfig-shaped)
+    svc: _PerAgent
+    sk: str
+    ch: Channel | None
+    reply_peer: str
+    prompt: Any  # str | list (multimodal content)
+    system_prompt: str
+
+
 class AgentHost:
     """Multi-channel host driving the SDK agent for every inbound message."""
 
@@ -567,7 +594,7 @@ class AgentHost:
         sid = self._sessions.get(sk)
         if not sid:
             return None
-        if locate_session_jsonl(sid) is not None:
+        if locate_session_jsonl(sid, prefer_cwd=WORKDIR) is not None:
             return sid
         log.warning(
             "Session %s for %s is missing on disk — starting fresh",
@@ -651,7 +678,7 @@ class AgentHost:
             # "did an LLM call actually happen for this session", which
             # is what the CLI status line needs to not lie to the user.
             def _reflect_one(sk: str, sid: str) -> None:
-                path = locate_session_jsonl(sid)
+                path = locate_session_jsonl(sid, prefer_cwd=WORKDIR)
                 if path is None:
                     log.info(
                         "flush_and_rotate: transcript for %s missing; "
@@ -717,7 +744,38 @@ class AgentHost:
         )
 
     async def process_inbound(self, inbound: InboundMessage) -> None:
-        """Route one inbound message through the SDK agent and reply."""
+        """Route one inbound message through the SDK agent and reply.
+
+        Split into three phases for readability:
+
+        1. **pre** — :meth:`_prepare_turn` resolves the agent, runs
+           host-layer slash commands (which may short-circuit the whole
+           turn), enriches the system prompt, materialises attachments
+           and renders the SDK prompt.
+        2. **dispatch** — :meth:`_execute_turn` acquires the per-session
+           lock and the global semaphore, runs the SDK query, and
+           persists the resulting session id back to ``self._sessions``.
+        3. **post** — :meth:`_dispatch_reply` routes the reply text /
+           error back through the originating channel, with the
+           heartbeat-sentinel silencing contract applied.
+        """
+        prepared = self._prepare_turn(inbound)
+        if prepared is None:
+            return  # slash command handled inline; nothing more to do.
+
+        await self._execute_turn(inbound, prepared)
+
+    def _prepare_turn(
+        self, inbound: InboundMessage,
+    ) -> _PreparedTurn | None:
+        """Resolve routing, enrich the prompt, and short-circuit slash commands.
+
+        Returns ``None`` when the inbound was fully handled by the
+        host-layer command dispatcher (no SDK turn required). Otherwise
+        returns a :class:`_PreparedTurn` bundle with everything
+        :meth:`_execute_turn` needs to run the SDK call and route the
+        reply.
+        """
         if inbound.agent_id:
             agent_id = inbound.agent_id
             binding = None
@@ -754,7 +812,7 @@ class AgentHost:
         )
         if cmd_result.handled:
             self._deliver_command_response(inbound, cmd_result.response)
-            return
+            return None
 
         sk = build_session_key(
             agent_id=eff.id,
@@ -798,7 +856,29 @@ class AgentHost:
         if inbound.channel == "wechat" and isinstance(ch, WeChatChannel):
             ch.send_typing(inbound.peer_id)
 
-        current_session = self._reap_stale_session(sk)
+        return _PreparedTurn(
+            eff=eff, svc=svc, sk=sk, ch=ch,
+            reply_peer=reply_peer, prompt=prompt,
+            system_prompt=system_prompt,
+        )
+
+    async def _execute_turn(
+        self, inbound: InboundMessage, prepared: _PreparedTurn,
+    ) -> None:
+        """Acquire per-session + global locks, run the SDK query, route reply.
+
+        Kept in one block (rather than split into separate "call" and
+        "post" helpers) because the session-id persistence has to
+        happen *inside* the lock that guarded the read — see the inline
+        note on H4 — and splitting would force either re-entry or a
+        fragile lock-hand-off between methods.
+        """
+        eff = prepared.eff
+        svc = prepared.svc
+        sk = prepared.sk
+        ch = prepared.ch
+        reply_peer = prepared.reply_peer
+
         is_heartbeat = inbound.sender_id == _HEARTBEAT_SENDER
         # Scheduler-injected senders skip SDK session persistence —
         # see :func:`_is_ephemeral_sender` for the full rationale and
@@ -807,26 +887,6 @@ class AgentHost:
         # 3 min one over the course of a day. ``stream_text=not is_heartbeat``
         # remains a separate concern (HEARTBEAT_OK silencing).
         is_ephemeral = _is_ephemeral_sender(inbound.sender_id)
-        # Two distinct concepts, intentionally decoupled:
-        #
-        # * ``session_for_turn`` controls SDK *resume* — whether this turn's
-        #   context is built from an existing JSONL. ``None`` for ephemeral
-        #   senders so cron / heartbeat don't load and don't append.
-        # * ``ctx_session_id`` is the session id made visible to Pip-Boy's
-        #   own MCP tools (``reflect`` in particular). It must point at the
-        #   *user's* session JSONL even for ephemeral turns, because the
-        #   whole point of an "at 2 am run reflect" cron is for that cron
-        #   to process the user conversation that the cron itself never
-        #   participated in. Zeroing this out would silently break
-        #   cron-driven memory maintenance.
-        session_for_turn: str | None = None if is_ephemeral else current_session
-        ctx_session_id = current_session or ""
-
-        mcp_ctx = self._build_mcp_ctx(
-            svc, eff.effective_model, inbound.sender_id,
-            channel=ch, peer_id=reply_peer,
-            session_id=ctx_session_id,
-        )
 
         # ``track`` owns the scheduler-side bookkeeping: coalesce-key
         # release on exit (so the next tick can fire again) and cron
@@ -841,13 +901,48 @@ class AgentHost:
         )
         with tracker as tracked:
             async with self._get_session_lock(sk), self._semaphore:
+                # Resolve the resume session id INSIDE the per-session
+                # lock. Two concurrent inbounds on the same ``sk`` would
+                # otherwise both read the same stale id before either
+                # had a chance to persist ``result.session_id`` back —
+                # the second turn would then resume a session the first
+                # turn has already rotated away from, and whichever
+                # finishes last clobbers the other's persisted state.
+                # Per-session serialisation is already enforced; bringing
+                # the read inside closes the gap for free.
+                current_session = self._reap_stale_session(sk)
+                # Two distinct concepts, intentionally decoupled:
+                #
+                # * ``session_for_turn`` controls SDK *resume* — whether this
+                #   turn's context is built from an existing JSONL. ``None``
+                #   for ephemeral senders so cron / heartbeat don't load
+                #   and don't append.
+                # * ``ctx_session_id`` is the session id made visible to
+                #   Pip-Boy's own MCP tools (``reflect`` in particular).
+                #   It must point at the *user's* session JSONL even for
+                #   ephemeral turns, because the whole point of an "at 2 am
+                #   run reflect" cron is for that cron to process the user
+                #   conversation that the cron itself never participated in.
+                #   Zeroing this out would silently break cron-driven memory
+                #   maintenance.
+                session_for_turn: str | None = (
+                    None if is_ephemeral else current_session
+                )
+                ctx_session_id = current_session or ""
+
+                mcp_ctx = self._build_mcp_ctx(
+                    svc, eff.effective_model, inbound.sender_id,
+                    channel=ch, peer_id=reply_peer,
+                    session_id=ctx_session_id,
+                )
+
                 try:
                     result: QueryResult = await run_query(
-                        prompt=prompt,
+                        prompt=prepared.prompt,
                         mcp_ctx=mcp_ctx,
                         model=eff.effective_model,
                         session_id=session_for_turn,
-                        system_prompt_append=system_prompt,
+                        system_prompt_append=prepared.system_prompt,
                         cwd=WORKDIR,
                         # Heartbeats must NOT stream: we need to inspect the
                         # full reply before deciding whether to print (so we
@@ -860,21 +955,34 @@ class AgentHost:
                     log.error("SDK query failed for %s: %s", sk, exc)
                     tracked.failure(f"SDK query failed: {exc}")
                     if ch:
-                        send_with_retry(ch, reply_peer, f"[error] {exc}")
+                        send_with_retry(
+                            ch, reply_peer, f"[error] {exc}",
+                            inbound_id=str(
+                                inbound.raw.get("_pip_inbound_id") or ""
+                            ),
+                        )
                     return
+
+                # Persist the new session id BEFORE releasing the lock so
+                # the next inbound on the same ``sk`` sees it. Doing this
+                # after the ``async with`` closes reopens the race H4 was
+                # supposed to fix: two concurrent turns would both read a
+                # stale ``current_session`` and the later one would
+                # clobber the earlier one's id on save.
+                #
+                # Skip for ephemeral senders — their ``result.session_id``
+                # is a throwaway the SDK minted for this one turn, and
+                # binding it to ``sk`` would overwrite the user's real
+                # session on the next save.
+                if not is_ephemeral and result.session_id:
+                    self._sessions[sk] = result.session_id
+                    _save_sessions(self._sessions)
 
             if result.error:
                 # Soft failure — ``run_query`` returned normally but the
                 # SDK reported a tool / API error. Count it toward the
                 # cron auto-disable streak just like a raised exception.
                 tracked.failure(result.error)
-
-            # Skip persistence for ephemeral senders — their ``result.session_id``
-            # is a throwaway the SDK minted for this one turn, and binding it to
-            # ``sk`` would overwrite the user's real session on the next save.
-            if not is_ephemeral and result.session_id:
-                self._sessions[sk] = result.session_id
-                _save_sessions(self._sessions)
 
             self._dispatch_reply(
                 inbound=inbound,
@@ -909,7 +1017,10 @@ class AgentHost:
             # the next ``>>>`` prompt starts on its own line.
             print(f"  {response}")
         elif ch:
-            send_with_retry(ch, reply_peer, response)
+            send_with_retry(
+                ch, reply_peer, response,
+                inbound_id=str(inbound.raw.get("_pip_inbound_id") or ""),
+            )
 
     @staticmethod
     def _dispatch_reply(
@@ -950,12 +1061,17 @@ class AgentHost:
             )
             return
 
+        inbound_id = str(inbound.raw.get("_pip_inbound_id") or "")
+
         if result.error:
             log.warning("Agent error for %s: %s", session_key, result.error)
             if inbound.channel == "cli":
                 print(f"\n  [error] {result.error}")
             elif ch:
-                send_with_retry(ch, reply_peer, f"[error] {result.error}")
+                send_with_retry(
+                    ch, reply_peer, f"[error] {result.error}",
+                    inbound_id=inbound_id,
+                )
             return
 
         if result.text:
@@ -971,7 +1087,9 @@ class AgentHost:
                 else:
                     print()
             elif ch:
-                send_with_retry(ch, reply_peer, result.text)
+                send_with_retry(
+                    ch, reply_peer, result.text, inbound_id=inbound_id,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1173,11 +1291,23 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
                         # here is picked up on the next PreCompact anyway.
                         log.exception("flush_and_rotate failed during /exit")
                         summary = FlushSummary()
-                    if summary.reflected:
+                    # Message priority is *observations* first — the only
+                    # signal the user actually cares about is whether
+                    # memory grew. "reflected N session(s) wrote 0" is
+                    # technically true but reads like progress when there
+                    # was none. Separating the "we looked but saw nothing
+                    # new" case avoids over-promising.
+                    if summary.observations:
                         print(
                             f"  Powering down — reflected "
                             f"{summary.reflected} session(s), "
                             f"wrote {summary.observations} observation(s)."
+                        )
+                    elif summary.reflected:
+                        print(
+                            f"  Powering down — reviewed "
+                            f"{summary.reflected} session(s); "
+                            f"no new observations."
                         )
                     elif summary.rotated:
                         print(
@@ -1224,6 +1354,17 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
         pass
     finally:
         stop_event.set()
+        # Mirror the ``/exit`` reflect path on any exit — Ctrl+C / a
+        # crashing channel thread / SystemExit all land here instead
+        # of the graceful ``/exit`` branch. Without this, a few hours
+        # of interactive traffic can evaporate because reflect only
+        # ever runs on heartbeat / PreCompact / clean /exit. The call
+        # is synchronous in its own event loop; exceptions are
+        # swallowed so a broken reflect never blocks shutdown.
+        try:
+            asyncio.run(host.flush_and_rotate())
+        except Exception:  # noqa: BLE001
+            log.exception("shutdown flush_and_rotate failed")
         scheduler.stop()
         channel_mgr.close_all()
         for t in bg_threads:

@@ -202,6 +202,19 @@ def load_formatted(
     byte position to persist so the next call only processes newly-appended
     lines. If nothing new is available, text is ``""`` and ``new_offset``
     equals ``start_offset``.
+
+    Cursor semantics on ``max_chars`` truncation
+    --------------------------------------------
+    If appending the next renderable line would exceed ``max_chars`` and
+    we already have at least one line in the buffer, the cursor is *not*
+    advanced past that line — the oversize content stays in the delta so
+    the next reflect pass can pick it up. (Earlier versions advanced past
+    the rejected line, silently losing its content forever.)
+
+    Degenerate case: the *first* renderable line is already larger than
+    ``max_chars``. Rolling back would make the cursor stick and block
+    reflect forever on the same pathological line, so we emit a truncated
+    slice, log a warning, and advance past it — progress beats stalling.
     """
     if not path.is_file():
         return start_offset, ""
@@ -211,17 +224,30 @@ def load_formatted(
     last_offset = start_offset
 
     for offset, record in iter_transcript(path, start_offset):
-        last_offset = offset
         parsed = normalize_line(record)
         if not parsed:
+            # Meta / system / empty-content lines carry nothing for reflect;
+            # advance past them so they don't re-read next pass.
+            last_offset = offset
             continue
         role, text = parsed
         rendered = f"[{role.upper()}] {text}"
-        total_chars += len(rendered)
-        if total_chars > max_chars:
+        if total_chars + len(rendered) > max_chars:
+            if lines:
+                lines.append("[truncated]")
+                break
+            log.warning(
+                "transcript line at offset %d exceeds max_chars=%d; "
+                "emitting truncated slice",
+                offset, max_chars,
+            )
+            lines.append(rendered[:max_chars])
             lines.append("[truncated]")
+            last_offset = offset
             break
         lines.append(rendered)
+        total_chars += len(rendered)
+        last_offset = offset
 
     return last_offset, "\n".join(lines)
 
@@ -231,10 +257,28 @@ def load_formatted(
 # ---------------------------------------------------------------------------
 
 
+def _encode_cwd_for_cc_projects(cwd: Path) -> str:
+    """Best-effort replica of CC's ``<enc-cwd>`` folder naming.
+
+    Claude Code encodes the cwd path by replacing path separators and
+    colons with dashes, e.g. ``D:\\Workspace\\Pip-Boy`` becomes
+    ``D--Workspace-Pip-Boy``. The exact algorithm may drift over time,
+    so this helper is used only as a *preference* signal inside
+    :func:`locate_session_jsonl` — never as a hard match. If the
+    encoding changes, we fall back to mtime sorting without losing
+    correctness.
+    """
+    s = str(cwd.resolve()) if cwd.is_absolute() else str(cwd)
+    for ch in ("\\", "/", ":"):
+        s = s.replace(ch, "-")
+    return s
+
+
 def locate_session_jsonl(
     session_id: str,
     *,
     projects_root: Path | None = None,
+    prefer_cwd: Path | None = None,
 ) -> Path | None:
     """Return the JSONL file for ``session_id``, or ``None`` if not found.
 
@@ -242,6 +286,12 @@ def locate_session_jsonl(
     passed via ``projects_root``). The lookup is by filename, so the cwd
     encoding used by Claude Code is irrelevant — there should only be one
     match across all project folders for a given session id.
+
+    Disambiguation (plan M10): if ``prefer_cwd`` is provided AND multiple
+    matches exist, prefer the match whose parent directory name matches
+    CC's encoding of ``prefer_cwd`` (usually the host's ``WORKDIR``).
+    Falls back to "most-recently modified" when no encoded match is
+    found, so a CC encoding drift never breaks the lookup.
 
     Hook-driven reflect paths should prefer ``input_data['transcript_path']``
     from the hook payload; this helper exists for the ``reflect`` MCP tool and
@@ -259,8 +309,20 @@ def locate_session_jsonl(
         return None
     if not matches:
         return None
-    if len(matches) > 1:
-        # Extremely unlikely (would mean CC reused a session id across projects),
-        # but if it happens, pick the most-recently-modified.
-        matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    if len(matches) == 1:
+        return matches[0]
+
+    # Multiple matches: same session id appears under more than one
+    # project directory. Extremely unlikely in normal operation (would
+    # mean CC reused a session id across projects) but has been seen
+    # when running the host against different workdirs against the
+    # same ~/.claude.  Prefer the project dir whose name matches the
+    # encoding of ``prefer_cwd``; otherwise most-recently-modified.
+    if prefer_cwd is not None:
+        wanted = _encode_cwd_for_cc_projects(prefer_cwd)
+        for m in matches:
+            if m.parent.name == wanted:
+                return m
+
+    matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return matches[0]

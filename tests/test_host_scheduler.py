@@ -934,3 +934,49 @@ class TestRunDream:
             sched._run_dream("pip-boy", time.time(), [])
 
         assert "pip-boy" not in sched._dream_running
+
+    def test_happy_path_purges_consumed_observations(self, tmp_path: Path):
+        """Plan H5: after a successful Dream, the observations that
+        fed it must be hard-deleted so the next Dream cycle does not
+        re-consolidate the same signals (which would over-weight them
+        in the L2 store and silently drift the memory model).
+
+        We seed the store with three observations, two of them with
+        timestamps ≤ ``started_at`` (the ones the Dream would have
+        read) and one with a timestamp *after* ``started_at`` (as if
+        it were written while Dream was running). Only the first two
+        must disappear; the concurrent-write one must survive.
+        """
+        sched, store = self._sched_and_store(tmp_path)
+
+        started_at = time.time()
+        before_1 = {"ts": started_at - 30, "text": "old-1", "category": "lesson"}
+        before_2 = {"ts": started_at - 10, "text": "old-2", "category": "lesson"}
+        # Race window: written while the LLM call was running. Its ``ts``
+        # is greater than ``started_at``, so the purge must leave it
+        # alone — otherwise we lose the observation entirely.
+        after_1 = {"ts": started_at + 5, "text": "new-1", "category": "lesson"}
+        store.write_observations([before_1, before_2, after_1])
+
+        with (
+            patch(
+                "pip_agent.anthropic_client.build_anthropic_client",
+                return_value=object(),
+            ),
+            patch(
+                "pip_agent.memory.consolidate.consolidate",
+                return_value=[{
+                    "id": "m1", "text": "stay concise", "count": 2,
+                    "stability": 0.7,
+                }],
+            ),
+            patch(
+                "pip_agent.memory.consolidate.distill_axioms",
+                return_value="- be concise",
+            ),
+        ):
+            sched._run_dream("pip-boy", started_at, [before_1, before_2])
+
+        remaining = store.load_all_observations()
+        remaining_texts = [o["text"] for o in remaining]
+        assert remaining_texts == ["new-1"], remaining_texts

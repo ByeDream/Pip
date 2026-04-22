@@ -12,6 +12,7 @@ from pip_agent.channels import (
     CLIChannel,
     InboundMessage,
     WeChatChannel,
+    send_with_retry,
 )
 
 # ---------------------------------------------------------------------------
@@ -229,3 +230,128 @@ class TestWeChatSend:
     def test_has_context_token(self, wechat):
         assert wechat.has_context_token("user@im.wechat") is True
         assert wechat.has_context_token("nobody") is False
+
+
+# ---------------------------------------------------------------------------
+# WecomChannel — pending-frames routing (plan M4)
+# ---------------------------------------------------------------------------
+
+# Import-time check: skip the whole block if the SDK isn't installed
+# in the environment (CI without wecom-aibot-python-sdk).
+_wecom_cls: object
+try:
+    from pip_agent.channels import WecomChannel as _wecom_cls
+    _WECOM_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _WECOM_AVAILABLE = False
+
+
+@pytest.mark.skipif(not _WECOM_AVAILABLE, reason="wecom-aibot-python-sdk not installed")
+class TestWecomPendingFrames:
+    """Regression guard for the ``_pending_frames`` overwrite race.
+
+    The old implementation keyed pending frames by ``peer_id``. Two
+    concurrent inbound messages from the same peer would overwrite
+    each other, and ``send()`` for the first message would end up
+    threading ``reply_stream`` to the *second* frame — replying to
+    the wrong user message.
+
+    The fix keys by a uuid per inbound, stashed in
+    ``InboundMessage.raw["_pip_inbound_id"]`` by ``_enqueue``. This
+    test replicates the race shape directly against the pending-frames
+    table since ``_enqueue`` is a closure inside ``start()``.
+    """
+
+    def _make_channel(self, monkeypatch):
+        # Bypass __init__ so we don't need a real WSClient.
+        ch = _wecom_cls.__new__(_wecom_cls)
+        import threading
+        ch._bot_id = "bot-1"
+        ch._bot_secret = "secret"
+        ch._msg_queue = []
+        ch._q_lock = threading.Lock()
+        ch._ws_client = MagicMock()
+        ch._ws_loop = None
+        ch._pending_frames = {}
+        ch._pending_lock = threading.Lock()
+        # Capture reply_async calls: which frame reply_stream was
+        # handed for each send.
+        recorded: list[dict] = []
+        def _fake_run_async(coro):
+            # close the coroutine to avoid "never awaited" warnings
+            try:
+                coro.close()
+            except Exception:
+                pass
+        def _fake_reply_async(frame, text):  # pragma: no cover - unused
+            pass
+        ch._run_async = _fake_run_async  # type: ignore[attr-defined]
+        # Patch _reply_async via monkeypatch on the unbound method to
+        # record which frame we would have sent to.
+        def _spy_reply_async(self, frame, text):
+            recorded.append({"frame": frame, "text": text})
+            async def _noop():
+                return None
+            return _noop()
+        monkeypatch.setattr(_wecom_cls, "_reply_async", _spy_reply_async)
+        return ch, recorded
+
+    def test_concurrent_inbounds_from_same_peer_do_not_overwrite(
+        self, monkeypatch,
+    ):
+        ch, recorded = self._make_channel(monkeypatch)
+
+        # Simulate two back-to-back inbounds from the same peer. The
+        # race in the old code happened at enqueue time — the second
+        # would clobber _pending_frames[peer_id]. Here we emulate the
+        # new keying contract directly.
+        frame_a = {"body": {"msgtype": "text"}, "_pip_inbound_id": "id-A"}
+        frame_b = {"body": {"msgtype": "text"}, "_pip_inbound_id": "id-B"}
+        ch._pending_frames["id-A"] = frame_a
+        ch._pending_frames["id-B"] = frame_b
+
+        # Reply to A — must thread to frame_a, not frame_b.
+        ok = ch.send("peer-1", "reply-A", inbound_id="id-A")
+        assert ok is True
+        assert len(recorded) == 1
+        assert recorded[0]["frame"] is frame_a
+        assert recorded[0]["text"] == "reply-A"
+
+        # Reply to B — must still find frame_b; release_inbound for A
+        # has no effect on B.
+        ch.release_inbound("id-A")
+        assert "id-A" not in ch._pending_frames
+        assert ch._pending_frames["id-B"] is frame_b
+
+        ok = ch.send("peer-1", "reply-B", inbound_id="id-B")
+        assert ok is True
+        assert recorded[1]["frame"] is frame_b
+
+    def test_missing_inbound_id_falls_through_to_proactive(
+        self, monkeypatch,
+    ):
+        """Without ``inbound_id`` (cron / heartbeat / command response
+        without an originating frame), ``send`` must not raise and
+        should fall through to the proactive markdown push."""
+        ch, _recorded = self._make_channel(monkeypatch)
+        called: list[tuple[str, str]] = []
+        def _fake_proactive(to, text):
+            called.append((to, text))
+            return True
+        monkeypatch.setattr(ch, "_send_proactive", _fake_proactive)
+
+        ok = ch.send("peer-42", "proactive body")  # no inbound_id
+        assert ok is True
+        assert called == [("peer-42", "proactive body")]
+
+    def test_send_with_retry_releases_pending_frame(self, monkeypatch):
+        """After every chunk of a reply has been dispatched,
+        ``send_with_retry`` calls ``release_inbound`` so the
+        pending-frames table doesn't grow unbounded over the bot's
+        lifetime."""
+        ch, _recorded = self._make_channel(monkeypatch)
+        ch._pending_frames["id-X"] = {"body": {}, "_pip_inbound_id": "id-X"}
+
+        # Short text -> one chunk; send_with_retry must still release.
+        send_with_retry(ch, "peer-x", "short reply", inbound_id="id-X")
+        assert "id-X" not in ch._pending_frames

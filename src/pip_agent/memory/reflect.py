@@ -129,9 +129,10 @@ def reflect_from_jsonl(
 
     If the transcript has no new reflect-worthy content, returns the advanced
     offset (or the original if nothing was read) with an empty observation
-    list. If the LLM call fails or no client is available, returns
-    ``(start_offset, [])`` — the cursor is NOT advanced so the next run can
-    retry.
+    list. If the LLM call fails, no client is available, or the LLM returns
+    invalid JSON, returns ``(start_offset, [])`` — the cursor is NOT advanced
+    so the next run can retry. Only a successful LLM call that produces a
+    valid JSON array (even an empty one) advances the cursor.
     """
     if not transcript_path or not Path(transcript_path).is_file():
         return start_offset, []
@@ -188,8 +189,15 @@ def reflect_from_jsonl(
     from pip_agent.memory.utils import extract_json_array
     observations = extract_json_array(text)
     if observations is None:
+        # Invalid JSON from the LLM — most often a transient model
+        # hiccup (truncation, stray markdown fence, etc.). Keep the
+        # cursor at ``start_offset`` so the next reflect pass sees
+        # the same delta and can try again; advancing would silently
+        # drop whatever observations that chunk was supposed to yield.
+        # The LLM call happens only on heartbeat / /exit / PreCompact
+        # / ``reflect`` MCP, so retry cost is bounded.
         log.warning("reflect: LLM returned invalid JSON: %.200s", text)
-        return new_offset, []
+        return start_offset, []
 
     now = time.time()
     valid: list[Observation] = []
@@ -222,6 +230,77 @@ can all read/write the same map without any risk of key drift. Schema:
 ``{session_id: int}``.
 """
 
+PENDING_REFLECT_KEY = "_pending_reflect"
+"""Two-phase commit marker for in-flight reflect results.
+
+Before :func:`reflect_and_persist` writes observations to disk it stages
+``{session_id, new_offset, observations}`` under this key in
+``state.json`` via an atomic save. Only after the append to
+``observations/*.jsonl`` succeeds does it clear the marker and advance
+the cursor in a second atomic save. Crash recovery: on the next
+reflect call, :func:`_drain_pending_reflect` flushes any unfinished
+pending bundle before handing control back to the normal pass, so an
+interrupt between stage and commit leaves the observations + cursor
+exactly where they should be after a clean run.
+
+Residual risk: a crash *during* the observations append can lead to
+at-most-once re-append on the next run (append is not itself atomic
+on POSIX/NTFS). Dream consolidation now hard-deletes the observations
+file on success, so the duplication window is bounded to a single
+Dream cycle.
+"""
+
+
+def _drain_pending_reflect(memory_store) -> dict:
+    """Finish any half-committed reflect pass left by a prior crash.
+
+    Loads ``state.json``, and if a pending bundle is present:
+
+    1. Appends the staged observations via ``write_observations`` (so
+       the data lands in the same daily jsonl a clean run would have
+       used).
+    2. Advances the per-session offset to the staged ``new_offset``.
+    3. Clears the pending marker and saves state atomically.
+
+    Returns the post-drain state dict so the caller can work with a
+    single load. If there's nothing pending, state is returned as-is
+    (no save happens).
+    """
+    state = memory_store.load_state()
+    pending = state.get(PENDING_REFLECT_KEY)
+    if not pending:
+        return state
+
+    log.info(
+        "reflect: draining pending bundle from prior run "
+        "(session=%s obs=%d new_offset=%s)",
+        (pending.get("session_id") or "")[:8],
+        len(pending.get("observations") or []),
+        pending.get("new_offset"),
+    )
+
+    observations = pending.get("observations") or []
+    if observations:
+        try:
+            memory_store.write_observations(observations)
+        except Exception:  # noqa: BLE001
+            # If disk append fails we leave the pending marker alone so
+            # the next drain retries; better to risk duplicates than
+            # lose data.
+            log.exception("reflect: failed to drain pending observations")
+            return state
+
+    session_id = pending.get("session_id") or ""
+    new_offset = pending.get("new_offset")
+    if session_id and isinstance(new_offset, int):
+        offsets = dict(state.get(OFFSET_STATE_KEY) or {})
+        offsets[session_id] = new_offset
+        state[OFFSET_STATE_KEY] = offsets
+        state["last_reflect_at"] = time.time()
+    state.pop(PENDING_REFLECT_KEY, None)
+    memory_store.save_state(state)
+    return state
+
 
 def reflect_and_persist(
     *,
@@ -242,18 +321,21 @@ def reflect_and_persist(
 
     * If ``reflect_from_jsonl`` raises or the cursor did not advance,
       nothing is written to the memory store.
-    * Observations are ``write_observations``-appended only when the LLM
-      returned at least one.
-    * State is rewritten only when ``new_offset != start_offset``, so a
-      zero-delta pass is a true no-op (no state churn, no ``state.json``
-      rewrite that would invalidate mtime-based caches).
+    * Observations + cursor commit as a two-phase transaction: stage
+      under :data:`PENDING_REFLECT_KEY` (atomic save), append, then
+      clear (atomic save). Crash between stage and clear is recovered
+      at the start of the next call via
+      :func:`_drain_pending_reflect`.
+    * State is rewritten only when there is real work (observations
+      were produced OR cursor advanced on a no-op pass); a no-delta
+      pass is still a no-op (no state churn).
 
     Returns ``(start_offset, new_offset, obs_count)`` so callers can log
     and report consistently.
     """
     from pip_agent.memory.reflect import reflect_from_jsonl
 
-    state = memory_store.load_state()
+    state = _drain_pending_reflect(memory_store)
     offsets: dict[str, int] = dict(state.get(OFFSET_STATE_KEY) or {})
     start_offset = int(offsets.get(session_id, 0))
 
@@ -265,10 +347,32 @@ def reflect_and_persist(
         client=client,
     )
 
+    if new_offset == start_offset:
+        return start_offset, new_offset, len(observations)
+
     if observations:
+        # Phase 1: stage atomically. If we crash after this the drain on
+        # the next call will finish the job.
+        state[PENDING_REFLECT_KEY] = {
+            "session_id": session_id,
+            "new_offset": new_offset,
+            "observations": list(observations),
+        }
+        memory_store.save_state(state)
+
+        # Phase 2a: append observations.
         memory_store.write_observations(observations)
 
-    if new_offset != start_offset:
+        # Phase 2b: clear stage + advance cursor atomically.
+        state.pop(PENDING_REFLECT_KEY, None)
+        offsets[session_id] = new_offset
+        state[OFFSET_STATE_KEY] = offsets
+        state["last_reflect_at"] = time.time()
+        memory_store.save_state(state)
+    else:
+        # Delta seen but no observations extracted (LLM said []). No
+        # stage needed — just advance the cursor so we don't re-read
+        # the same delta. One atomic save.
         offsets[session_id] = new_offset
         state[OFFSET_STATE_KEY] = offsets
         state["last_reflect_at"] = time.time()

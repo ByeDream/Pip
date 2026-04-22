@@ -44,9 +44,13 @@ def _pre_compact_hook(memory_store: MemoryStore | None):
        so we can tell reflection fired even if the LLM call is skipped.
     2. Look up the per-session byte cursor in ``state[_OFFSET_KEY]``.
     3. Call :func:`reflect_from_jsonl` on the delta.
-    4. Persist new observations and advance the cursor. If reflection failed
-       or returned no observations, only the timestamp is updated — the cursor
-       is preserved so the next run retries the same delta.
+    4. Persist new observations and advance the cursor. The cursor is
+       advanced whenever the LLM call returned a well-formed JSON array,
+       even an empty one — an empty ``[]`` is the model's explicit
+       "no high-signal observations in this delta" signal, and
+       re-reading the same bytes to ask again would just burn tokens.
+       The cursor is preserved only when the LLM call itself failed or
+       returned malformed JSON so the next run can retry the same delta.
 
     All errors are swallowed with a ``log.warning`` so Claude Code's compact
     never aborts because of Pip's bookkeeping.

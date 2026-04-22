@@ -712,12 +712,29 @@ class HostScheduler:
             state[_DREAM_CYCLE_KEY] = cycle
             store.save_state(state)
 
+            # Hard-delete the observations we just consolidated. They
+            # are an intermediate product — once merged into
+            # ``memories.json`` keeping them around makes the next
+            # Dream re-count the same signal (the H5 regression).
+            # Only observations with ``ts <= started_at`` are purged, so
+            # any new observation reflected while Dream was running
+            # survives for the next cycle.
+            try:
+                purged = store.purge_observations_through(started_at)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "Dream: observation purge failed for agent=%s "
+                    "(memories already written; safe to retry next cycle)",
+                    agent_id,
+                )
+                purged = 0
+
             log.info(
                 "Dream: done for agent=%s cycle=%d obs=%d mem=%d axioms=%s "
-                "duration=%.1fs",
+                "purged=%d duration=%.1fs",
                 agent_id, cycle, len(observations), len(new_memories),
                 "yes" if axioms_text else "no",
-                time.time() - started_at,
+                purged, time.time() - started_at,
             )
         except Exception:
             log.exception("Dream: crashed for agent=%s", agent_id)
