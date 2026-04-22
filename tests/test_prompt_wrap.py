@@ -272,7 +272,14 @@ class TestMaterializeAttachments:
     """``_materialize_attachments`` drops binary bytes to disk so the
     LLM can follow them with its native Read/Bash tools. This is what
     makes zip/doc/pdf uploads actionable instead of opaque.
+
+    The incoming dir lives under the per-agent tree, so saved paths
+    look like ``.pip/agents/<id>/incoming/<ts>-<name>``.
     """
+
+    def _incoming_dir(self, workdir):
+        # Mirrors the real caller: .pip/agents/<id>/incoming
+        return workdir / ".pip" / "agents" / "pip-boy" / "incoming"
 
     def test_binary_file_written_and_saved_path_set(self, tmp_path):
         from pip_agent.agent_host import _materialize_attachments
@@ -284,10 +291,16 @@ class TestMaterializeAttachments:
                 type="file", filename="archive.zip", data=payload,
             )],
         )
-        _materialize_attachments(inbound, tmp_path)
+        incoming = self._incoming_dir(tmp_path)
+        _materialize_attachments(
+            inbound, workdir=tmp_path, incoming_dir=incoming,
+        )
         att = inbound.attachments[0]
-        assert att.saved_path.startswith("incoming/")
+        assert att.saved_path.startswith(".pip/agents/pip-boy/incoming/")
         assert att.saved_path.endswith("-archive.zip")
+        # POSIX separators even on Windows — the model feeds this
+        # straight into Bash ``unzip``, which doesn't grok backslashes.
+        assert "\\" not in att.saved_path
         written = tmp_path / att.saved_path
         assert written.exists()
         assert written.read_bytes() == payload
@@ -304,9 +317,12 @@ class TestMaterializeAttachments:
                 data=b"hello", text="hello",
             )],
         )
-        _materialize_attachments(inbound, tmp_path)
+        incoming = self._incoming_dir(tmp_path)
+        _materialize_attachments(
+            inbound, workdir=tmp_path, incoming_dir=incoming,
+        )
         assert inbound.attachments[0].saved_path == ""
-        assert not (tmp_path / "incoming").exists()
+        assert not incoming.exists()
 
     def test_image_gets_extension_from_mime(self, tmp_path):
         # Images arrive without a filename on WeChat; we synthesize one
@@ -320,14 +336,18 @@ class TestMaterializeAttachments:
                 mime_type="image/png",
             )],
         )
-        _materialize_attachments(inbound, tmp_path)
+        incoming = self._incoming_dir(tmp_path)
+        _materialize_attachments(
+            inbound, workdir=tmp_path, incoming_dir=incoming,
+        )
         att = inbound.attachments[0]
         assert att.saved_path.endswith(".png")
         assert (tmp_path / att.saved_path).exists()
 
     def test_path_traversal_filename_is_sanitized(self, tmp_path):
         # A malicious / bugged channel could hand us a filename with
-        # path separators. We must land strictly under ``incoming/``.
+        # path separators. We must land strictly under the agent's
+        # incoming dir regardless.
         from pip_agent.agent_host import _materialize_attachments
 
         inbound = InboundMessage(
@@ -337,13 +357,46 @@ class TestMaterializeAttachments:
                 data=b"nope",
             )],
         )
-        _materialize_attachments(inbound, tmp_path)
+        incoming = self._incoming_dir(tmp_path)
+        _materialize_attachments(
+            inbound, workdir=tmp_path, incoming_dir=incoming,
+        )
         att = inbound.attachments[0]
-        assert att.saved_path.startswith("incoming/")
-        # basename() strips the leading ``../../etc/`` — only "passwd"
-        # remains, embedded in the timestamped file under incoming/.
+        assert att.saved_path.startswith(".pip/agents/pip-boy/incoming/")
         assert ".." not in att.saved_path
         assert "passwd" in att.saved_path
+
+    def test_per_agent_isolation(self, tmp_path):
+        # Two agents, same filename, same second — the per-agent
+        # partitioning is what stops them from clobbering each other.
+        from pip_agent.agent_host import _materialize_attachments
+
+        inb_a = InboundMessage(
+            text="", sender_id="u1", channel="wecom", peer_id="p1",
+            attachments=[Attachment(
+                type="file", filename="notes.bin", data=b"A" * 10,
+            )],
+        )
+        inb_b = InboundMessage(
+            text="", sender_id="u1", channel="wecom", peer_id="p1",
+            attachments=[Attachment(
+                type="file", filename="notes.bin", data=b"B" * 10,
+            )],
+        )
+        dir_a = tmp_path / ".pip" / "agents" / "alpha" / "incoming"
+        dir_b = tmp_path / ".pip" / "agents" / "beta" / "incoming"
+        _materialize_attachments(
+            inb_a, workdir=tmp_path, incoming_dir=dir_a,
+        )
+        _materialize_attachments(
+            inb_b, workdir=tmp_path, incoming_dir=dir_b,
+        )
+        a_path = tmp_path / inb_a.attachments[0].saved_path
+        b_path = tmp_path / inb_b.attachments[0].saved_path
+        assert a_path.read_bytes() == b"A" * 10
+        assert b_path.read_bytes() == b"B" * 10
+        assert "alpha" in inb_a.attachments[0].saved_path
+        assert "beta" in inb_b.attachments[0].saved_path
 
     def test_oversized_attachment_skipped(self, tmp_path):
         from pip_agent.agent_host import (
@@ -358,9 +411,12 @@ class TestMaterializeAttachments:
                 data=b"x" * (_MAX_INCOMING_BYTES + 1),
             )],
         )
-        _materialize_attachments(inbound, tmp_path)
+        incoming = self._incoming_dir(tmp_path)
+        _materialize_attachments(
+            inbound, workdir=tmp_path, incoming_dir=incoming,
+        )
         assert inbound.attachments[0].saved_path == ""
-        assert not (tmp_path / "incoming").exists()
+        assert not incoming.exists()
 
     def test_no_attachments_is_noop(self, tmp_path):
         from pip_agent.agent_host import _materialize_attachments
@@ -369,5 +425,8 @@ class TestMaterializeAttachments:
             text="just text", sender_id="u1",
             channel="cli", peer_id="cli-user",
         )
-        _materialize_attachments(inbound, tmp_path)
-        assert not (tmp_path / "incoming").exists()
+        incoming = self._incoming_dir(tmp_path)
+        _materialize_attachments(
+            inbound, workdir=tmp_path, incoming_dir=incoming,
+        )
+        assert not incoming.exists()

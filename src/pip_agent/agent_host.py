@@ -49,9 +49,10 @@ log = logging.getLogger(__name__)
 AGENTS_DIR = WORKDIR / ".pip" / "agents"
 BINDINGS_PATH = AGENTS_DIR / "bindings.json"
 
-# Inbound file/image bytes get dropped here so the LLM can reach them
-# with its native ``Read`` / ``Bash`` tools (``unzip -l``, ``file``, etc).
-# Workdir-relative so the path the LLM sees is portable across restarts.
+# Inbound file/image bytes get dropped under each agent's
+# ``.pip/agents/<agent_id>/incoming/`` so (a) the LLM can reach them
+# with its native ``Read`` / ``Bash`` tools via a workdir-relative
+# path, and (b) agents don't clobber each other's uploads.
 INCOMING_DIR_NAME = "incoming"
 _MAX_INCOMING_BYTES = 50 * 1024 * 1024  # 50 MB — matches send_file cap
 
@@ -271,16 +272,28 @@ def _sanitize_filename(name: str) -> str:
 
 def _materialize_attachments(
     inbound: InboundMessage,
+    *,
     workdir: Path,
+    incoming_dir: Path,
 ) -> None:
-    """Persist binary attachment bytes under ``workdir/incoming/`` in-place.
+    """Persist binary attachment bytes under ``incoming_dir`` in-place.
 
-    Sets ``Attachment.saved_path`` to the workdir-relative location so
-    the prompt renderer can hand the LLM a path its native ``Read`` /
-    ``Bash`` tools can follow (``unzip -l``, ``file``, ``grep``, etc).
+    Sets ``Attachment.saved_path`` to a **workdir-relative** POSIX
+    path so the prompt renderer can hand the LLM a location its
+    native ``Read`` / ``Bash`` tools (which inherit ``cwd=workdir``)
+    can follow directly — ``unzip -l`` / ``file`` / ``grep`` etc.
 
-    Mutates the attachments on ``inbound``; returns nothing. Called
-    from :meth:`Host.process_inbound` before prompt formatting, so
+    Conventionally ``incoming_dir`` is
+    ``{workdir}/.pip/agents/<agent_id>/incoming`` — one inbox per
+    agent so two agents on the same channel can't trample each
+    other's uploads, and ``/reset`` for one agent doesn't affect
+    another's pending files. Placing it under the per-agent dir also
+    matches how memory, cron, and user profiles already partition
+    state. Decoupled from ``workdir`` as a parameter so tests and
+    future re-targeting (e.g. TTL sweep) don't need module patches.
+
+    Mutates attachments on ``inbound``; returns nothing. Called from
+    :meth:`Host.process_inbound` before prompt formatting, so
     :func:`_format_prompt` stays pure.
 
     Why disk, not inline
@@ -299,7 +312,6 @@ def _materialize_attachments(
     if not inbound.attachments:
         return
 
-    incoming = workdir / INCOMING_DIR_NAME
     ts_prefix = time.strftime("%Y%m%d-%H%M%S")
 
     for i, att in enumerate(inbound.attachments):
@@ -333,11 +345,20 @@ def _materialize_attachments(
             safe = _sanitize_filename(att.filename or f"{att.type}-{i}")
 
         try:
-            incoming.mkdir(parents=True, exist_ok=True)
-            dest = incoming / f"{ts_prefix}-{safe}"
+            incoming_dir.mkdir(parents=True, exist_ok=True)
+            dest = incoming_dir / f"{ts_prefix}-{safe}"
             dest.write_bytes(att.data)
-            att.saved_path = f"{INCOMING_DIR_NAME}/{dest.name}"
-        except OSError as exc:
+            # Always use POSIX-style separators in what we hand the
+            # LLM — the model will echo this path into shell commands
+            # (Bash is bundled with CC even on Windows), and mixed
+            # backslashes break word-splitting there.
+            rel = dest.relative_to(workdir).as_posix()
+            att.saved_path = rel
+        except (OSError, ValueError) as exc:
+            # ``ValueError`` from ``relative_to`` covers the pathological
+            # case of ``incoming_dir`` sitting outside ``workdir`` —
+            # shouldn't happen with our defaults but don't crash the
+            # turn over a paths misconfiguration.
             log.warning(
                 "could not materialize attachment %s: %s",
                 att.filename or att.type, exc,
@@ -754,12 +775,18 @@ class AgentHost:
             sender_id=inbound.sender_id,
         )
 
-        # Drop binary attachment bytes into ``WORKDIR/incoming/`` *before*
-        # prompt rendering so :func:`_format_prompt` can hand the model a
-        # real path. Has to happen after slash-command dispatch (no point
-        # persisting a zip the user intended for a host command) but
-        # before we format the prompt.
-        _materialize_attachments(inbound, WORKDIR)
+        # Drop binary attachment bytes into the per-agent incoming box
+        # *before* prompt rendering so :func:`_format_prompt` can hand
+        # the model a real path. Per-agent isolation means a zip sent
+        # to agent A can't be clobbered by one sent to B with the same
+        # filename on the same second. Has to run after slash dispatch
+        # (no point persisting a file the user intended for a host
+        # command) but before prompt formatting.
+        _materialize_attachments(
+            inbound,
+            workdir=WORKDIR,
+            incoming_dir=AGENTS_DIR / eff.id / INCOMING_DIR_NAME,
+        )
 
         prompt = _format_prompt(inbound, svc.memory_store)
 
