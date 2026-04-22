@@ -1,8 +1,8 @@
 """Tests for pure-logic memory helpers (tokenize, temporal_decay, search_memories).
 
-Pipeline-level integration tests (reflect over CC JSONL, scheduler-driven dream,
-etc.) are rewritten in Phase 4.5 and Phase 11; see ``docs/sdk-contract-notes.md``
-for the new data-source contract.
+Pipeline-level integration tests (reflect over CC JSONL, scheduler-driven
+dream, etc.) live in their own modules; this file only covers the
+deterministic retrieval helpers.
 """
 
 from __future__ import annotations

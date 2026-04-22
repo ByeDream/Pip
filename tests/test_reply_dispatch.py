@@ -475,9 +475,8 @@ class TestAgentIdFromSessionKey:
 class TestFlushAndRotate:
     """On-exit reflect + session rotation.
 
-    The contract from docs/sdk-contract-notes.md §11.2 (Q5): reflect every
-    live session, persist observations, then clear the in-memory map so
-    the next launch mints fresh session ids.
+    Contract: reflect every live session, persist observations, then clear
+    the in-memory map so the next launch mints fresh session ids.
     """
 
     def _build_host(self, tmp_path: Path, sessions: dict[str, str]):

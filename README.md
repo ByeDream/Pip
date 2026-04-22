@@ -219,8 +219,6 @@ Unknown slash commands are passed through to the model for interpretation — no
 
 ## Further reading
 
-- [`docs/sdk-contract-notes.md`](docs/sdk-contract-notes.md) — Observed SDK behaviour, hook contracts, memory pipeline design decisions, and design journal for every phase of the 0.4 rewrite.
-- [`docs/system-prompt-anatomy.md`](docs/system-prompt-anatomy.md) — How the system prompt is assembled each turn.
 - [`docs/releasing.md`](docs/releasing.md) — Release workflow.
 
 ## License

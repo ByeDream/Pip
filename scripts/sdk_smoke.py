@@ -2,11 +2,12 @@
 
 Goal: verify the exact field contracts of ClaudeAgentOptions / HookMatcher /
 PreCompactHookInput / StopHookInput / SystemMessage(init) and observe
-~/.claude/projects/<cwd-encoded>/<session>.jsonl layout so Phase 4.5's
-memory/transcript_source.py can rely on concrete facts, not guesses.
+~/.claude/projects/<cwd-encoded>/<session>.jsonl layout that
+``memory/transcript_source.py`` relies on.
 
-Run with `python scripts/sdk_smoke.py`. The script never errors out; it always
-prints what it observed so we have something to paste into docs/sdk-contract-notes.md.
+Run with ``python scripts/sdk_smoke.py``. The script never errors out; it
+always prints what it observed, so it doubles as a diagnostic when the
+SDK bumps and something in the memory pipeline starts misbehaving.
 """
 from __future__ import annotations
 

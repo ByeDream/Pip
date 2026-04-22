@@ -24,8 +24,6 @@ Schedule kinds supported:
 * ``cron``     — minimal cron expression parser supporting ``"M H * * *"``
   (daily) and ``"M * * * *"`` (hourly). Anything more exotic returns an error
   at ``add_job`` time.
-
-See ``docs/sdk-contract-notes.md`` for the full host ⇄ agent contract.
 """
 
 from __future__ import annotations
@@ -568,8 +566,7 @@ class HostScheduler:
     def _tick_dream(self, agent_dir: Path, now: float) -> None:
         """Fire a Dream pass for this agent iff all trigger gates are met.
 
-        Gates (documented in ``docs/sdk-contract-notes.md`` §11 and mirrored
-        in ``config.Settings``):
+        Gates (mirrored in ``config.Settings``):
 
         1. Local clock within the ``[dream_hour_start, dream_hour_end)``
            window. ``start == end`` disables Dream entirely.

@@ -14,8 +14,6 @@ pipeline to a fragile shape, this module exposes three defensive primitives:
 * :func:`locate_session_jsonl` — ad-hoc lookup when we only know the session_id
   (used by the ``reflect`` MCP tool); hook-driven reflect uses
   ``input_data['transcript_path']`` directly and never calls this.
-
-See ``docs/sdk-contract-notes.md`` §6 for the schema rationale.
 """
 
 from __future__ import annotations

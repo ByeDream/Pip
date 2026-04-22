@@ -69,10 +69,10 @@ _REFLECT_SYSTEM_BASE = (
 )
 
 # Hard cap on observations returned from a single reflect pass. The prompt
-# asks the model for ≤5 (see Q1 in ``docs/sdk-contract-notes.md`` §11) but
-# prompts are not contracts — a misbehaving model, a prompt-injection in
-# the transcript, or a future model update can all blow past that. Slice
-# in Python so downstream memory / Dream workload is always bounded.
+# asks the model for ≤5, but prompts are not contracts — a misbehaving model,
+# a prompt-injection in the transcript, or a future model update can all
+# blow past that. Slice in Python so downstream memory / Dream workload is
+# always bounded.
 _MAX_OBSERVATIONS_PER_PASS = 5
 
 _REFLECT_SYSTEM_CACHE: str | None = None
@@ -142,8 +142,8 @@ def reflect_from_jsonl(
         start_offset=start_offset,
         max_chars=_MAX_PROMPT_CHARS,
     )
-    # Q7 cursor guard (docs/sdk-contract-notes.md §11.3): if the byte
-    # cursor has not moved, there is nothing new in the transcript and
+    # Zero-delta cursor guard: if the byte cursor has not moved after
+    # ``load_formatted``, there is nothing new in the transcript and
     # the LLM call would burn a cold start to produce ``[]``. The
     # ``not formatted.strip()`` check below catches a superset of this
     # (e.g. cursor advanced but the delta was pure system-init chrome),

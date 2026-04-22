@@ -5,13 +5,12 @@ the PreCompact hook (``test_hooks.py``) rely on without exercising
 directly. Locking them in here means callers get stable behaviour even
 as the call sites diverge.
 
-The design decisions under test are documented in
-``docs/sdk-contract-notes.md`` §11.3:
+Invariants under test:
 
-* **Q1** — reflect output is capped at ≤5 observations.
-* **Q7** — zero-byte-delta short-circuit: no LLM call when the cursor
-  has not moved.
-* **Q8** — failure-does-not-advance-cursor: LLM exceptions must leave
+* Reflect output is capped at ≤5 observations per pass.
+* Zero-byte-delta short-circuit: no LLM call when the cursor has not
+  moved.
+* Failure-does-not-advance-cursor: LLM exceptions must leave
   ``start_offset`` pinned so the next trigger retries the same delta.
 """
 

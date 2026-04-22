@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     # ``.pip/agents/<agent_id>/`` is fired as a ``<heartbeat>`` inbound every
     # ``heartbeat_interval`` seconds during the active window. Set the interval
     # to 0 to disable. Heartbeat is NOT part of the memory pipeline — reflect
-    # triggers are PreCompact + /exit only; see §11 of sdk-contract-notes.
+    # triggers are PreCompact + ``/exit`` only.
     heartbeat_interval: int = Field(default=1800)
     heartbeat_active_start: int = Field(default=9)
     heartbeat_active_end: int = Field(default=22)
