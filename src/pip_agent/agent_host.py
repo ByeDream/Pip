@@ -759,11 +759,29 @@ class AgentHost:
            error back through the originating channel, with the
            heartbeat-sentinel silencing contract applied.
         """
-        prepared = self._prepare_turn(inbound)
-        if prepared is None:
-            return  # slash command handled inline; nothing more to do.
+        # PROFILE — open a turn context for all downstream spans.
+        from pip_agent import _profile
 
-        await self._execute_turn(inbound, prepared)
+        _profile.new_turn(
+            channel=inbound.channel,
+            sender=inbound.sender_id,
+            peer=inbound.peer_id,
+            text_len=len(inbound.text) if inbound.text else 0,
+            atts=len(inbound.attachments or []),
+            is_group=inbound.is_group,
+        )
+        try:
+            async with _profile.span(
+                "host.process_inbound",
+                channel=inbound.channel,
+            ):
+                prepared = self._prepare_turn(inbound)
+                if prepared is None:
+                    return  # slash command handled inline.
+
+                await self._execute_turn(inbound, prepared)
+        finally:
+            _profile.end_turn()
 
     def _prepare_turn(
         self, inbound: InboundMessage,
@@ -776,91 +794,114 @@ class AgentHost:
         :meth:`_execute_turn` needs to run the SDK call and route the
         reply.
         """
-        if inbound.agent_id:
-            agent_id = inbound.agent_id
-            binding = None
-        else:
-            agent_id, binding = self._binding_table.resolve(
+        # PROFILE
+        from pip_agent import _profile
+
+        with _profile.span_sync("host.prepare_turn"):
+            with _profile.span_sync("host.route_session"):
+                if inbound.agent_id:
+                    agent_id = inbound.agent_id
+                    binding = None
+                else:
+                    agent_id, binding = self._binding_table.resolve(
+                        channel=inbound.channel,
+                        account_id=inbound.account_id,
+                        guild_id=inbound.guild_id,
+                        peer_id=inbound.peer_id,
+                    )
+                if not agent_id:
+                    agent_id = self._registry.default_agent().id
+
+                agent_cfg = (
+                    self._registry.get_agent(agent_id) or self._registry.default_agent()
+                )
+                eff = resolve_effective_config(agent_cfg, binding)
+
+                svc = self._get_agent_services(eff.id)
+
+            # Short-circuit host-layer slash commands BEFORE we do the more
+            # expensive prompt enrichment + SDK subprocess spawn. Dispatch
+            # runs cheaply off in-memory registry / bindings / memory-store
+            # state; its response (if any) is routed back through the same
+            # channel that delivered the inbound. Unknown slashes fall
+            # through to the agent so the LLM can still interpret them.
+            with _profile.span_sync("host.dispatch_command"):
+                cmd_result = host_commands.dispatch_command(
+                    host_commands.CommandContext(
+                        inbound=inbound,
+                        registry=self._registry,
+                        bindings=self._binding_table,
+                        bindings_path=BINDINGS_PATH,
+                        memory_store=svc.memory_store,
+                        scheduler=self._scheduler,
+                    ),
+                )
+            if cmd_result.handled:
+                _profile.event(
+                    "host.command_handled",
+                    cmd=inbound.text[:60] if inbound.text else "",
+                )
+                self._deliver_command_response(inbound, cmd_result.response)
+                return None
+
+            sk = build_session_key(
+                agent_id=eff.id,
                 channel=inbound.channel,
-                account_id=inbound.account_id,
-                guild_id=inbound.guild_id,
                 peer_id=inbound.peer_id,
+                guild_id=inbound.guild_id,
+                is_group=inbound.is_group,
+                dm_scope=eff.effective_dm_scope,
             )
-        if not agent_id:
-            agent_id = self._registry.default_agent().id
 
-        agent_cfg = self._registry.get_agent(agent_id) or self._registry.default_agent()
-        eff = resolve_effective_config(agent_cfg, binding)
+            base_prompt = eff.system_prompt(workdir=str(WORKDIR))
+            user_text = inbound.text if isinstance(inbound.text, str) else ""
+            with _profile.span_sync(
+                "memory.enrich_prompt",
+                agent_id=eff.id,
+                channel=inbound.channel,
+            ):
+                system_prompt = svc.memory_store.enrich_prompt(
+                    base_prompt, user_text,
+                    channel=inbound.channel,
+                    agent_id=eff.id,
+                    workdir=str(WORKDIR),
+                    sender_id=inbound.sender_id,
+                )
 
-        svc = self._get_agent_services(eff.id)
+            # Drop binary attachment bytes into the per-agent incoming box
+            # *before* prompt rendering so :func:`_format_prompt` can hand
+            # the model a real path. Per-agent isolation means a zip sent
+            # to agent A can't be clobbered by one sent to B with the same
+            # filename on the same second. Has to run after slash dispatch
+            # (no point persisting a file the user intended for a host
+            # command) but before prompt formatting.
+            with _profile.span_sync(
+                "host.materialize_attachments",
+                n=len(inbound.attachments or []),
+            ):
+                _materialize_attachments(
+                    inbound,
+                    workdir=WORKDIR,
+                    incoming_dir=AGENTS_DIR / eff.id / INCOMING_DIR_NAME,
+                )
 
-        # Short-circuit host-layer slash commands BEFORE we do the more
-        # expensive prompt enrichment + SDK subprocess spawn. Dispatch
-        # runs cheaply off in-memory registry / bindings / memory-store
-        # state; its response (if any) is routed back through the same
-        # channel that delivered the inbound. Unknown slashes fall
-        # through to the agent so the LLM can still interpret them.
-        cmd_result = host_commands.dispatch_command(
-            host_commands.CommandContext(
-                inbound=inbound,
-                registry=self._registry,
-                bindings=self._binding_table,
-                bindings_path=BINDINGS_PATH,
-                memory_store=svc.memory_store,
-                scheduler=self._scheduler,
-            ),
-        )
-        if cmd_result.handled:
-            self._deliver_command_response(inbound, cmd_result.response)
-            return None
+            with _profile.span_sync("host.format_prompt"):
+                prompt = _format_prompt(inbound, svc.memory_store)
 
-        sk = build_session_key(
-            agent_id=eff.id,
-            channel=inbound.channel,
-            peer_id=inbound.peer_id,
-            guild_id=inbound.guild_id,
-            is_group=inbound.is_group,
-            dm_scope=eff.effective_dm_scope,
-        )
+            ch = self._channel_mgr.get(inbound.channel)
+            reply_peer = inbound.peer_id
+            if inbound.is_group and inbound.guild_id:
+                reply_peer = inbound.guild_id
 
-        base_prompt = eff.system_prompt(workdir=str(WORKDIR))
-        user_text = inbound.text if isinstance(inbound.text, str) else ""
-        system_prompt = svc.memory_store.enrich_prompt(
-            base_prompt, user_text,
-            channel=inbound.channel,
-            agent_id=eff.id,
-            workdir=str(WORKDIR),
-            sender_id=inbound.sender_id,
-        )
+            if inbound.channel == "wechat" and isinstance(ch, WeChatChannel):
+                _profile.event("host.send_typing", channel="wechat")
+                ch.send_typing(inbound.peer_id)
 
-        # Drop binary attachment bytes into the per-agent incoming box
-        # *before* prompt rendering so :func:`_format_prompt` can hand
-        # the model a real path. Per-agent isolation means a zip sent
-        # to agent A can't be clobbered by one sent to B with the same
-        # filename on the same second. Has to run after slash dispatch
-        # (no point persisting a file the user intended for a host
-        # command) but before prompt formatting.
-        _materialize_attachments(
-            inbound,
-            workdir=WORKDIR,
-            incoming_dir=AGENTS_DIR / eff.id / INCOMING_DIR_NAME,
-        )
-
-        prompt = _format_prompt(inbound, svc.memory_store)
-
-        ch = self._channel_mgr.get(inbound.channel)
-        reply_peer = inbound.peer_id
-        if inbound.is_group and inbound.guild_id:
-            reply_peer = inbound.guild_id
-
-        if inbound.channel == "wechat" and isinstance(ch, WeChatChannel):
-            ch.send_typing(inbound.peer_id)
-
-        return _PreparedTurn(
-            eff=eff, svc=svc, sk=sk, ch=ch,
-            reply_peer=reply_peer, prompt=prompt,
-            system_prompt=system_prompt,
-        )
+            return _PreparedTurn(
+                eff=eff, svc=svc, sk=sk, ch=ch,
+                reply_peer=reply_peer, prompt=prompt,
+                system_prompt=system_prompt,
+            )
 
     async def _execute_turn(
         self, inbound: InboundMessage, prepared: _PreparedTurn,
@@ -899,8 +940,13 @@ class AgentHost:
             if self._scheduler is not None
             else nullcontext(_NullTracked())
         )
+        # PROFILE
+        from pip_agent import _profile
+
         with tracker as tracked:
+            _profile.event("host.lock_wait_start", session_key=sk)
             async with self._get_session_lock(sk), self._semaphore:
+                _profile.event("host.lock_wait_end", session_key=sk)  # PROFILE
                 # Resolve the resume session id INSIDE the per-session
                 # lock. Two concurrent inbounds on the same ``sk`` would
                 # otherwise both read the same stale id before either
@@ -910,7 +956,8 @@ class AgentHost:
                 # finishes last clobbers the other's persisted state.
                 # Per-session serialisation is already enforced; bringing
                 # the read inside closes the gap for free.
-                current_session = self._reap_stale_session(sk)
+                async with _profile.span("host.session_preflight"):  # PROFILE
+                    current_session = self._reap_stale_session(sk)
                 # Two distinct concepts, intentionally decoupled:
                 #
                 # * ``session_for_turn`` controls SDK *resume* — whether this
@@ -935,22 +982,35 @@ class AgentHost:
                     channel=ch, peer_id=reply_peer,
                     session_id=ctx_session_id,
                 )
+                _profile.event(  # PROFILE
+                    "host.mcp_ctx_built",
+                    model=eff.effective_model,
+                    resume=bool(session_for_turn),
+                )
 
                 try:
-                    result: QueryResult = await run_query(
-                        prompt=prepared.prompt,
-                        mcp_ctx=mcp_ctx,
+                    async with _profile.span(  # PROFILE
+                        "host.run_query",
                         model=eff.effective_model,
-                        session_id=session_for_turn,
-                        system_prompt_append=prepared.system_prompt,
-                        cwd=WORKDIR,
-                        # Heartbeats must NOT stream: we need to inspect the
-                        # full reply before deciding whether to print (so we
-                        # can silence the HEARTBEAT_OK sentinel). Everything
-                        # else streams unconditionally — streaming is an
-                        # interactive contract, not a debug toggle.
-                        stream_text=not is_heartbeat,
-                    )
+                        resume=bool(session_for_turn),
+                        prompt_kind=(
+                            "str" if isinstance(prepared.prompt, str) else "blocks"
+                        ),
+                    ):
+                        result: QueryResult = await run_query(
+                            prompt=prepared.prompt,
+                            mcp_ctx=mcp_ctx,
+                            model=eff.effective_model,
+                            session_id=session_for_turn,
+                            system_prompt_append=prepared.system_prompt,
+                            cwd=WORKDIR,
+                            # Heartbeats must NOT stream: we need to inspect the
+                            # full reply before deciding whether to print (so we
+                            # can silence the HEARTBEAT_OK sentinel). Everything
+                            # else streams unconditionally — streaming is an
+                            # interactive contract, not a debug toggle.
+                            stream_text=not is_heartbeat,
+                        )
                 except Exception as exc:
                     log.error("SDK query failed for %s: %s", sk, exc)
                     tracked.failure(f"SDK query failed: {exc}")
@@ -984,13 +1044,19 @@ class AgentHost:
                 # cron auto-disable streak just like a raised exception.
                 tracked.failure(result.error)
 
-            self._dispatch_reply(
-                inbound=inbound,
-                result=result,
-                ch=ch,
-                reply_peer=reply_peer,
-                session_key=sk,
-            )
+            with _profile.span_sync(  # PROFILE
+                "host.dispatch_reply",
+                channel=inbound.channel,
+                reply_len=len(result.text or ""),
+                has_error=bool(result.error),
+            ):
+                self._dispatch_reply(
+                    inbound=inbound,
+                    result=result,
+                    ch=ch,
+                    reply_peer=reply_peer,
+                    session_key=sk,
+                )
 
     def _deliver_command_response(
         self, inbound: InboundMessage, response: str | None,
@@ -1109,7 +1175,10 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
     ``__main__.main()`` instead. See that module's docstring for why.
     """
 
+    from pip_agent import _profile
     from pip_agent.scaffold import ensure_workspace
+
+    _profile.cold_start("run_host_entered", mode=mode)
 
     ensure_workspace(WORKDIR)
     settings.check_required()
@@ -1117,6 +1186,10 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
     registry = AgentRegistry(AGENTS_DIR)
     binding_table = BindingTable()
     binding_table.load(BINDINGS_PATH)
+    _profile.cold_start(
+        "registry_ready",
+        agents=len(registry.list_agents()),
+    )
 
     channel_mgr = ChannelManager()
     cli_channel = CLIChannel()
@@ -1181,6 +1254,11 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
         except Exception as exc:
             print(f"  [wecom] Init failed: {exc}")
 
+    _profile.cold_start(
+        "channels_ready",
+        channels=channel_mgr.list_channels(),
+    )
+
     scheduler = HostScheduler(
         agents_dir=AGENTS_DIR,
         msg_queue=msg_queue,
@@ -1188,6 +1266,7 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
         stop_event=stop_event,
     )
     scheduler.start()
+    _profile.cold_start("scheduler_ready")
 
     host = AgentHost(
         registry=registry,
@@ -1195,6 +1274,7 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
         channel_mgr=channel_mgr,
         scheduler=scheduler,
     )
+    _profile.cold_start("host_ready")
 
     from pip_agent import __version__
 
@@ -1216,8 +1296,15 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
     # main loop always drains that queue (even in CLI-only mode).
     async def _run() -> None:
         loop = asyncio.get_running_loop()
+        # Final cold-start anchor: event loop is up and we're one step
+        # away from ``stdin.readline()`` / WS / long-poll inbound. Any
+        # wall time before this point counts as cold-start cost.
+        _profile.cold_start("loop_ready")
 
         def _stdin_reader() -> None:
+            # PROFILE
+            from pip_agent import _profile
+
             while not stop_event.is_set():
                 try:
                     line = sys.stdin.readline()
@@ -1227,6 +1314,12 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
                     break
                 text = line.strip()
                 if text:
+                    # PROFILE
+                    _profile.event(
+                        "cli.inbound_received",
+                        channel="cli",
+                        text_len=len(text),
+                    )
                     with q_lock:
                         msg_queue.append(InboundMessage(
                             text=text,
@@ -1250,10 +1343,17 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
         # doesn't lose mid-flight observations.
         pending_tasks: list[asyncio.Task[None]] = []
 
+        # PROFILE
+        from pip_agent import _profile
+
         while not stop_event.is_set():
             with q_lock:
                 batch = msg_queue[:]
                 msg_queue.clear()
+
+            # PROFILE
+            if batch:
+                _profile.event("host.queue_drain", batch=len(batch))
 
             # User-originated messages go first. With the scheduler's new
             # coalescing there is at most one in-flight cron/heartbeat per

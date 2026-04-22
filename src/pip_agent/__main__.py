@@ -77,7 +77,16 @@ def main(argv: list[str] | None = None) -> None:
     force_utf8_console()
     _configure_logging()
 
+    # Initialise profiling as early as possible so the first cold-start
+    # milestone has somewhere to land. No-op when ``enable_profiler`` is
+    # false, which is the default.
+    from pip_agent import _profile
+
+    _profile.bootstrap()
+    _profile.cold_start("logging_ready", mode=args.mode)
+
     from pip_agent.agent_host import run_host
+    _profile.cold_start("run_host_imported")
     run_host(mode=args.mode, bind_agent=args.bind)
 
 

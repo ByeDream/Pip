@@ -163,30 +163,34 @@ async def run_query(
     cannot tell the difference between "agent is thinking" and "agent
     crashed").
     """
-    mcp_server = build_mcp_server(mcp_ctx)
-    effective_cwd = str(cwd) if cwd else str(mcp_ctx.workdir)
+    # PROFILE
+    from pip_agent import _profile
 
-    hooks = build_hooks(memory_store=mcp_ctx.memory_store)
+    async with _profile.span("runner.sdk_setup"):
+        mcp_server = build_mcp_server(mcp_ctx)
+        effective_cwd = str(cwd) if cwd else str(mcp_ctx.workdir)
 
-    options = ClaudeAgentOptions(
-        model=model or None,
-        cwd=effective_cwd,
-        resume=session_id,
-        system_prompt=(
-            {
-                "type": "preset",
-                "preset": "claude_code",
-                "append": system_prompt_append,
-            }
-            if system_prompt_append
-            else None
-        ),
-        permission_mode="bypassPermissions",
-        setting_sources=["project", "user"],
-        env=_build_env(),
-        mcp_servers={"pip": mcp_server},
-        hooks=hooks,
-    )
+        hooks = build_hooks(memory_store=mcp_ctx.memory_store)
+
+        options = ClaudeAgentOptions(
+            model=model or None,
+            cwd=effective_cwd,
+            resume=session_id,
+            system_prompt=(
+                {
+                    "type": "preset",
+                    "preset": "claude_code",
+                    "append": system_prompt_append,
+                }
+                if system_prompt_append
+                else None
+            ),
+            permission_mode="bypassPermissions",
+            setting_sources=["project", "user"],
+            env=_build_env(),
+            mcp_servers={"pip": mcp_server},
+            hooks=hooks,
+        )
 
     result = QueryResult()
     # Track whether we have an unterminated streaming line so we can close
@@ -205,57 +209,111 @@ async def run_query(
     else:
         sdk_prompt = _stream_single_user_message(prompt)
 
+    import time as _time  # PROFILE
+
     try:
-        async for message in query(prompt=sdk_prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock) and stream_text:
-                        print(block.text, end="", flush=True)
-                        streaming_line_open = True
-                    elif isinstance(block, ToolUseBlock):
-                        # Tool-use traces are always surfaced: a user staring
-                        # at a silent 30-second tool-chain cannot distinguish
-                        # "agent is thinking" from "agent crashed". This is a
-                        # UX contract, not debug output — do NOT gate on
-                        # ``VERBOSE``.
-                        args_preview = str(block.input)[:80]
-                        print(
-                            f"\n  [tool: {block.name} {args_preview}]",
-                            flush=True,
+        async with _profile.span(  # PROFILE
+            "runner.sdk_stream",
+            prompt_kind="str" if isinstance(prompt, str) else "blocks",
+            resume=bool(session_id),
+        ):
+            stream_start_ns = _time.perf_counter_ns()  # PROFILE
+            first_text_seen = False  # PROFILE
+            tool_count = 0  # PROFILE
+            async for message in query(prompt=sdk_prompt, options=options):
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock) and stream_text:
+                            # PROFILE — first-token latency anchor.
+                            if not first_text_seen:
+                                _profile.event(
+                                    "runner.first_text",
+                                    since_stream_ms=round(
+                                        (_time.perf_counter_ns() - stream_start_ns)
+                                        / 1_000_000.0,
+                                        3,
+                                    ),
+                                    text_len=len(block.text),
+                                )
+                                first_text_seen = True
+                            print(block.text, end="", flush=True)
+                            streaming_line_open = True
+                        elif isinstance(block, ToolUseBlock):
+                            # Tool-use traces are always surfaced: a user staring
+                            # at a silent 30-second tool-chain cannot distinguish
+                            # "agent is thinking" from "agent crashed". This is a
+                            # UX contract, not debug output — do NOT gate on
+                            # ``VERBOSE``.
+                            # PROFILE
+                            tool_count += 1
+                            _profile.event(
+                                "runner.tool_use",
+                                name=block.name,
+                                since_stream_ms=round(
+                                    (_time.perf_counter_ns() - stream_start_ns)
+                                    / 1_000_000.0,
+                                    3,
+                                ),
+                            )
+                            args_preview = str(block.input)[:80]
+                            print(
+                                f"\n  [tool: {block.name} {args_preview}]",
+                                flush=True,
+                            )
+                            # Tool traces start with ``\n`` and end without one,
+                            # so the line remains "open" from the console's POV.
+                            streaming_line_open = True
+
+                elif isinstance(message, SystemMessage):
+                    if message.subtype == "init":
+                        result.session_id = message.data.get("session_id")
+                        log.info("Session: %s", result.session_id)
+                        # PROFILE
+                        _profile.event(
+                            "runner.session_init",
+                            sid=result.session_id,
+                            since_stream_ms=round(
+                                (_time.perf_counter_ns() - stream_start_ns)
+                                / 1_000_000.0,
+                                3,
+                            ),
                         )
-                        # Tool traces start with ``\n`` and end without one,
-                        # so the line remains "open" from the console's POV.
-                        streaming_line_open = True
 
-            elif isinstance(message, SystemMessage):
-                if message.subtype == "init":
-                    result.session_id = message.data.get("session_id")
-                    log.info("Session: %s", result.session_id)
-
-            elif isinstance(message, ResultMessage):
-                result.text = message.result
-                result.session_id = message.session_id
-                result.cost_usd = message.total_cost_usd
-                result.num_turns = message.num_turns
-                if message.is_error:
-                    result.error = message.result
-                # Close the streamed line *before* the log record fires,
-                # otherwise the "Done: turns=..." log glues onto whatever
-                # the last ``TextBlock`` printed.
-                if streaming_line_open:
-                    print(flush=True)
-                    streaming_line_open = False
-                log.info(
-                    "Done: turns=%d cost=$%.4f stop=%s",
-                    message.num_turns,
-                    message.total_cost_usd or 0,
-                    message.stop_reason,
-                )
+                elif isinstance(message, ResultMessage):
+                    result.text = message.result
+                    result.session_id = message.session_id
+                    result.cost_usd = message.total_cost_usd
+                    result.num_turns = message.num_turns
+                    if message.is_error:
+                        result.error = message.result
+                    # Close the streamed line *before* the log record fires,
+                    # otherwise the "Done: turns=..." log glues onto whatever
+                    # the last ``TextBlock`` printed.
+                    if streaming_line_open:
+                        print(flush=True)
+                        streaming_line_open = False
+                    # PROFILE
+                    _profile.event(
+                        "runner.result",
+                        turns=message.num_turns,
+                        cost_usd=message.total_cost_usd or 0,
+                        stop=message.stop_reason,
+                        err=message.is_error,
+                        tool_calls=tool_count,
+                        reply_len=len(message.result or ""),
+                    )
+                    log.info(
+                        "Done: turns=%d cost=$%.4f stop=%s",
+                        message.num_turns,
+                        message.total_cost_usd or 0,
+                        message.stop_reason,
+                    )
 
     except ClaudeSDKError as exc:
         if streaming_line_open:
             print(flush=True)
         result.error = str(exc)
         log.error("SDK error: %s", exc)
+        _profile.event("runner.sdk_error", err=str(exc)[:200])  # PROFILE
 
     return result

@@ -228,25 +228,41 @@ class WeChatChannel(Channel):
         full_url = media.get("full_url", "")
         if not eqp and not full_url:
             return None
-        try:
-            if eqp:
-                resp = self._http.get(
-                    f"{self.ILINK_CDN}/download",
-                    params={"encrypted_query_param": eqp},
-                    timeout=timeout,
+        # PROFILE
+        from pip_agent import _profile
+
+        with _profile.span_sync(
+            "wechat.media_download",
+            channel="wechat",
+            has_eqp=bool(eqp),
+            timeout=timeout,
+        ):
+            try:
+                if eqp:
+                    resp = self._http.get(
+                        f"{self.ILINK_CDN}/download",
+                        params={"encrypted_query_param": eqp},
+                        timeout=timeout,
+                    )
+                else:
+                    resp = self._http.get(full_url, timeout=timeout)
+                resp.raise_for_status()
+                data = resp.content
+                raw_key = aeskey_fallback or media.get("aes_key", "")
+                if raw_key:
+                    key = _parse_ilink_aes_key(raw_key)
+                    data = _aes_ecb_decrypt(data, key)
+                # PROFILE
+                _profile.event(
+                    "wechat.media_bytes",
+                    channel="wechat",
+                    bytes=len(data) if data else 0,
+                    decrypted=bool(raw_key),
                 )
-            else:
-                resp = self._http.get(full_url, timeout=timeout)
-            resp.raise_for_status()
-            data = resp.content
-            raw_key = aeskey_fallback or media.get("aes_key", "")
-            if raw_key:
-                key = _parse_ilink_aes_key(raw_key)
-                data = _aes_ecb_decrypt(data, key)
-            return data
-        except Exception as exc:
-            log.warning("wechat CDN download/decrypt failed: %s", exc)
-            return None
+                return data
+            except Exception as exc:
+                log.warning("wechat CDN download/decrypt failed: %s", exc)
+                return None
 
     def _collect_ilink_item(
         self, item: dict, texts: list[str], atts: list[Attachment],
@@ -292,17 +308,27 @@ class WeChatChannel(Channel):
 
     def poll(self) -> list[InboundMessage]:
         """One round of getupdates.  Returns parsed messages."""
+        # PROFILE
+        from pip_agent import _profile
+
+        with _profile.span_sync("wechat.poll", channel="wechat"):
+            return self._poll_inner()
+
+    def _poll_inner(self) -> list[InboundMessage]:  # PROFILE — split from poll()
+        from pip_agent import _profile  # PROFILE
+
         try:
-            resp = self._http.post(
-                f"{self._base_url}/ilink/bot/getupdates",
-                headers=self._headers(),
-                json={
-                    "get_updates_buf": self._get_updates_buf,
-                    "base_info": {"channel_version": "1.0.0"},
-                },
-                timeout=40.0,
-            )
-            data = resp.json()
+            with _profile.span_sync("wechat.poll_http", channel="wechat"):  # PROFILE
+                resp = self._http.post(
+                    f"{self._base_url}/ilink/bot/getupdates",
+                    headers=self._headers(),
+                    json={
+                        "get_updates_buf": self._get_updates_buf,
+                        "base_info": {"channel_version": "1.0.0"},
+                    },
+                    timeout=40.0,
+                )
+                data = resp.json()
         except Exception as exc:
             if not self._closing:
                 log.warning("wechat getupdates error: %s", exc)
@@ -334,27 +360,37 @@ class WeChatChannel(Channel):
             if ctx_token and from_user:
                 self._context_tokens[from_user] = ctx_token
 
-            texts: list[str] = []
-            atts: list[Attachment] = []
-            for item in msg.get("item_list", []):
-                self._collect_ilink_item(item, texts, atts)
-                ref_item = (item.get("ref_msg") or {}).get("message_item")
-                if isinstance(ref_item, dict):
-                    self._collect_ilink_item(ref_item, [], atts)
+            # PROFILE
+            with _profile.span_sync("wechat.parse_item", channel="wechat"):
+                texts: list[str] = []
+                atts: list[Attachment] = []
+                for item in msg.get("item_list", []):
+                    self._collect_ilink_item(item, texts, atts)
+                    ref_item = (item.get("ref_msg") or {}).get("message_item")
+                    if isinstance(ref_item, dict):
+                        self._collect_ilink_item(ref_item, [], atts)
 
-            text = "\n".join(texts)
-            if not text and not atts:
-                continue
+                text = "\n".join(texts)
+                if not text and not atts:
+                    continue
 
-            results.append(InboundMessage(
-                text=text,
-                sender_id=from_user,
-                channel="wechat",
-                peer_id=from_user,
-                account_id=self._account_id,
-                raw=msg,
-                attachments=atts,
-            ))
+                # PROFILE
+                _profile.event(
+                    "wechat.inbound_received",
+                    channel="wechat",
+                    text_len=len(text),
+                    atts=len(atts),
+                    sender=from_user,
+                )
+                results.append(InboundMessage(
+                    text=text,
+                    sender_id=from_user,
+                    channel="wechat",
+                    peer_id=from_user,
+                    account_id=self._account_id,
+                    raw=msg,
+                    attachments=atts,
+                ))
 
         return results
 
@@ -366,38 +402,50 @@ class WeChatChannel(Channel):
     def send(self, to: str, text: str, **kw: Any) -> bool:
         from pip_agent.fileutil import chunk_message
 
+        # PROFILE
+        from pip_agent import _profile
+
         ctx_token = self._context_tokens.get(to, "")
         if not ctx_token:
             print(f"  [wechat] Cannot reply to {to}: no context_token")
             return False
 
-        ok = True
-        for chunk in chunk_message(text, "wechat"):
-            client_id = f"pip:{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
-            body = {
-                "msg": {
-                    "from_user_id": "",
-                    "to_user_id": to,
-                    "client_id": client_id,
-                    "message_type": 2,
-                    "message_state": 2,
-                    "context_token": ctx_token,
-                    "item_list": [{"type": 1, "text_item": {"text": chunk}}],
-                },
-                "base_info": {"channel_version": "1.0.0"},
-            }
-            try:
-                resp = self._http.post(
-                    f"{self._base_url}/ilink/bot/sendmessage",
-                    headers=self._headers(),
-                    json=body,
-                )
-                if resp.status_code != 200:
+        with _profile.span_sync(
+            "wechat.send", channel="wechat", text_len=len(text),
+        ):
+            ok = True
+            for idx, chunk in enumerate(chunk_message(text, "wechat")):
+                client_id = f"pip:{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
+                body = {
+                    "msg": {
+                        "from_user_id": "",
+                        "to_user_id": to,
+                        "client_id": client_id,
+                        "message_type": 2,
+                        "message_state": 2,
+                        "context_token": ctx_token,
+                        "item_list": [{"type": 1, "text_item": {"text": chunk}}],
+                    },
+                    "base_info": {"channel_version": "1.0.0"},
+                }
+                try:
+                    with _profile.span_sync(  # PROFILE
+                        "wechat.send_chunk",
+                        channel="wechat",
+                        idx=idx,
+                        bytes=len(chunk.encode("utf-8")),
+                    ):
+                        resp = self._http.post(
+                            f"{self._base_url}/ilink/bot/sendmessage",
+                            headers=self._headers(),
+                            json=body,
+                        )
+                    if resp.status_code != 200:
+                        ok = False
+                except Exception as exc:
+                    log.warning("wechat sendmessage error: %s", exc)
                     ok = False
-            except Exception as exc:
-                log.warning("wechat sendmessage error: %s", exc)
-                ok = False
-        return ok
+            return ok
 
     def send_typing(self, to: str) -> None:
         """Send typing indicator via sendtyping API (fire-and-forget)."""

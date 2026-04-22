@@ -151,20 +151,32 @@ def send_with_retry(
     pending frames by ``peer_id`` is unsafe under concurrency. Unused by
     CLI / WeChat.
     """
+    # PROFILE
+    from pip_agent import _profile
+
     if ch.name == "cli":
-        with ch.send_lock:
+        with _profile.span_sync(
+            "channel.send_with_retry", channel=ch.name, chunks=1, text_len=len(text),
+        ), ch.send_lock:
             return ch.send(to, text)
 
     from pip_agent.fileutil import chunk_message
 
     chunks = chunk_message(text, ch.name)
     all_ok = True
-    with ch.send_lock:
+    retries = 0
+    with _profile.span_sync(
+        "channel.send_with_retry",
+        channel=ch.name,
+        chunks=len(chunks),
+        text_len=len(text),
+    ), ch.send_lock:
         for chunk in chunks:
             ok = ch.send(to, chunk, inbound_id=inbound_id)
             if ok:
                 continue
             for delay in BACKOFF_SCHEDULE:
+                retries += 1
                 jitter = delay * 0.2 * (random.random() - 0.5)
                 time.sleep(delay + jitter)
                 ok = ch.send(to, chunk, inbound_id=inbound_id)
@@ -176,6 +188,10 @@ def send_with_retry(
                     "send_with_retry: gave up after %d retries to %s on %s",
                     len(BACKOFF_SCHEDULE), to, ch.name,
                 )
+        if retries:  # PROFILE
+            _profile.event(
+                "channel.send_retries", channel=ch.name, retries=retries,
+            )
     if inbound_id:
         # Drop the cached inbound frame now that every chunk has been
         # attempted. Channels without per-frame state override this to

@@ -61,61 +61,73 @@ def _pre_compact_hook(memory_store: MemoryStore | None):
         tool_use_id: str | None,
         context: Any,
     ) -> dict[str, Any]:
-        if memory_store is None:
-            return {}
+        # PROFILE
+        from pip_agent import _profile
 
-        transcript_path = str(input_data.get("transcript_path") or "")
-        session_id = str(input_data.get("session_id") or "")
+        async with _profile.span(
+            "hook.pre_compact",
+            trigger=input_data.get("trigger", "?"),
+        ):
+            if memory_store is None:
+                return {}
 
-        try:
-            state = memory_store.load_state()
-            state["last_pre_compact_at"] = time.time()
-            if session_id:
-                state["last_pre_compact_session_id"] = session_id
-            if transcript_path:
-                state["last_pre_compact_transcript"] = transcript_path
-            memory_store.save_state(state)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("PreCompact: failed to stamp memory state: %s", exc)
-            return {}
+            transcript_path = str(input_data.get("transcript_path") or "")
+            session_id = str(input_data.get("session_id") or "")
 
-        if not transcript_path or not session_id:
-            log.info("PreCompact: missing transcript_path or session_id; skipping reflect")
-            return {}
+            try:
+                state = memory_store.load_state()
+                state["last_pre_compact_at"] = time.time()
+                if session_id:
+                    state["last_pre_compact_session_id"] = session_id
+                if transcript_path:
+                    state["last_pre_compact_transcript"] = transcript_path
+                memory_store.save_state(state)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("PreCompact: failed to stamp memory state: %s", exc)
+                return {}
 
-        path = Path(transcript_path)
-        if not path.is_file():
-            log.info("PreCompact: transcript file missing: %s", path)
-            return {}
-
-        try:
-            from pip_agent.anthropic_client import build_anthropic_client
-            from pip_agent.memory.reflect import reflect_and_persist
-
-            client = build_anthropic_client()
-            if client is None:
+            if not transcript_path or not session_id:
                 log.info(
-                    "PreCompact: reflect skipped for session=%s — "
-                    "no ANTHROPIC_API_KEY/AUTH_TOKEN configured",
-                    session_id[:8],
+                    "PreCompact: missing transcript_path or session_id; skipping reflect"
                 )
                 return {}
 
-            start_offset, new_offset, obs_count = reflect_and_persist(
-                memory_store=memory_store,
-                session_id=session_id,
-                transcript_path=path,
-                client=client,
-            )
-            log.info(
-                "PreCompact: reflect session=%s obs=%d offset=%d→%d trigger=%s",
-                session_id[:8], obs_count, start_offset, new_offset,
-                input_data.get("trigger", "?"),
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("PreCompact: reflect failed: %s", exc)
+            path = Path(transcript_path)
+            if not path.is_file():
+                log.info("PreCompact: transcript file missing: %s", path)
+                return {}
 
-        return {}
+            try:
+                from pip_agent.anthropic_client import build_anthropic_client
+                from pip_agent.memory.reflect import reflect_and_persist
+
+                client = build_anthropic_client()
+                if client is None:
+                    log.info(
+                        "PreCompact: reflect skipped for session=%s — "
+                        "no ANTHROPIC_API_KEY/AUTH_TOKEN configured",
+                        session_id[:8],
+                    )
+                    return {}
+
+                async with _profile.span(  # PROFILE
+                    "hook.pre_compact.reflect", session=session_id[:8]
+                ):
+                    start_offset, new_offset, obs_count = reflect_and_persist(
+                        memory_store=memory_store,
+                        session_id=session_id,
+                        transcript_path=path,
+                        client=client,
+                    )
+                log.info(
+                    "PreCompact: reflect session=%s obs=%d offset=%d→%d trigger=%s",
+                    session_id[:8], obs_count, start_offset, new_offset,
+                    input_data.get("trigger", "?"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("PreCompact: reflect failed: %s", exc)
+
+            return {}
 
     return _callback
 
@@ -131,15 +143,19 @@ def _stop_hook(memory_store: MemoryStore | None):
         tool_use_id: str | None,
         context: Any,
     ) -> dict[str, Any]:
-        if memory_store is None:
+        # PROFILE
+        from pip_agent import _profile
+
+        async with _profile.span("hook.stop"):
+            if memory_store is None:
+                return {}
+            try:
+                state = memory_store.load_state()
+                state["last_activity_at"] = time.time()
+                memory_store.save_state(state)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Stop hook: failed to update state: %s", exc)
             return {}
-        try:
-            state = memory_store.load_state()
-            state["last_activity_at"] = time.time()
-            memory_store.save_state(state)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Stop hook: failed to update state: %s", exc)
-        return {}
 
     return _callback
 

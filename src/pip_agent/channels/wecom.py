@@ -120,15 +120,25 @@ class WecomChannel(Channel):
             # carries ``filename``/``file_name``/``name`` for user
             # uploads, so if we drop this the agent sees ``[File: file]``
             # with no extension to work from. Plumb it through.
-            try:
-                data, fname = await asyncio.wait_for(
-                    ws.download_file(url, aeskey),
-                    timeout=self._DOWNLOAD_TIMEOUT,
-                )
-                return data, fname
-            except Exception as exc:
-                log.warning("wecom media download failed: %s", exc)
-                return None, None
+            # PROFILE
+            from pip_agent import _profile
+
+            async with _profile.span("wecom.media_download", channel="wecom"):
+                try:
+                    data, fname = await asyncio.wait_for(
+                        ws.download_file(url, aeskey),
+                        timeout=self._DOWNLOAD_TIMEOUT,
+                    )
+                    # PROFILE
+                    _profile.event(
+                        "wecom.media_bytes",
+                        channel="wecom",
+                        bytes=len(data) if data else 0,
+                    )
+                    return data, fname
+                except Exception as exc:
+                    log.warning("wecom media download failed: %s", exc)
+                    return None, None
 
         async def _collect_quote_attachments(body: dict) -> list[Attachment]:
             """Download media from a quoted (reply-to) message.
@@ -234,6 +244,19 @@ class WecomChannel(Channel):
                 raw=frame,
                 attachments=attachments,
             )
+            # PROFILE
+            from pip_agent import _profile
+
+            _profile.event(
+                "wecom.inbound_received",
+                channel="wecom",
+                text_len=len(text),
+                atts=len(attachments),
+                sender=sender_id,
+                peer=peer_id,
+                is_group=is_group,
+                inbound_id=inbound_id,
+            )
             with self._q_lock:
                 self._msg_queue.append(msg)
 
@@ -263,6 +286,17 @@ class WecomChannel(Channel):
             if not body:
                 return
             msgtype = body.get("msgtype", "")
+            # PROFILE
+            from pip_agent import _profile
+
+            async with _profile.span(
+                "wecom.on_message", channel="wecom", msgtype=msgtype
+            ):
+                await _on_message_inner(frame, body, msgtype)
+
+        async def _on_message_inner(  # PROFILE — split from _on_message
+            frame: dict, body: dict, msgtype: str,
+        ) -> None:
             text_parts: list[str] = []
             atts: list[Attachment] = []
 
@@ -464,24 +498,30 @@ class WecomChannel(Channel):
         asyncio.run(_run())
 
     def send(self, to: str, text: str, **kw: Any) -> bool:
-        inbound_id = str(kw.get("inbound_id") or "")
-        frame: Any = None
-        if inbound_id:
-            with self._pending_lock:
-                frame = self._pending_frames.get(inbound_id)
-        if not frame or not self._ws_client:
-            # No cached frame means this is either a proactive send
-            # (cron / heartbeat / command response without an inbound)
-            # or the frame was already released. Fall through to the
-            # markdown push path rather than silently dropping.
-            log.debug(
-                "wecom send: no frame for inbound_id=%s (peer=%s), "
-                "using send_message",
-                inbound_id or "<none>", to,
-            )
-            return self._send_proactive(to, text)
-        self._run_async(self._reply_async(frame, text))
-        return True
+        # PROFILE
+        from pip_agent import _profile
+
+        with _profile.span_sync(
+            "wecom.send", channel="wecom", text_len=len(text),
+        ):
+            inbound_id = str(kw.get("inbound_id") or "")
+            frame: Any = None
+            if inbound_id:
+                with self._pending_lock:
+                    frame = self._pending_frames.get(inbound_id)
+            if not frame or not self._ws_client:
+                # No cached frame means this is either a proactive send
+                # (cron / heartbeat / command response without an inbound)
+                # or the frame was already released. Fall through to the
+                # markdown push path rather than silently dropping.
+                log.debug(
+                    "wecom send: no frame for inbound_id=%s (peer=%s), "
+                    "using send_message",
+                    inbound_id or "<none>", to,
+                )
+                return self._send_proactive(to, text)
+            self._run_async(self._reply_async(frame, text))
+            return True
 
     def release_inbound(self, inbound_id: str) -> None:
         if not inbound_id:
@@ -490,8 +530,14 @@ class WecomChannel(Channel):
             self._pending_frames.pop(inbound_id, None)
 
     async def _reply_async(self, frame: dict, text: str) -> None:
-        stream_id = generate_req_id("stream")
-        await self._ws_client.reply_stream(frame, stream_id, text, True)
+        # PROFILE
+        from pip_agent import _profile
+
+        async with _profile.span(
+            "wecom.reply_stream", channel="wecom", text_len=len(text),
+        ):
+            stream_id = generate_req_id("stream")
+            await self._ws_client.reply_stream(frame, stream_id, text, True)
 
     # -- media upload pipeline (WebSocket protocol, no SDK uploadMedia needed) --
 
@@ -556,20 +602,24 @@ class WecomChannel(Channel):
         import asyncio
         import concurrent.futures
 
+        # PROFILE
+        from pip_agent import _profile
+
         loop = self._ws_loop
         if loop is None or loop.is_closed():
             log.warning("wecom _run_async: WS loop not available")
             return None
-        future = asyncio.run_coroutine_threadsafe(coro, loop)
-        try:
-            return future.result(timeout=30)
-        except concurrent.futures.TimeoutError:
-            log.warning("wecom _run_async: timed out")
-            future.cancel()
-            return None
-        except Exception:
-            log.exception("wecom _run_async: coroutine failed")
-            return None
+        with _profile.span_sync("wecom.run_async_wait", channel="wecom"):
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            try:
+                return future.result(timeout=30)
+            except concurrent.futures.TimeoutError:
+                log.warning("wecom _run_async: timed out")
+                future.cancel()
+                return None
+            except Exception:
+                log.exception("wecom _run_async: coroutine failed")
+                return None
 
     def send_image(self, to: str, image_data: bytes, caption: str = "", **kw: Any) -> bool:
         if not self._ws_client or not image_data:

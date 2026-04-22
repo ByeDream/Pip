@@ -41,6 +41,23 @@ class Settings(BaseSettings):
     # internal log firehose (scheduler ticks, memory pipeline, SDK init).
     verbose: bool = Field(default=False)
 
+    # Structured timing profiler — see ``pip_agent._profile``. When
+    # enabled, every inbound turn emits JSONL span / event records to
+    # ``profile_dir / profile.jsonl`` (append-only, thread + coroutine
+    # safe). Default **off**: hot-path cost when disabled is a single
+    # attribute check, so leaving the instrumentation in production is
+    # safe, but the file it writes is intended for perf investigations,
+    # not operational logging.
+    #
+    # ``PIP_PROFILE=1`` in the shell env is also honoured as a one-off
+    # override when you don't want to touch ``.env``.
+    enable_profiler: bool = Field(default=False)
+
+    # Where profile JSONL lands. Empty string → the profiler picks a
+    # default under ``D:\Workspace\pip-test\profile-logs``. Override via
+    # ``PIP_PROFILE_DIR`` env var still works.
+    profile_dir: str = Field(default="")
+
     wecom_bot_id: str = Field(default="")
     wecom_bot_secret: str = Field(default="")
 

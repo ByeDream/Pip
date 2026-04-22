@@ -59,7 +59,28 @@ class McpContext:
 def build_mcp_server(ctx: McpContext) -> McpSdkServerConfig:
     """Create the in-process MCP server with all Pip-Boy-unique tools."""
     tools = _memory_tools(ctx) + _cron_tools(ctx) + _channel_tools(ctx)
+    # PROFILE — wrap every tool handler so each invocation shows up
+    # as its own ``mcp.<name>`` span. Single-site interception means one
+    # line to remove during cleanup.
+    tools = [_profile_wrap_tool(t) for t in tools]
     return create_sdk_mcp_server("pip", tools=tools)
+
+
+def _profile_wrap_tool(tool: SdkMcpTool) -> SdkMcpTool:  # PROFILE
+    """Wrap an ``SdkMcpTool`` so its handler is instrumented with a span."""
+    from pip_agent import _profile
+
+    original = tool.handler
+    name = tool.name
+
+    async def wrapped(args: dict[str, Any]) -> dict[str, Any]:
+        async with _profile.span(f"mcp.{name}"):
+            return await original(args)
+
+    # ``SdkMcpTool`` is a dataclass; build a shallow copy with the new handler.
+    from dataclasses import replace
+
+    return replace(tool, handler=wrapped)
 
 
 # ---------------------------------------------------------------------------
