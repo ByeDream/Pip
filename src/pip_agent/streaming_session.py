@@ -357,6 +357,7 @@ class StreamingSession:
                             if streaming_line_open:
                                 print(flush=True)
                                 streaming_line_open = False
+                            usage = message.usage or {}
                             _profile.event(
                                 "stream.result",
                                 session_key=self.session_key,
@@ -367,6 +368,10 @@ class StreamingSession:
                                 err=message.is_error,
                                 tool_calls=tool_count,
                                 reply_len=len(message.result or ""),
+                                input_tokens=int(usage.get("input_tokens") or 0),
+                                output_tokens=int(usage.get("output_tokens") or 0),
+                                cache_read=int(usage.get("cache_read_input_tokens") or 0),
+                                cache_creation=int(usage.get("cache_creation_input_tokens") or 0),
                             )
                 except ClaudeSDKError as exc:
                     if streaming_line_open:
