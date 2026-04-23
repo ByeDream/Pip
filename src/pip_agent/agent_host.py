@@ -20,16 +20,17 @@ from typing import Any
 
 from pip_agent import host_commands
 from pip_agent.agent_runner import QueryResult, run_query
+# Tier 3 cold-start: only import the light channel primitives at module
+# import time. Wechat / wecom pull ``aibot`` and ``aiohttp`` (~450 ms +
+# ~180 ms on a warm machine); CLI-only launches never need them, and
+# even wecom-only launches don't need wechat. The heavy channel
+# symbols are imported lazily at their use sites below.
 from pip_agent.channels import (
     Channel,
     ChannelManager,
     CLIChannel,
     InboundMessage,
-    WeChatChannel,
-    WecomChannel,
     send_with_retry,
-    wechat_poll_loop,
-    wecom_ws_loop,
 )
 from pip_agent.config import WORKDIR, settings
 from pip_agent.host_scheduler import HostScheduler
@@ -893,9 +894,18 @@ class AgentHost:
             if inbound.is_group and inbound.guild_id:
                 reply_peer = inbound.guild_id
 
-            if inbound.channel == "wechat" and isinstance(ch, WeChatChannel):
-                _profile.event("host.send_typing", channel="wechat")
-                ch.send_typing(inbound.peer_id)
+            if inbound.channel == "wechat":
+                # Import lazily: the wechat channel pulls in its own
+                # aiohttp + pywinauto stack that CLI/wecom-only runs
+                # don't need. By the time we actually dispatch a
+                # wechat inbound we've already paid the import during
+                # channel construction in :func:`run_host`, so this is
+                # free.
+                from pip_agent.channels.wechat import WeChatChannel
+
+                if isinstance(ch, WeChatChannel):
+                    _profile.event("host.send_typing", channel="wechat")
+                    ch.send_typing(inbound.peer_id)
 
             return _PreparedTurn(
                 eff=eff, svc=svc, sk=sk, ch=ch,
@@ -1202,9 +1212,16 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
 
     state_dir = WORKDIR / ".pip"
 
-    wechat_channel: WeChatChannel | None = None
+    wechat_channel = None
     if mode != "cli":
         try:
+            # Deferred import: keeps CLI cold-start off the wechat
+            # (pywinauto / aiohttp) dependency graph.
+            from pip_agent.channels.wechat import (
+                WeChatChannel,
+                wechat_poll_loop,
+            )
+
             wechat_channel = WeChatChannel(state_dir)
             if mode == "scan":
                 wechat_channel._clear_creds()
@@ -1238,6 +1255,11 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
 
     if settings.wecom_bot_id and settings.wecom_bot_secret:
         try:
+            # Deferred import: aibot (WeCom SDK) + aiohttp add ~600 ms
+            # to cold start. Only pay it if wecom creds are actually
+            # configured.
+            from pip_agent.channels.wecom import WecomChannel, wecom_ws_loop
+
             wecom_channel = WecomChannel(
                 settings.wecom_bot_id,
                 settings.wecom_bot_secret,
