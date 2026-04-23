@@ -115,6 +115,30 @@ class Settings(BaseSettings):
     # in the conversation transcript.
     batch_text_joiner: str = Field(default="\n\n")
 
+    # Idle backoff for the WeChat iLink ``getupdates`` long-poll.
+    #
+    # Observed problem: the iLink server frequently fast-returns from
+    # ``getupdates`` with no messages (response < 50 ms). Without any
+    # client-side wait between calls, the poll loop hammers the server
+    # at ~20 req/sec when the user's WeChat is idle — burning CPU,
+    # local HTTP overhead, and the server's rate budget, and flooding
+    # verbose-mode logs with httpx INFO lines.
+    #
+    # Contract: only applied when the previous poll returned ZERO new
+    # messages AND no transport error fired. If messages arrived, we
+    # loop back immediately (active-conversation latency matters more
+    # than idle thrift). Error backoff is a separate, stronger scale
+    # (``2s * consecutive_errors`` capped at 30 s, see
+    # :func:`wechat_poll_loop`).
+    #
+    # 1.0 s balances:
+    #   * interactive latency on a quiet channel (one user types, we
+    #     fetch within ≤1 s of their send)
+    #   * ~20x reduction in idle-state request volume (was ~20 req/s,
+    #     now ~1 req/s)
+    # Set to 0 to restore the pre-Tier-2 hot-loop behaviour.
+    wechat_poll_idle_sec: float = Field(default=1.0)
+
     wecom_bot_id: str = Field(default="")
     wecom_bot_secret: str = Field(default="")
 

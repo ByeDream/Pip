@@ -482,9 +482,29 @@ def wechat_poll_loop(
     stop: threading.Event,
     pause: threading.Event | None = None,
 ) -> None:
-    """Long-poll loop for WeChat, runs in a daemon thread."""
+    """Long-poll loop for WeChat, runs in a daemon thread.
+
+    Cadence:
+
+    * ``getupdates`` returned ≥ 1 message → loop immediately (interactive
+      latency matters more than thrift when a conversation is active).
+    * ``getupdates`` returned 0 messages → ``stop.wait(
+      settings.wechat_poll_idle_sec)`` before the next call. Without
+      this the loop hammers the iLink server at ~20 req/sec whenever
+      the user's chat is idle (the server fast-returns from long-poll
+      in <50 ms). Use ``stop.wait`` rather than ``time.sleep`` so
+      ``/exit`` interrupts promptly.
+    * Transport error → exponential backoff, independent of the idle
+      interval. Errors already drive a longer wait (``2s *
+      consecutive_errors`` capped at 30 s) and should not be shortened
+      by the idle setting.
+    """
+    from pip_agent import _profile  # PROFILE
+    from pip_agent.config import settings
+
     print("  [wechat] Polling started")
     consecutive_errors = 0
+    idle_polls_streak = 0
     while not stop.is_set():
         if pause is not None and pause.is_set():
             stop.wait(0.5)
@@ -498,6 +518,31 @@ def wechat_poll_loop(
             if msgs:
                 with lock:
                     queue.extend(msgs)
+                # Drop any stale idle streak — the channel just woke up,
+                # next poll should fire immediately for a fast follow-up.
+                if idle_polls_streak:
+                    _profile.event(
+                        "wechat.poll_idle_streak_end",
+                        channel="wechat",
+                        streak=idle_polls_streak,
+                    )
+                    idle_polls_streak = 0
+                # Immediate loop — no sleep. Active-conversation path.
+                continue
+            # Idle path — throttle so we don't DOS the iLink server.
+            idle_polls_streak += 1
+            idle_wait = settings.wechat_poll_idle_sec
+            if idle_wait > 0:
+                # Emit once per streak start (avoid per-poll event spam);
+                # streak-end event above carries the total count for
+                # post-hoc analysis.
+                if idle_polls_streak == 1:
+                    _profile.event(
+                        "wechat.poll_idle_backoff",
+                        channel="wechat",
+                        wait_sec=idle_wait,
+                    )
+                stop.wait(idle_wait)
         except OSError:
             if stop.is_set():
                 break
