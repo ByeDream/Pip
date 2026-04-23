@@ -491,8 +491,38 @@ class WecomChannel(Channel):
         async def _run():
             self._ws_loop = asyncio.get_running_loop()
             await ws.connect()
-            while not stop_event.is_set():
-                await asyncio.sleep(0.5)
+            # Bridge the cross-thread ``threading.Event`` into asyncio by
+            # blocking a single executor worker on ``Event.wait()``. The
+            # worker wakes the instant ``stop_event.set()`` is called,
+            # bounding shutdown latency to worker-scheduling (~ms) instead
+            # of the old ``asyncio.sleep(0.5)`` poll tick (avg 250 ms, p99
+            # 500 ms just to notice a shutdown signal).
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, stop_event.wait)
+            # Drain in-flight replies before tearing the socket down. A
+            # bare ``ws.disconnect()`` here would cancel any coroutines
+            # that other threads scheduled via ``_run_async`` (typically
+            # ``_reply_async`` / media uploads) while the user was
+            # mid-sentence — the receiving side sees a truncated stream.
+            # Wait up to 3 s for the loop's own task set to drain; after
+            # that the disconnect goes through regardless (we'd rather
+            # lose a hung task than stall Ctrl+C indefinitely).
+            pending = {
+                t for t in asyncio.all_tasks(loop)
+                if t is not asyncio.current_task()
+            }
+            if pending:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=3.0,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "wecom shutdown: %d task(s) still running after "
+                        "3 s drain window; disconnecting anyway",
+                        len(pending),
+                    )
             ws.disconnect()
 
         asyncio.run(_run())
