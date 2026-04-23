@@ -58,6 +58,63 @@ class Settings(BaseSettings):
     # ``PIP_PROFILE_DIR`` env var still works.
     profile_dir: str = Field(default="")
 
+    # Tier 1 streaming session reuse. When enabled, AgentHost keeps one
+    # ``ClaudeSDKClient`` alive per session_key, so subsequent turns on
+    # the same session avoid the ~400 ms subprocess spawn + handshake.
+    # Ephemeral senders (cron / heartbeat) still go through the one-shot
+    # ``run_query`` path — mixing stateful and stateless flows in the
+    # same client would pollute the user's transcript. Disable to force
+    # every turn back to the one-shot path (useful for A/B comparison).
+    enable_streaming_session: bool = Field(default=True)
+
+    # Idle-eviction window for cached streaming clients, in seconds.
+    # Sweep runs on the host scheduler; clients idle longer than this
+    # are disconnected to (a) free ~25 MB RSS per stale ``claude.exe``
+    # subprocess, and (b) let the next turn pick up refreshed memory
+    # enrichment (``system_prompt_append`` is frozen at connect()).
+    # 180 s is slightly above the typical "user replies within 3 min"
+    # window from perf-report-new.md; tune per workload.
+    stream_idle_ttl_sec: int = Field(default=180)
+
+    # Hard cap on concurrent live streaming clients. Acts as the new
+    # analogue of the old per-turn ``Semaphore(3)``: still bounds total
+    # resident ``claude.exe`` processes, but now the bound is per
+    # *session* rather than per *turn*. 10 is comfortable for the 4-5
+    # active peers observed in perf logs; raise if you run a larger
+    # agent fleet.
+    stream_max_live: int = Field(default=10)
+
+    # Tier 2: when multiple text-only inbound messages from the same
+    # sender/peer land in the SAME drain tick (≤ ``0.3 s`` apart with
+    # the current inbound loop cadence), fuse them into a single LLM
+    # turn. Typical win is on WeCom, where users tend to break a
+    # thought across 2-3 bubbles (``"早"`` / ``"今天提醒我开会"`` /
+    # ``"谢谢"``). Each bubble previously spent a full session_init
+    # recap + LLM round trip; coalescing cuts that to one.
+    #
+    # Messages are eligible only if ALL of these hold:
+    #
+    # * ``attachments`` is empty (no images / files / voice — media
+    #   changes the prompt shape and we don't want to reorder image
+    #   placement just to save tokens).
+    # * ``source_job_id`` is empty (not a heartbeat / cron payload;
+    #   those are already coalesced by ``HostScheduler`` and batching
+    #   them with a human message would misleadingly attribute the
+    #   keepalive to the user).
+    # * ``text`` does not start with ``"/"`` (host commands — ``/exit``,
+    #   ``/flush``, …— must stay as discrete turns).
+    #
+    # Disable to force one-inbound-per-turn behaviour (useful when
+    # debugging agent logic that depends on seeing messages
+    # individually).
+    batch_text_inbounds: bool = Field(default=True)
+
+    # Joiner inserted between coalesced message bodies. Two newlines
+    # preserves paragraph semantics for the model (each bubble reads as
+    # its own paragraph). Keep this narrow — changing it is observable
+    # in the conversation transcript.
+    batch_text_joiner: str = Field(default="\n\n")
+
     wecom_bot_id: str = Field(default="")
     wecom_bot_secret: str = Field(default="")
 

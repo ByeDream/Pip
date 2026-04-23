@@ -13,6 +13,7 @@ import logging
 import re
 import sys
 import threading
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,7 @@ from pip_agent.routing import (
     normalize_agent_id,
     resolve_effective_config,
 )
+from pip_agent.streaming_session import StaleSessionError, StreamingSession
 
 log = logging.getLogger(__name__)
 
@@ -163,6 +165,109 @@ class _NullTracked:
 
     def failure(self, message: str = "") -> None:
         return None
+
+
+def _batch_group_key(m: InboundMessage) -> tuple[str, str, str, str, str, bool]:
+    """Identifier for "same logical conversation" used by Tier 2 batching.
+
+    Two messages only coalesce when every field here matches. We
+    intentionally include ``agent_id`` and ``guild_id`` so a group
+    DM and a 1-on-1 DM from the same sender stay separate, and
+    different bot accounts never cross-talk.
+    """
+    return (
+        m.channel,
+        m.sender_id,
+        m.peer_id,
+        m.guild_id,
+        m.agent_id,
+        m.is_group,
+    )
+
+
+def _batch_eligible(m: InboundMessage) -> bool:
+    """Tier 2 filter: may ``m`` participate in text coalescing?
+
+    See the ``batch_text_inbounds`` docstring in ``config.py`` for the
+    policy rationale. The quick form:
+
+    * no attachments (preserve multimodal ordering)
+    * no scheduler marker (heartbeat / cron stay individual)
+    * non-empty text that is NOT a host slash command
+    """
+    if m.attachments:
+        return False
+    if m.source_job_id:
+        return False
+    text = m.text.strip()
+    if not text:
+        return False
+    if text.startswith("/"):
+        return False
+    return True
+
+
+def _coalesce_text_inbounds(
+    batch: list[InboundMessage],
+    joiner: str,
+) -> tuple[list[InboundMessage], int]:
+    """Fuse contiguous same-conversation text-only inbounds into one.
+
+    Walks ``batch`` once (O(n)) preserving FIFO order. A message is
+    merged into the previous one when both pass :func:`_batch_eligible`
+    and share the same :func:`_batch_group_key`. The merged message
+    keeps all fields of the *first* (earliest) inbound except
+    ``text``, which becomes ``joiner.join([first.text, …, last.text])``.
+
+    Returns ``(new_batch, fused_count)`` where ``fused_count`` is the
+    number of messages absorbed (``0`` means no coalescing happened,
+    so the caller can short-circuit any profile emit).
+
+    Why concatenate instead of replay-as-history? The LLM already
+    sees prior turns via the streaming session. Splitting a single
+    train of thought across 3 turns would *waste* 2 LLM round trips
+    without adding information — concatenation gives the same
+    information in one trip.
+    """
+    if len(batch) < 2:
+        return batch, 0
+
+    out: list[InboundMessage] = []
+    fused = 0
+    for m in batch:
+        if not out:
+            out.append(m)
+            continue
+        prev = out[-1]
+        if (
+            _batch_eligible(prev)
+            and _batch_eligible(m)
+            and _batch_group_key(prev) == _batch_group_key(m)
+        ):
+            # Build a new InboundMessage rather than mutating ``prev``
+            # in place — ``prev`` might still be held by someone (e.g.
+            # the caller's sort list). Cheap dataclass copy.
+            merged = InboundMessage(
+                text=(prev.text + joiner + m.text) if prev.text else m.text,
+                sender_id=prev.sender_id,
+                channel=prev.channel,
+                peer_id=prev.peer_id,
+                guild_id=prev.guild_id,
+                account_id=prev.account_id,
+                is_group=prev.is_group,
+                agent_id=prev.agent_id,
+                # Keep the EARLIEST raw — the reply routes off ``peer_id``
+                # anyway and the raw blob is only used for debugging /
+                # attachment backfill.
+                raw=prev.raw,
+                attachments=[],
+                source_job_id="",
+            )
+            out[-1] = merged
+            fused += 1
+        else:
+            out.append(m)
+    return out, fused
 
 
 def _inbound_sort_key(inbound: InboundMessage) -> tuple[int, int]:
@@ -560,6 +665,27 @@ class AgentHost:
         self._max_concurrent = 3
         self._semaphore = asyncio.Semaphore(self._max_concurrent)
 
+        # Tier 1: streaming-session cache. One ``StreamingSession`` per
+        # session key keeps the CC subprocess alive across turns so we
+        # only pay the ~400 ms spawn + handshake once per session. Guarded
+        # by a dict-level lock (NOT a per-key one) because the expensive
+        # operation — ``StreamingSession.connect()`` — needs to run once
+        # per (session_key, process) and we don't want two concurrent
+        # first-turns on the same key to both spawn a client. Per-session
+        # locks (``_session_locks`` above) serialise actual turn dispatch
+        # and are acquired by the caller (``_execute_turn``) AFTER this
+        # create step returns, so holding ``_streaming_lock`` during
+        # connect is fine.
+        #
+        # Eviction: idle sweep runs once per tick of the background
+        # ``_streaming_idle_sweep`` task (started in :meth:`start_idle_sweep`),
+        # closing any session whose ``last_used_ns`` is older than
+        # ``settings.stream_idle_ttl_sec``. Max-live cap drops the oldest
+        # idle session when a new create would exceed the limit.
+        self._streaming_sessions: dict[str, StreamingSession] = {}
+        self._streaming_lock = asyncio.Lock()
+        self._streaming_sweep_task: asyncio.Task[None] | None = None
+
     def _get_session_lock(self, sk: str) -> asyncio.Lock:
         """Return the per-session lock, creating it lazily."""
         # asyncio runs on a single thread — no extra guard needed for
@@ -604,6 +730,300 @@ class AgentHost:
         self._sessions.pop(sk, None)
         _save_sessions(self._sessions)
         return None
+
+    # ------------------------------------------------------------------
+    # Tier 1: streaming-session cache
+    # ------------------------------------------------------------------
+
+    async def _run_turn_streaming(
+        self,
+        *,
+        session_key: str,
+        prepared: _PreparedTurn,
+        inbound: InboundMessage,
+        mcp_ctx: McpContext,
+        current_session_id: str | None,
+    ) -> QueryResult:
+        """Dispatch one non-ephemeral turn through the cached client.
+
+        Implements the one-retry stale-session recovery documented in
+        the Tier 4.2 note of the optimisation plan:
+
+        * First attempt: get-or-create a ``StreamingSession`` for this
+          key (creating one means we pay the spawn cost here, on this
+          turn, rather than amortised over future turns).
+        * If the CC server reports the session id is gone
+          (``StaleSessionError``), drop the cached client + wipe the
+          persisted id, then try ONCE more with a fresh connection and
+          ``resume=None``. Second failure surfaces as a normal error
+          path (caller handles).
+        """
+        from pip_agent import _profile
+
+        try:
+            session = await self._get_or_create_streaming_session(
+                session_key=session_key,
+                prepared=prepared,
+                mcp_ctx=mcp_ctx,
+                resume_session_id=current_session_id,
+            )
+        except Exception:
+            log.exception(
+                "stream %s: failed to open streaming client — "
+                "falling back to one-shot run_query for this turn",
+                session_key,
+            )
+            _profile.event(
+                "stream.create_failed",
+                session_key=session_key,
+            )
+            return await run_query(
+                prompt=prepared.prompt,
+                mcp_ctx=mcp_ctx,
+                model=prepared.eff.effective_model,
+                session_id=current_session_id,
+                system_prompt_append=prepared.system_prompt,
+                cwd=WORKDIR,
+                stream_text=True,
+            )
+
+        try:
+            result = await session.run_turn(
+                prepared.prompt,
+                sender_id=inbound.sender_id,
+                peer_id=mcp_ctx.peer_id,
+                stream_text=True,
+            )
+        except StaleSessionError as exc:
+            log.warning(
+                "stream %s: stale CC session — retrying fresh (%s)",
+                session_key, exc,
+            )
+            _profile.event(
+                "stream.stale_detected",
+                session_key=session_key,
+                err=str(exc)[:160],
+            )
+            # Drop the dead session from the cache and from persistence.
+            await self._evict_streaming_session(
+                session_key, reason="stale_session",
+            )
+            self._sessions.pop(session_key, None)
+            _save_sessions(self._sessions)
+            # Rebuild with no resume id — fresh conversation on this key.
+            session = await self._get_or_create_streaming_session(
+                session_key=session_key,
+                prepared=prepared,
+                mcp_ctx=mcp_ctx,
+                resume_session_id=None,
+            )
+            _profile.event(
+                "stream.stale_recovered",
+                session_key=session_key,
+            )
+            result = await session.run_turn(
+                prepared.prompt,
+                sender_id=inbound.sender_id,
+                peer_id=mcp_ctx.peer_id,
+                stream_text=True,
+            )
+        return result
+
+    async def _get_or_create_streaming_session(
+        self,
+        *,
+        session_key: str,
+        prepared: _PreparedTurn,
+        mcp_ctx: McpContext,
+        resume_session_id: str | None,
+    ) -> StreamingSession:
+        """Return a live ``StreamingSession`` for ``session_key``.
+
+        Holds ``self._streaming_lock`` around the create path so two
+        concurrent first-turns on the same key can't both spawn a
+        client. Per-turn dispatch happens OUTSIDE this lock (each
+        session owns its own ``_turn_lock``).
+        """
+        from pip_agent import _profile
+
+        async with self._streaming_lock:
+            existing = self._streaming_sessions.get(session_key)
+            if existing is not None and not existing._closed:
+                _profile.event(
+                    "stream.reused",
+                    session_key=session_key,
+                    turns_so_far=existing.turn_count,
+                    age_ms=round(
+                        (time.perf_counter_ns() - existing.created_ns) / 1e6, 1,
+                    ),
+                )
+                return existing
+
+            # Max-live eviction: if we're at the cap, drop the stalest
+            # idle session to make room. Exception: if ALL live sessions
+            # are actively in the middle of a turn (very unusual —
+            # implies >stream_max_live concurrent peers), we still
+            # create the new one to avoid stalling the turn; the old
+            # ones will expire via idle TTL on their own.
+            if len(self._streaming_sessions) >= settings.stream_max_live:
+                await self._evict_oldest_idle(reason="max_live_cap")
+
+            # Resolve the right resume id — mirror _reap_stale_session
+            # semantics on just this id to avoid attempting resume
+            # against a JSONL that's been pruned on disk.
+            effective_resume = resume_session_id
+            if effective_resume and locate_session_jsonl(
+                effective_resume, prefer_cwd=WORKDIR,
+            ) is None:
+                log.info(
+                    "stream %s: resume id %s has no JSONL — starting fresh",
+                    session_key, effective_resume,
+                )
+                _profile.event(
+                    "stream.resume_jsonl_missing",
+                    session_key=session_key,
+                    sid=effective_resume,
+                )
+                effective_resume = None
+                # Keep persistence in sync — the old id is toast.
+                self._sessions.pop(session_key, None)
+                _save_sessions(self._sessions)
+
+            session = StreamingSession(
+                session_key=session_key,
+                mcp_ctx=mcp_ctx,
+                model=prepared.eff.effective_model,
+                cwd=WORKDIR,
+                system_prompt_append=prepared.system_prompt,
+                resume_session_id=effective_resume,
+            )
+            await session.connect()
+            self._streaming_sessions[session_key] = session
+            return session
+
+    async def _evict_streaming_session(
+        self, session_key: str, *, reason: str,
+    ) -> None:
+        """Remove + close the session for ``session_key`` if present."""
+        session = self._streaming_sessions.pop(session_key, None)
+        if session is not None:
+            await session.close(reason=reason)
+
+    async def _evict_oldest_idle(self, *, reason: str) -> None:
+        """Close the most-stale cached session. Caller holds ``_streaming_lock``.
+
+        "Most stale" = largest ``now - last_used_ns`` among sessions
+        whose per-session ``_turn_lock`` is not held. If every session
+        is currently in a turn, we no-op — the idle sweep will catch
+        them once they're back to idle.
+        """
+        now = time.perf_counter_ns()
+        candidate: tuple[str, StreamingSession] | None = None
+        candidate_age_ns = -1
+        for sk, sess in self._streaming_sessions.items():
+            # ``asyncio.Lock.locked()`` is safe to call from inside the
+            # same loop — no blocking.
+            if sess._turn_lock.locked():
+                continue
+            age = now - sess.last_used_ns
+            if age > candidate_age_ns:
+                candidate_age_ns = age
+                candidate = (sk, sess)
+        if candidate is None:
+            log.info(
+                "stream eviction (%s) skipped — all %d sessions busy",
+                reason, len(self._streaming_sessions),
+            )
+            return
+        sk, _ = candidate
+        log.info(
+            "stream eviction (%s): closing %s (idle %.1fs)",
+            reason, sk, candidate_age_ns / 1e9,
+        )
+        await self._evict_streaming_session(sk, reason=reason)
+
+    async def _idle_sweep_loop(self) -> None:
+        """Background task: periodically close idle streaming sessions."""
+        from pip_agent import _profile
+
+        ttl_ns = settings.stream_idle_ttl_sec * 1_000_000_000
+        # Sweep cadence is deliberately coarse: the stream cache is an
+        # optimisation, not a correctness primitive, so sweeping once
+        # every 1/3 of the TTL is plenty. Bounded below by 5 s so very
+        # short TTLs (test scenarios) don't spin.
+        sweep_interval = max(5, settings.stream_idle_ttl_sec // 3)
+        log.info(
+            "stream idle-sweep loop started (ttl=%ds, interval=%ds)",
+            settings.stream_idle_ttl_sec, sweep_interval,
+        )
+        while True:
+            try:
+                await asyncio.sleep(sweep_interval)
+                now = time.perf_counter_ns()
+                stale_keys: list[str] = []
+                # Snapshot to avoid dict-mutation-during-iteration.
+                for sk, sess in list(self._streaming_sessions.items()):
+                    if sess._turn_lock.locked():
+                        continue
+                    if now - sess.last_used_ns >= ttl_ns:
+                        stale_keys.append(sk)
+                if stale_keys:
+                    _profile.event(
+                        "stream.idle_sweep",
+                        count=len(stale_keys),
+                        live=len(self._streaming_sessions),
+                    )
+                    async with self._streaming_lock:
+                        for sk in stale_keys:
+                            sess = self._streaming_sessions.get(sk)
+                            if sess is None:
+                                continue
+                            # Re-check inside the lock: something could
+                            # have bumped the session in the meantime.
+                            if sess._turn_lock.locked():
+                                continue
+                            if now - sess.last_used_ns < ttl_ns:
+                                continue
+                            await self._evict_streaming_session(
+                                sk, reason="idle_ttl",
+                            )
+            except asyncio.CancelledError:
+                log.info("stream idle-sweep loop cancelled")
+                return
+            except Exception:
+                log.exception(
+                    "stream idle-sweep tick failed — continuing loop",
+                )
+
+    def start_idle_sweep(self) -> None:
+        """Kick off the background idle-sweep task. Called from ``run_host``.
+
+        Safe to call multiple times; subsequent calls are a no-op once
+        the task is running. Separate method (rather than kicked off in
+        ``__init__``) because ``AgentHost`` may be constructed on a
+        thread that doesn't have a running event loop, and
+        ``asyncio.create_task`` would raise there.
+        """
+        if self._streaming_sweep_task is not None:
+            return
+        loop = asyncio.get_running_loop()
+        self._streaming_sweep_task = loop.create_task(
+            self._idle_sweep_loop(),
+        )
+
+    async def close_all_streaming_sessions(self, *, reason: str) -> None:
+        """Disconnect every cached streaming client. Used at shutdown."""
+        async with self._streaming_lock:
+            keys = list(self._streaming_sessions.keys())
+            for sk in keys:
+                await self._evict_streaming_session(sk, reason=reason)
+        if self._streaming_sweep_task is not None:
+            self._streaming_sweep_task.cancel()
+            try:
+                await self._streaming_sweep_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._streaming_sweep_task = None
 
     async def flush_and_rotate(self) -> FlushSummary:
         """On-exit memory handoff: reflect every live session, then rotate.
@@ -998,29 +1418,58 @@ class AgentHost:
                     resume=bool(session_for_turn),
                 )
 
+                # Tier 1 decision point:
+                #
+                # Ephemeral senders (cron / heartbeat) MUST use the
+                # one-shot path — they opt out of session persistence by
+                # design (see :func:`_is_ephemeral_sender`), and binding
+                # them to a cached client would pollute the user's
+                # transcript on the next user turn. Similarly,
+                # ``stream_text=False`` (heartbeats need the full reply
+                # buffered for HEARTBEAT_OK silencing) is cleanly served
+                # by the one-shot path.
+                #
+                # Non-ephemeral senders go through the streaming cache
+                # when enabled. Stale-session recovery: one retry with a
+                # fresh client. After that, surface the error normally.
+                use_streaming = (
+                    settings.enable_streaming_session
+                    and not is_ephemeral
+                    and not is_heartbeat
+                )
                 try:
-                    async with _profile.span(  # PROFILE
-                        "host.run_query",
-                        model=eff.effective_model,
-                        resume=bool(session_for_turn),
-                        prompt_kind=(
-                            "str" if isinstance(prepared.prompt, str) else "blocks"
-                        ),
-                    ):
-                        result: QueryResult = await run_query(
-                            prompt=prepared.prompt,
+                    if use_streaming:
+                        result = await self._run_turn_streaming(
+                            session_key=sk,
+                            prepared=prepared,
+                            inbound=inbound,
                             mcp_ctx=mcp_ctx,
-                            model=eff.effective_model,
-                            session_id=session_for_turn,
-                            system_prompt_append=prepared.system_prompt,
-                            cwd=WORKDIR,
-                            # Heartbeats must NOT stream: we need to inspect the
-                            # full reply before deciding whether to print (so we
-                            # can silence the HEARTBEAT_OK sentinel). Everything
-                            # else streams unconditionally — streaming is an
-                            # interactive contract, not a debug toggle.
-                            stream_text=not is_heartbeat,
+                            current_session_id=current_session,
                         )
+                    else:
+                        async with _profile.span(  # PROFILE
+                            "host.run_query",
+                            model=eff.effective_model,
+                            resume=bool(session_for_turn),
+                            prompt_kind=(
+                                "str" if isinstance(prepared.prompt, str) else "blocks"
+                            ),
+                        ):
+                            result = await run_query(
+                                prompt=prepared.prompt,
+                                mcp_ctx=mcp_ctx,
+                                model=eff.effective_model,
+                                session_id=session_for_turn,
+                                system_prompt_append=prepared.system_prompt,
+                                cwd=WORKDIR,
+                                # Heartbeats must NOT stream: we need the full
+                                # reply before deciding whether to print (so
+                                # the HEARTBEAT_OK sentinel can be silenced).
+                                # Everything else streams unconditionally —
+                                # streaming is an interactive contract, not a
+                                # debug toggle.
+                                stream_text=not is_heartbeat,
+                            )
                 except Exception as exc:
                     log.error("SDK query failed for %s: %s", sk, exc)
                     tracked.failure(f"SDK query failed: {exc}")
@@ -1323,10 +1772,13 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
         # wall time before this point counts as cold-start cost.
         _profile.cold_start("loop_ready")
 
-        def _stdin_reader() -> None:
-            # PROFILE
-            from pip_agent import _profile
+        # Tier 1: start the streaming-session idle sweep now that we
+        # have a running event loop. Safe to call even when the
+        # streaming cache is disabled — the loop itself only evicts
+        # sessions that were actually added.
+        host.start_idle_sweep()
 
+        def _stdin_reader() -> None:
             while not stop_event.is_set():
                 try:
                     line = sys.stdin.readline()
@@ -1365,9 +1817,6 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
         # doesn't lose mid-flight observations.
         pending_tasks: list[asyncio.Task[None]] = []
 
-        # PROFILE
-        from pip_agent import _profile
-
         while not stop_event.is_set():
             with q_lock:
                 batch = msg_queue[:]
@@ -1384,6 +1833,28 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
             # the keepalive.
             if batch:
                 batch.sort(key=_inbound_sort_key)
+
+            # Tier 2: fuse contiguous text-only messages from the same
+            # conversation into one LLM turn. ``batch`` is already
+            # sorted by priority-then-FIFO, so same-conversation text
+            # bubbles from a single user land adjacent. Toggle off via
+            # ``batch_text_inbounds=false`` in ``.env``.
+            if batch and settings.batch_text_inbounds:
+                before_n = len(batch)
+                batch, fused = _coalesce_text_inbounds(
+                    batch, settings.batch_text_joiner,
+                )
+                if fused:
+                    _profile.event(
+                        "host.batch_coalesced",
+                        before=before_n,
+                        after=len(batch),
+                        fused=fused,
+                    )
+                    log.info(
+                        "Tier2 batch: fused %d text inbound(s) "
+                        "(%d -> %d)", fused, before_n, len(batch),
+                    )
 
             for inbound in batch:
                 # Only real interactive CLI input can terminate the host; a
@@ -1469,6 +1940,19 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
         # ``send`` complete — not about memory consistency.
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+        # Tier 1: close every cached streaming client so the
+        # ``claude.exe`` subprocesses exit cleanly before we unwind the
+        # event loop. Done HERE (inside the loop) rather than in the
+        # outer ``finally`` because ``disconnect()`` is an ``async``
+        # call and the outer block spins a fresh ``asyncio.run``. See
+        # the note there about reflect being reachable from a new loop
+        # — the same doesn't apply to the streaming cache, which is
+        # tied to *this* loop's subprocess transports.
+        try:
+            await host.close_all_streaming_sessions(reason="shutdown")
+        except Exception:  # noqa: BLE001
+            log.exception("close_all_streaming_sessions during shutdown failed")
 
     try:
         asyncio.run(_run())
