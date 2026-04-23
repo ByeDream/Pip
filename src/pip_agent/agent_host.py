@@ -632,38 +632,57 @@ class AgentHost:
         self._sessions = _load_sessions()
         self._agents: dict[str, _PerAgent] = {}
 
-        # Two-layer concurrency control:
+        # Concurrency-control layers (post-Tier-1). Three distinct caps
+        # guard three distinct failure modes:
         #
-        # * ``_session_locks`` — one ``asyncio.Lock`` per session key, created
-        #   on first use. Guarantees that two messages targeting the *same*
-        #   session run sequentially. The canonical case this fixes is a
-        #   group chat: members A and B reply to the bot at the same instant,
-        #   both resolve to the same ``agent:pip:wecom:peer:<gid>`` session
-        #   key, and without the lock their turns can interleave — both
-        #   resume the SAME ``session_id``, then race to write it back. One
-        #   of the two sessions gets lost. The old global ``Semaphore(3)``
-        #   couldn't prevent this, because three different slots running the
-        #   same session is exactly the bug.
+        # * ``_session_locks`` — one ``asyncio.Lock`` per session key,
+        #   created on first use. Guarantees that two messages targeting
+        #   the *same* session run sequentially. The canonical case this
+        #   fixes is a group chat: members A and B reply to the bot at the
+        #   same instant, both resolve to the same
+        #   ``agent:pip:wecom:peer:<gid>`` session key, and without the
+        #   lock their turns can interleave — both resume the SAME
+        #   ``session_id``, then race to write it back. One of the two
+        #   sessions gets lost. This lock is taken by every turn
+        #   (streaming and one-shot alike).
         #
-        # * ``_semaphore`` — a global cap on how many CC subprocesses can
-        #   spawn concurrently, regardless of how many distinct sessions
-        #   have traffic. Every ``run_query`` loads the resumed JSONL into
-        #   a new process; unbounded parallelism on a day with 50 active
-        #   peers would torch RAM and swap. Keep the cap.
+        # * ``_streaming_lock`` (below) — serialises NEW streaming-client
+        #   spawns across all sessions. Because ``StreamingSession.connect()``
+        #   is ~400–1000 ms (CC subprocess + MCP handshake), two concurrent
+        #   first-turns on different peers would otherwise race the
+        #   spawn; serialising them also means a "startup storm" (10
+        #   peers saying hi at once) becomes 10 sequential connects
+        #   instead of 10 concurrent ones — predictable RAM/CPU profile
+        #   instead of spiking. Reuse path (subsequent turns on a cached
+        #   session) does NOT take this lock.
         #
-        # Acquisition order is session-lock FIRST, global-semaphore SECOND
-        # (see ``process_inbound``). That way a session's second message
-        # waits on its own lock while unrelated sessions keep flowing
-        # through the semaphore, and the semaphore is never wasted on a
-        # turn that still has to wait for the same-session predecessor.
+        # * ``_one_shot_semaphore`` — bounds concurrency on the fallback
+        #   ``run_query`` code path (cron, heartbeat, anything with
+        #   ``enable_streaming_session=false``). Each of those DOES spawn
+        #   a fresh CC subprocess per turn, so an unbounded burst would
+        #   torch RAM. Default 3 is plenty: cron/heartbeat fire at most
+        #   once per 30 min each, so contention here is rare.
+        #
+        # Historical note (migration from one-shot-only world): a single
+        # ``_semaphore(3)`` used to wrap *every* turn, which correctly
+        # bounded subprocess spawns when every turn spawned one. After
+        # Tier 1 made streaming turns reuse a long-lived subprocess, that
+        # outer semaphore degenerated into "global cap on simultaneous
+        # active streaming turns" — a bottleneck unrelated to the RAM
+        # concern it was supposed to guard. With the split below, streaming
+        # turns are capped by ``_streaming_lock`` (spawn rate) and
+        # ``stream_max_live`` (live-session count), and one-shot turns
+        # keep their own dedicated semaphore.
         #
         # Locks are never cleaned up: a few hundred bytes per distinct
         # session key, and the key space is bounded by the number of
         # peers we ever meet — negligible vs. the JSONL / memory-store
         # data we already persist per session.
         self._session_locks: dict[str, asyncio.Lock] = {}
-        self._max_concurrent = 3
-        self._semaphore = asyncio.Semaphore(self._max_concurrent)
+        self._one_shot_max_concurrent = 3
+        self._one_shot_semaphore = asyncio.Semaphore(
+            self._one_shot_max_concurrent,
+        )
 
         # Tier 1: streaming-session cache. One ``StreamingSession`` per
         # session key keeps the CC subprocess alive across turns so we
@@ -1542,8 +1561,14 @@ class AgentHost:
         from pip_agent import _profile
 
         with tracker as tracked:
+            # Only the per-session lock is required at this outer scope.
+            # The historical ``_semaphore`` wrap was moved down to the
+            # one-shot ``run_query`` branch below — streaming turns
+            # operate on an already-spawned long-lived subprocess and
+            # don't need global throttling (their spawn path is guarded
+            # by ``_streaming_lock`` + ``stream_max_live`` instead).
             _profile.event("host.lock_wait_start", session_key=sk)
-            async with self._get_session_lock(sk), self._semaphore:
+            async with self._get_session_lock(sk):
                 _profile.event("host.lock_wait_end", session_key=sk)  # PROFILE
                 # Resolve the resume session id INSIDE the per-session
                 # lock. Two concurrent inbounds on the same ``sk`` would
@@ -1615,7 +1640,16 @@ class AgentHost:
                             current_session_id=current_session,
                         )
                     else:
-                        async with _profile.span(  # PROFILE
+                        # One-shot path (cron / heartbeat / streaming
+                        # disabled). Unlike the streaming path, each
+                        # call here spawns a fresh CC subprocess, so
+                        # we throttle with ``_one_shot_semaphore`` to
+                        # cap worst-case RAM during a cron/heartbeat
+                        # burst. Narrowing the wrap to just this
+                        # branch avoids the old semantic where the
+                        # semaphore bottlenecked streaming turns as
+                        # well (see ``__init__`` comment block).
+                        async with self._one_shot_semaphore, _profile.span(
                             "host.run_query",
                             model=eff.effective_model,
                             resume=bool(session_for_turn),
