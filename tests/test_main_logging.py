@@ -117,20 +117,20 @@ class TestConfigureLoggingHonoursVerbose:
 
 
 class TestThirdPartyLibsRideRootLevel:
-    """Third parties are NOT pinned — they inherit root.
+    """Non-HTTP third parties are NOT pinned — they inherit root.
 
-    The user requirement that drove this design: "I don't need DEBUG from
-    third-party libs, only Pip needs DEBUG; mcp / httpx / httpcore can all
-    be at INFO." Setting root to INFO under verbose, with no per-library
-    pin, delivers exactly that: third parties get their INFO+ output (SDK
-    startup info, session ids, useful MCP / HTTP traces) but not their
-    DEBUG (which is where the scary ``OTEL trace context injection failed``
-    traceback and every HTTP-layer packet dump live).
+    The original design rule was "only pip_agent needs a pin, everyone
+    else rides root". That still holds for SDK / MCP / asyncio — their
+    INFO output is useful startup, session, and scheduler context.
+
+    The exception is HTTP wire-chatter (``httpx`` / ``httpcore`` /
+    ``urllib3`` / ``h11``) — see ``TestHttpWireChatterIsCapped`` for the
+    operational reason those libs are hard-pinned at WARNING.
     """
 
     @pytest.mark.parametrize(
         "third_party",
-        ["mcp", "httpx", "httpcore", "claude_agent_sdk", "asyncio", "anyio", "urllib3"],
+        ["mcp", "claude_agent_sdk", "asyncio", "anyio"],
     )
     def test_third_party_is_not_explicitly_pinned(
         self, fresh_root_logger, monkeypatch, third_party,
@@ -144,10 +144,60 @@ class TestThirdPartyLibsRideRootLevel:
 
         level = logging.getLogger(third_party).level
         assert level == logging.NOTSET, (
-            f"{third_party!r} was pinned (level={level}); third parties "
-            "should ride the root level so VERBOSE=false silences them and "
-            "VERBOSE=true shows their INFO (not DEBUG)"
+            f"{third_party!r} was pinned (level={level}); non-HTTP third "
+            "parties should ride the root level so VERBOSE=false silences "
+            "them and VERBOSE=true shows their INFO (not DEBUG)"
         )
+
+
+class TestHttpWireChatterIsCapped:
+    """HTTP-layer libs are hard-pinned at WARNING regardless of VERBOSE.
+
+    The operational bug that drove this: the WeChat iLink ``getupdates``
+    endpoint fast-returns (no server-side long-poll hold) when there's
+    nothing to deliver, at roughly 20 req/sec. With root at INFO under
+    VERBOSE=true, ``httpx`` emits one line per request —
+    ``HTTP Request: POST .../getupdates "HTTP/1.1 200 OK"`` — every 50ms.
+    The CLI prompt scrolls off-screen continuously and the user can't
+    type. INFO from httpx / httpcore / urllib3 / h11 carries ~zero signal
+    for Pip-Boy (errors come through at WARNING+ anyway), so the fix is
+    to cap them at WARNING unconditionally.
+
+    If these start emitting useful INFO that we want back, revisit —
+    but do NOT just remove the pin, because the CLI unusability will
+    come straight back.
+    """
+
+    @pytest.mark.parametrize(
+        "http_lib", ["httpx", "httpcore", "urllib3", "h11"],
+    )
+    def test_http_lib_is_capped_under_verbose(
+        self, fresh_root_logger, monkeypatch, http_lib,
+    ):
+        from pip_agent import __main__ as main_mod
+
+        monkeypatch.setattr(main_mod.settings, "verbose", True)
+        main_mod._configure_logging()
+
+        assert logging.getLogger(http_lib).level == logging.WARNING, (
+            f"{http_lib!r} must be pinned at WARNING even under VERBOSE — "
+            "otherwise WeChat long-poll floods the CLI stdout"
+        )
+
+    @pytest.mark.parametrize(
+        "http_lib", ["httpx", "httpcore", "urllib3", "h11"],
+    )
+    def test_http_lib_is_capped_under_quiet(
+        self, fresh_root_logger, monkeypatch, http_lib,
+    ):
+        # Quiet mode already suppresses INFO at root, but keep the pin
+        # explicit so flipping VERBOSE doesn't change per-lib behaviour.
+        from pip_agent import __main__ as main_mod
+
+        monkeypatch.setattr(main_mod.settings, "verbose", False)
+        main_mod._configure_logging()
+
+        assert logging.getLogger(http_lib).level == logging.WARNING
 
 
 class TestConfigureLoggingActuallyEmits:
@@ -177,20 +227,39 @@ class TestConfigureLoggingActuallyEmits:
     def test_third_party_debug_suppressed_even_when_verbose(
         self, fresh_root_logger, monkeypatch, capsys,
     ):
-        # User requirement: no DEBUG from third parties, ever. Under
-        # VERBOSE=true root is INFO, so a httpx DEBUG record is dropped
-        # at the root effective-level check.
+        # Non-HTTP third parties still emit INFO under VERBOSE=true
+        # (useful SDK startup / session records); DEBUG is still gone
+        # because root sits at INFO.
         from pip_agent import __main__ as main_mod
 
         monkeypatch.setattr(main_mod.settings, "verbose", True)
         main_mod._configure_logging()
 
-        logging.getLogger("httpx").debug("packet dump nobody wants")
-        logging.getLogger("httpx").info("GET /v1/messages")
+        logging.getLogger("claude_agent_sdk").debug("packet dump nobody wants")
+        logging.getLogger("claude_agent_sdk").info("session opened sid=abc")
 
         captured = capsys.readouterr()
         assert "packet dump" not in captured.out
-        assert "GET /v1/messages" in captured.out
+        assert "session opened" in captured.out
+
+    def test_httpx_info_suppressed_even_when_verbose(
+        self, fresh_root_logger, monkeypatch, capsys,
+    ):
+        # HTTP wire-chatter (httpx et al) is the only class of third party
+        # explicitly capped at WARNING: INFO-level "POST ... 200 OK" is
+        # pure noise that floods the CLI on the WeChat long-poll path.
+        # Errors still surface (logged at WARNING+).
+        from pip_agent import __main__ as main_mod
+
+        monkeypatch.setattr(main_mod.settings, "verbose", True)
+        main_mod._configure_logging()
+
+        logging.getLogger("httpx").info("HTTP Request: POST /getupdates 200")
+        logging.getLogger("httpx").warning("connection reset by peer")
+
+        captured = capsys.readouterr()
+        assert "getupdates 200" not in captured.out
+        assert "connection reset" in captured.out
 
     def test_everything_suppressed_below_warning_when_not_verbose(
         self, fresh_root_logger, monkeypatch, capsys,
