@@ -63,19 +63,26 @@ def main(argv: list[str]) -> int:
     print(f"=== {path}  ({len(events)} events) ===\n")
 
     # -------- cold start --------
+    # Deltas between adjacent milestones make the tall bars obvious:
+    # a small since_start_ms can still hide a 400 ms step right before
+    # it. Ordering by ``since_start_ms`` is safe because each milestone
+    # is emitted in the order run_host executes; we don't have
+    # interleaved processes to worry about.
     print("--- cold_start ---")
     cs = [e for e in events if _evt(e).startswith("cold_start.")]
+    cs.sort(key=lambda e: _meta(e).get("since_start_ms") or 0.0)
+    prev_ms: float | None = None
     for e in cs:
         m = _meta(e)
-        ms = m.get("since_start_ms")
-        extra = ""
-        if "channels" in m:
-            extra = f"  channels={m['channels']}"
-        if "agents" in m:
-            extra = f"  agents={m['agents']}"
-        if "mode" in m:
-            extra = f"  mode={m['mode']}"
-        print(f"  {ms:>8.1f} ms  {_evt(e)}{extra}")
+        ms = float(m.get("since_start_ms") or 0.0)
+        delta = f"(+{ms - prev_ms:>7.1f} ms)" if prev_ms is not None else "           "
+        extra_bits = []
+        for key in ("mode", "agents", "channels", "logged_in"):
+            if key in m:
+                extra_bits.append(f"{key}={m[key]}")
+        extra = ("  " + "  ".join(extra_bits)) if extra_bits else ""
+        print(f"  {ms:>8.1f} ms  {delta}  {_evt(e)}{extra}")
+        prev_ms = ms
     print()
 
     # -------- batching --------

@@ -1953,6 +1953,13 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
     channel_mgr = ChannelManager()
     cli_channel = CLIChannel()
     channel_mgr.register(cli_channel)
+    # Fine-grained cold-start markers inside the historical
+    # ``channels_ready`` block. v2 profiling showed a ~500 ms opaque
+    # gap here between ``registry_ready`` and ``channels_ready``; these
+    # sub-markers decompose it into (wechat import / wechat init /
+    # wechat login-check / wecom import / wecom init) so optimisation
+    # effort can target the actual tall bar instead of guessing.
+    _profile.cold_start("cli_channel_registered")
 
     stop_event = threading.Event()
     msg_queue: list[InboundMessage] = []
@@ -1970,8 +1977,13 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
                 WeChatChannel,
                 wechat_poll_loop,
             )
+            _profile.cold_start("wechat_import_done")
 
             wechat_channel = WeChatChannel(state_dir)
+            _profile.cold_start(
+                "wechat_instance_ready",
+                logged_in=bool(wechat_channel.is_logged_in),
+            )
             if mode == "scan":
                 wechat_channel._clear_creds()
                 if not wechat_channel.login():
@@ -1981,6 +1993,15 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
                 if not wechat_channel.login():
                     print("  [wechat] Login failed, falling back to CLI-only.")
                     wechat_channel = None
+            # Emit login-check marker AFTER any login attempt; the
+            # ``logged_in`` flag makes the "was the user already in?"
+            # vs "did we just log in?" distinction visible post-hoc.
+            _profile.cold_start(
+                "wechat_login_checked",
+                logged_in=bool(
+                    wechat_channel and wechat_channel.is_logged_in,
+                ),
+            )
             if wechat_channel and wechat_channel.is_logged_in:
                 channel_mgr.register(wechat_channel)
                 t = threading.Thread(
@@ -1989,6 +2010,7 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
                 )
                 t.start()
                 bg_threads.append(t)
+                _profile.cold_start("wechat_poll_spawned")
                 if bind_agent:
                     aid = normalize_agent_id(bind_agent)
                     if registry.get_agent(aid):
@@ -2008,6 +2030,7 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
             # to cold start. Only pay it if wecom creds are actually
             # configured.
             from pip_agent.channels.wecom import WecomChannel, wecom_ws_loop
+            _profile.cold_start("wecom_import_done")
 
             wecom_channel = WecomChannel(
                 settings.wecom_bot_id,
@@ -2016,12 +2039,14 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
                 q_lock,
             )
             channel_mgr.register(wecom_channel)
+            _profile.cold_start("wecom_instance_ready")
             t = threading.Thread(
                 target=wecom_ws_loop, daemon=True,
                 args=(wecom_channel, stop_event),
             )
             t.start()
             bg_threads.append(t)
+            _profile.cold_start("wecom_ws_spawned")
         except Exception as exc:
             print(f"  [wecom] Init failed: {exc}")
 
