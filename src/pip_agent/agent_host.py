@@ -686,6 +686,45 @@ class AgentHost:
         self._streaming_lock = asyncio.Lock()
         self._streaming_sweep_task: asyncio.Task[None] | None = None
 
+        # Tier 2 lock-time coalescing.
+        #
+        # Drain-time ``_coalesce_text_inbounds`` only catches messages
+        # that arrive in the same drain tick. For the common real-world
+        # pattern "user fires 3 messages ~1s apart while the first turn
+        # is still running", each message is drained alone and each
+        # spawns its own ``_execute_turn`` coroutine, all queueing on
+        # the same session lock. Result: N turns, N LLM calls, no
+        # fusion — exactly the workload Tier 2 was meant to compress.
+        #
+        # Fix: a second fusion point keyed on the session lock. As each
+        # ``_execute_turn`` enters, if another turn is already claimed
+        # for this session_key AND the inbound is batch-eligible, the
+        # inbound is parked in ``_pending_per_session[sk]`` instead of
+        # running. When the active turn is about to push user text to
+        # the SDK (inside ``_run_turn_streaming``, after lock acquired),
+        # it pops pending[sk] and fuses them into a single merged
+        # prompt. Late arrivals that land AFTER the pop are flushed as
+        # a follow-up turn in ``_release_or_flush_session``.
+        #
+        # Invariants protected by ``_pending_lock``:
+        # 1. sk in ``_session_active`` ⇔ some coroutine is claimed to
+        #    run a text-batchable turn for sk (either currently
+        #    executing or being spawned as a leftover flush).
+        # 2. Every message appended to ``_pending_per_session[sk]`` is
+        #    batch-eligible at append time — we never mix attachments
+        #    or slash commands into the pending pool.
+        # 3. On release, pending[sk] is drained into a merged leftover
+        #    turn (keeping active set) OR active is cleared (no
+        #    leftovers). No path leaves active=True with pending=[].
+        self._pending_lock = asyncio.Lock()
+        self._session_active: set[str] = set()
+        self._pending_per_session: dict[str, list[InboundMessage]] = {}
+        # Leftover-flush tasks are fire-and-forget from the claimant's
+        # POV but must be drained on shutdown so reflect / memory
+        # writes aren't truncated mid-flight. See
+        # :meth:`drain_lock_flush_tasks` called from ``run_host``.
+        self._lock_flush_tasks: set[asyncio.Task[None]] = set()
+
     def _get_session_lock(self, sk: str) -> asyncio.Lock:
         """Return the per-session lock, creating it lazily."""
         # asyncio runs on a single thread — no extra guard needed for
@@ -787,9 +826,62 @@ class AgentHost:
                 stream_text=True,
             )
 
+        # Tier 2 lock-time coalescing — final fusion point.
+        #
+        # The ``_execute_turn`` gate parked any same-session text
+        # inbounds that arrived while this turn was queued for
+        # dispatch in ``_pending_per_session[session_key]``. With the
+        # session lock now held, drain that bucket and fuse everything
+        # into one merged prompt. This is the only path that actually
+        # COMPRESSES N rapid-fire messages into 1 LLM call — the
+        # drain-time pass in ``run_host`` only catches messages that
+        # hit the same ``queue_drain`` tick, which loses any user
+        # typing faster than the drain cadence.
+        effective_prompt = prepared.prompt
+        if (
+            settings.batch_text_inbounds
+            and _batch_eligible(inbound)
+        ):
+            async with self._pending_lock:
+                late = self._pending_per_session.pop(session_key, None)
+            if late:
+                fused_batch, fused = _coalesce_text_inbounds(
+                    [inbound, *late],
+                    settings.batch_text_joiner,
+                )
+                # By construction every entry in ``late`` + the current
+                # ``inbound`` is batch-eligible and shares ``session_key``,
+                # so ``_coalesce_text_inbounds`` collapses to exactly one
+                # merged inbound. Fall through unchanged if that
+                # assumption ever breaks (prompt-rebuild would be wrong).
+                if len(fused_batch) == 1:
+                    merged_inbound = fused_batch[0]
+                    effective_prompt = _format_prompt(
+                        merged_inbound, prepared.svc.memory_store,
+                    )
+                    _profile.event(
+                        "host.batch_coalesced",
+                        source="lock_time",
+                        session_key=session_key,
+                        before=len(late) + 1,
+                        after=1,
+                        fused=fused,
+                        channel=inbound.channel,
+                    )
+                    log.info(
+                        "Tier2 lock-time batch: fused %d late-arrivals "
+                        "into current turn for %s", len(late), session_key,
+                    )
+                else:
+                    log.warning(
+                        "Tier2 lock-time fusion for %s produced %d merged "
+                        "inbounds (expected 1) — using current prompt as-is",
+                        session_key, len(fused_batch),
+                    )
+
         try:
             result = await session.run_turn(
-                prepared.prompt,
+                effective_prompt,
                 sender_id=inbound.sender_id,
                 peer_id=mcp_ctx.peer_id,
                 stream_text=True,
@@ -822,7 +914,7 @@ class AgentHost:
                 session_key=session_key,
             )
             result = await session.run_turn(
-                prepared.prompt,
+                effective_prompt,
                 sender_id=inbound.sender_id,
                 peer_id=mcp_ctx.peer_id,
                 stream_text=True,
@@ -1359,6 +1451,82 @@ class AgentHost:
         # remains a separate concern (HEARTBEAT_OK silencing).
         is_ephemeral = _is_ephemeral_sender(inbound.sender_id)
 
+        # PROFILE — imported early so the lock-time coalescing gate
+        # below can emit observability events.
+        from pip_agent import _profile
+
+        # Tier 2 lock-time coalescing gate.
+        #
+        # If a batch-eligible (text-only, human-originated, no slash)
+        # inbound arrives while another turn is already claimed for
+        # this session, park it in ``_pending_per_session`` instead of
+        # running a separate turn. The active turn will drain pending
+        # inside ``_run_turn_streaming`` (lock held, right before the
+        # SDK push) and fuse them into one LLM call. Late arrivals
+        # that miss that drain are flushed as a follow-up turn by
+        # ``_release_or_flush_session``.
+        #
+        # Non-eligible inbounds (attachments, scheduler payloads,
+        # heartbeats, slash commands) skip the gate entirely — they
+        # can't be merged anyway, and we don't want them blocking the
+        # active-set (which is what drives the redirect). They still
+        # serialise via the per-session asyncio.Lock below, unchanged.
+        claimed_active = False
+        if settings.batch_text_inbounds and _batch_eligible(inbound):
+            async with self._pending_lock:
+                if sk in self._session_active:
+                    self._pending_per_session.setdefault(sk, []).append(
+                        inbound,
+                    )
+                    pending_depth = len(self._pending_per_session[sk])
+                    _profile.event(
+                        "host.redirected_to_lock_batch",
+                        session_key=sk,
+                        channel=inbound.channel,
+                        text_len=len(inbound.text or ""),
+                        pending_depth=pending_depth,
+                    )
+                    log.debug(
+                        "Tier2 lock-time redirect: sk=%s depth=%d "
+                        "(parked for fusion with in-flight turn)",
+                        sk, pending_depth,
+                    )
+                    return
+                self._session_active.add(sk)
+                claimed_active = True
+
+        try:
+            await self._execute_turn_body(
+                inbound=inbound,
+                prepared=prepared,
+                is_heartbeat=is_heartbeat,
+                is_ephemeral=is_ephemeral,
+            )
+        finally:
+            if claimed_active:
+                await self._release_or_flush_session(sk)
+
+    async def _execute_turn_body(
+        self,
+        *,
+        inbound: InboundMessage,
+        prepared: _PreparedTurn,
+        is_heartbeat: bool,
+        is_ephemeral: bool,
+    ) -> None:
+        """Inner body of :meth:`_execute_turn` (split for gating clarity).
+
+        Extracted so the lock-time coalescing gate + its try/finally can
+        wrap the whole dispatch without deeply indenting the existing
+        lock/semaphore/turn-run code. All behaviour below is pre-existing
+        and unchanged.
+        """
+        eff = prepared.eff
+        svc = prepared.svc
+        sk = prepared.sk
+        ch = prepared.ch
+        reply_peer = prepared.reply_peer
+
         # ``track`` owns the scheduler-side bookkeeping: coalesce-key
         # release on exit (so the next tick can fire again) and cron
         # ``consecutive_errors`` accounting. It is a no-op for inbounds
@@ -1516,6 +1684,104 @@ class AgentHost:
                     reply_peer=reply_peer,
                     session_key=sk,
                 )
+
+    async def _release_or_flush_session(self, sk: str) -> None:
+        """Clear the Tier 2 active claim; flush leftover inbounds if any.
+
+        Called from ``_execute_turn``'s ``finally`` block whenever the
+        current turn claimed ``_session_active[sk]`` on entry. Three
+        outcomes:
+
+        1. ``_pending_per_session[sk]`` is empty → drop the active flag
+           and return. Normal path when the current turn already ate
+           all late-arrivals at lock-time.
+        2. Pending has entries → fuse them into a merged inbound and
+           dispatch a follow-up ``process_inbound`` task. Keep the
+           active flag held so the new coroutine's own gate doesn't
+           re-claim (it will re-acquire during its own run). Actually
+           we *release* the claim here and let the new task re-claim,
+           which is simpler — any racing inbound that also wants the
+           lock will park itself correctly.
+        3. Fusion produced no single merged result (can't happen by
+           construction — everything in pending passed ``_batch_eligible``
+           when appended — but we guard it and clear the flag).
+
+        Leftover-flush tasks are tracked in ``_lock_flush_tasks`` so
+        :meth:`drain_lock_flush_tasks` can await them on shutdown;
+        otherwise reflect / memory-store writes could be truncated
+        mid-flight on ``/exit``.
+        """
+        from pip_agent import _profile
+
+        async with self._pending_lock:
+            lefts = self._pending_per_session.pop(sk, [])
+            self._session_active.discard(sk)
+        if not lefts:
+            return
+
+        # Everything in ``lefts`` was batch-eligible at append time
+        # and shares the same session key, so ``_coalesce_text_inbounds``
+        # collapses to a single element. Guard the assumption with a
+        # len-check rather than ``assert`` so a future refactor that
+        # relaxes the invariant degrades to "dispatch per leftover"
+        # instead of crashing.
+        fused_batch, fused = _coalesce_text_inbounds(
+            lefts, settings.batch_text_joiner,
+        )
+        if len(fused_batch) != 1:
+            log.warning(
+                "Tier2 leftover flush for %s: expected 1 merged inbound, "
+                "got %d — dispatching each independently",
+                sk, len(fused_batch),
+            )
+            for m in fused_batch:
+                task = asyncio.create_task(self.process_inbound(m))
+                self._lock_flush_tasks.add(task)
+                task.add_done_callback(self._lock_flush_tasks.discard)
+            return
+
+        merged = fused_batch[0]
+        _profile.event(
+            "host.batch_coalesced",
+            source="leftover_flush",
+            session_key=sk,
+            before=len(lefts),
+            after=1,
+            fused=fused,
+            channel=merged.channel,
+        )
+        log.info(
+            "Tier2 leftover flush: fused %d late-arrivals for %s "
+            "into 1 follow-up turn", len(lefts), sk,
+        )
+        task = asyncio.create_task(self.process_inbound(merged))
+        self._lock_flush_tasks.add(task)
+        task.add_done_callback(self._lock_flush_tasks.discard)
+
+    async def drain_lock_flush_tasks(self, *, timeout: float = 10.0) -> None:
+        """Await in-flight Tier 2 leftover-flush tasks. Shutdown helper.
+
+        Called from ``run_host`` just before / alongside the main
+        ``pending_tasks`` drain so ``/exit`` doesn't truncate a
+        leftover-merged turn mid-LLM. Bounded timeout mirrors the
+        existing streaming-session shutdown contract.
+        """
+        if not self._lock_flush_tasks:
+            return
+        # Snapshot — the set may mutate (done_callback removes) while
+        # we await.
+        pending = list(self._lock_flush_tasks)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "Tier2 lock-flush drain timed out after %.1fs "
+                "(%d tasks still running)",
+                timeout, sum(1 for t in pending if not t.done()),
+            )
 
     def _deliver_command_response(
         self, inbound: InboundMessage, response: str | None,
@@ -1847,6 +2113,7 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
                 if fused:
                     _profile.event(
                         "host.batch_coalesced",
+                        source="drain_time",
                         before=before_n,
                         after=len(batch),
                         fused=fused,
@@ -1940,6 +2207,15 @@ def run_host(mode: str = "auto", bind_agent: str | None = None) -> None:
         # ``send`` complete — not about memory consistency.
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+        # Tier 2 lock-time coalescing may have spawned leftover-flush
+        # tasks that aren't in ``pending_tasks`` (they were fired from
+        # inside ``_release_or_flush_session``). Drain them with a
+        # bounded timeout so reflect / memory writes complete cleanly.
+        try:
+            await host.drain_lock_flush_tasks(timeout=10.0)
+        except Exception:  # noqa: BLE001
+            log.exception("drain_lock_flush_tasks during shutdown failed")
 
         # Tier 1: close every cached streaming client so the
         # ``claude.exe`` subprocesses exit cleanly before we unwind the
