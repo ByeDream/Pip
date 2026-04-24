@@ -13,7 +13,7 @@ layers; each inherits from the one above:
 | --- | --- | --- | --- |
 | System (lowest) | `~/.pip/` | Per-user system settings | Only CLI preferences and `settings.json` (logging / profiler / network defaults). No channel credentials, no bindings. |
 | Workspace | `<pip_boy_workspace>/.pip/` | The root `pip-boy` agent's home + shared runtime state | Holds `bindings.json`, `agents_registry.json`, `credentials/`, `sdk_sessions.json`. |
-| Sub-agent | `<pip_boy_workspace>/<id>/.pip/` | An individual sub-agent | Independent `persona.md`, `memory`, `observations/`. Contacts live in the shared workspace-level `addressbook/` and are not duplicated per sub-agent. |
+| Sub-agent | `<pip_boy_workspace>/<id>/.pip/` | An individual sub-agent | Independent `persona.md`, `memory`, `observations/`. Contacts live in the shared workspace-level `addressbook/` (uuid-keyed, lazy-loaded) and are not duplicated per sub-agent. |
 
 Scalar settings from higher tiers override lower tiers; array-valued
 settings (like permission allow-lists) are unioned with dedup.
@@ -22,7 +22,59 @@ settings (like permission allow-lists) are unioned with dedup.
 including `pip-boy` itself — owns its own. The `addressbook/` is the
 one deliberate exception: it lives at the workspace root and is read /
 written by every agent so a contact learned anywhere is known
-everywhere.
+everywhere. Each contact is stored as `<user_id>.md` where `<user_id>`
+is an opaque 8-hex handle; profiles are loaded lazily via the
+`lookup_user` tool rather than injected into the system prompt, so
+prompt cost stays flat as the book grows.
+
+## User recognition
+
+Every inbound user message is wrapped in a `<user_query>` envelope the
+agent sees at the top of each turn:
+
+```xml
+<user_query from="<channel>:<sender_id>" user_id="<8-hex or unverified>">
+...message body...
+</user_query>
+```
+
+- `from` is the raw channel + sender identity (e.g. `cli:cli-user`,
+  `wecom:abc123`). Useful for channel-dependent decisions (markdown on
+  CLI vs plain text on WeChat) but never by itself sufficient for
+  identity — the same person can reach you from multiple channels.
+- `user_id` is the stable, opaque addressbook handle (e.g. `9c8b2a3e`)
+  — or the literal string `unverified` if this sender isn't in the
+  addressbook yet. The agent is expected to treat it as a meaningless
+  key and look up the profile on demand via `lookup_user(user_id)`.
+- `group="true"` is present on group-chat messages.
+
+The flow:
+
+```
+first contact              follow-up turns
+---------                  ---------------
+user_id="unverified"       user_id="<8-hex>"
+        │                          │
+        ▼                          ▼
+ agent asks name            agent knows them already
+        │                   (optional: lookup_user on
+        ▼                    first mention of a turn,
+ remember_user(              then cache for the rest)
+   name=...,                        │
+   call_me=...)                     ▼
+        │                    remember_user(notes=...)
+        ▼                    updates only their own
+ store mints new             record; different user_id
+ 8-hex user_id,              is refused
+ binds sender to it
+```
+
+`remember_user` is strictly self-directed: verified callers update
+their own record and nothing else; unverified callers create a fresh
+record and receive their assigned `user_id` in the response. To record
+facts about a *third* person (e.g. "Alice mentioned her colleague
+Bob"), use `memory_write` — it lives in the per-agent observations
+stream rather than the shared contact book.
 
 ## Directory layout
 
@@ -37,7 +89,7 @@ everywhere.
     HEARTBEAT.md
     state.json cron.json memories.json axioms.md
     observations/*.jsonl
-    addressbook/*.md          # shared contacts (every agent reads / writes)
+    addressbook/<user_id>.md  # shared contacts (every agent reads / writes via lookup_user / remember_user)
     incoming/
     credentials/             # channel keys (WeChat / WeCom)
     bindings.json            # global channel -> agent routing table

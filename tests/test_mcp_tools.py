@@ -31,7 +31,6 @@ from pip_agent.mcp_tools import (
 )
 from pip_agent.memory import MemoryStore
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -211,72 +210,28 @@ class TestRememberUser:
     """Contract:
 
     * ``None`` store → is_error.
-    * ``channel:peer`` sender_id prefix is stripped before persistence.
-      This contract matters because the LLM frequently re-emits the fully
-      qualified id it saw in the prompt, and double-prefixing would
-      corrupt the addressbook filename space.
-    * Channel is inferred from ``ctx.channel`` when not given, defaulting
-      to ``"cli"`` so local terminal onboarding works from day one.
+    * Unverified caller (no ``ctx.user_id``) → creates a new contact with
+      a fresh 8-hex ``user_id``; current ``channel:sender_id`` becomes
+      the first identifier.
+    * Verified caller (``ctx.user_id`` set) → updates ONLY their own
+      record. Supplying a different ``user_id`` argument is refused
+      with an explanatory error (must not silently succeed, must not
+      crash — the model needs the feedback to switch to memory_write).
+    * Unverified caller cannot target an existing ``user_id`` either —
+      that'd let an anonymous sender hijack someone else's profile.
+    * ``channel:peer`` sender_id prefix is stripped before persistence
+      so the LLM re-emitting the fully qualified id it saw doesn't
+      double-prefix the stored identifier.
     * The addressbook is workspace-shared: writes from any agent land in
-      ``<workspace>/.pip/addressbook/``.
+      ``<workspace>/.pip/addressbook/<user_id>.md``.
     """
 
     def _call(self, ctx, args):
         handler = _tool(_memory_tools(ctx), "remember_user").handler
         return _run(handler(args))
 
-    def test_no_store_is_error(self):
-        assert self._call(McpContext(memory_store=None), {}).get(
-            "is_error") is True
-
-    def test_sender_id_prefix_stripped_before_persistence(
-        self, tmp_path, monkeypatch,
-    ):
-        ms = _make_store(tmp_path / "agents")
-        seen: dict[str, Any] = {}
-
-        def fake_update(
-            *, sender_id="", channel="", **fields,
-        ):
-            seen["sender_id"] = sender_id
-            seen["channel"] = channel
-            seen["fields"] = fields
-            return "ok"
-
-        monkeypatch.setattr(ms, "update_user_profile", fake_update)
-
-        class _FakeCh:
-            name = "wecom"
-
-        ctx = McpContext(
-            memory_store=ms, channel=_FakeCh(),  # type: ignore[arg-type]
-            sender_id="wecom:alice",
-        )
-        self._call(ctx, {"name": "Alice", "timezone": "Asia/Shanghai"})
-        # Prefix must be stripped — otherwise the file lands at
-        # addressbook/wecom_wecom_alice.md and nothing can find it again.
-        assert seen["sender_id"] == "alice"
-        assert seen["channel"] == "wecom"
-        assert seen["fields"]["name"] == "Alice"
-        assert seen["fields"]["timezone"] == "Asia/Shanghai"
-
-    def test_default_channel_is_cli(self, tmp_path, monkeypatch):
-        ms = _make_store(tmp_path / "agents")
-        seen: dict[str, Any] = {}
-        monkeypatch.setattr(
-            ms, "update_user_profile",
-            lambda **kw: (seen.update(kw), "ok")[1],
-        )
-        ctx = McpContext(memory_store=ms, sender_id="local")
-        self._call(ctx, {"name": "User"})
-        assert seen["channel"] == "cli"
-        # ``local`` has no ``cli:`` prefix, so it passes through unchanged.
-        assert seen["sender_id"] == "local"
-
-    def test_write_lands_in_workspace_addressbook(self, tmp_path):
-        """End-to-end: a ``remember_user`` call from a sub-agent's
-        ``MemoryStore`` must persist in the workspace root's
-        ``addressbook/``, not under the sub-agent's own ``.pip/``."""
+    @staticmethod
+    def _sub_store(tmp_path: Path) -> tuple[MemoryStore, Path]:
         workspace = tmp_path / "workspace"
         workspace_pip = workspace / ".pip"
         workspace_pip.mkdir(parents=True)
@@ -287,6 +242,131 @@ class TestRememberUser:
             workspace_pip_dir=workspace_pip,
             agent_id="sub",
         )
+        return ms, workspace_pip
+
+    def test_no_store_is_error(self):
+        assert self._call(McpContext(memory_store=None), {}).get(
+            "is_error") is True
+
+    def test_unverified_caller_creates_contact_and_strips_prefix(
+        self, tmp_path,
+    ):
+        ms = _make_store(tmp_path / "agents")
+
+        class _FakeCh:
+            name = "wecom"
+
+        ctx = McpContext(
+            memory_store=ms, channel=_FakeCh(),  # type: ignore[arg-type]
+            sender_id="wecom:alice",  # LLM echoes the qualified id
+        )
+        result = self._call(
+            ctx, {"name": "Alice", "timezone": "Asia/Shanghai"},
+        )
+        assert result.get("is_error") is not True
+        body = _text_of(result)
+        assert "user_id=" in body
+
+        ab = ms.addressbook_dir
+        files = list(ab.glob("*.md"))
+        assert len(files) == 1
+        uid = files[0].stem
+        assert len(uid) == 8 and all(c in "0123456789abcdef" for c in uid)
+        text = files[0].read_text(encoding="utf-8")
+        # Prefix was stripped — stored identifier is ``wecom:alice``,
+        # not ``wecom:wecom:alice`` which would break future lookups.
+        assert "`wecom:alice`" in text
+        assert "wecom:wecom:alice" not in text
+        assert "Alice" in text
+        assert "Asia/Shanghai" in text
+
+    def test_default_channel_is_cli(self, tmp_path):
+        ms = _make_store(tmp_path / "agents")
+        ctx = McpContext(memory_store=ms, sender_id="local")
+        self._call(ctx, {"name": "User"})
+        files = list(ms.addressbook_dir.glob("*.md"))
+        assert len(files) == 1
+        text = files[0].read_text(encoding="utf-8")
+        assert "`cli:local`" in text
+
+    def test_verified_caller_updates_own_record(self, tmp_path):
+        ms = _make_store(tmp_path / "agents")
+
+        class _FakeCh:
+            name = "cli"
+
+        # Seed an initial unverified create.
+        seed_ctx = McpContext(
+            memory_store=ms, channel=_FakeCh(),  # type: ignore[arg-type]
+            sender_id="cli-user",
+        )
+        self._call(seed_ctx, {"name": "Alice"})
+        uid = next(ms.addressbook_dir.glob("*.md")).stem
+
+        # Now simulate a verified follow-up turn — ctx carries user_id.
+        verified = McpContext(
+            memory_store=ms, channel=_FakeCh(),  # type: ignore[arg-type]
+            sender_id="cli-user", user_id=uid,
+        )
+        result = self._call(verified, {"notes": "prefers terse replies"})
+        assert result.get("is_error") is not True
+        text = (ms.addressbook_dir / f"{uid}.md").read_text(encoding="utf-8")
+        assert "prefers terse replies" in text
+        # Still the same single file — no rogue create.
+        assert len(list(ms.addressbook_dir.glob("*.md"))) == 1
+
+    def test_verified_caller_cannot_target_other_user_id(self, tmp_path):
+        ms = _make_store(tmp_path / "agents")
+        # Two separate contacts, Alice and Bob.
+        uid_a, _ = ms.create_contact(
+            sender_id="alice", channel="cli", name="Alice",
+        )
+        uid_b, _ = ms.create_contact(
+            sender_id="bob", channel="cli", name="Bob",
+        )
+
+        class _FakeCh:
+            name = "cli"
+
+        ctx = McpContext(
+            memory_store=ms, channel=_FakeCh(),  # type: ignore[arg-type]
+            sender_id="alice", user_id=uid_a,
+        )
+        result = self._call(
+            ctx, {"user_id": uid_b, "notes": "sneaky"},
+        )
+        assert result.get("is_error") is True
+        # Bob's record stays untouched.
+        bob_text = (ms.addressbook_dir / f"{uid_b}.md").read_text(encoding="utf-8")
+        assert "sneaky" not in bob_text
+
+    def test_unverified_cannot_target_existing_user_id(self, tmp_path):
+        ms = _make_store(tmp_path / "agents")
+        uid, _ = ms.create_contact(
+            sender_id="alice", channel="cli", name="Alice",
+        )
+
+        class _FakeCh:
+            name = "wecom"
+
+        # Stranger from a fresh channel tries to claim Alice's record.
+        ctx = McpContext(
+            memory_store=ms, channel=_FakeCh(),  # type: ignore[arg-type]
+            sender_id="imposter",  # user_id left empty → unverified
+        )
+        result = self._call(
+            ctx, {"user_id": uid, "notes": "injected"},
+        )
+        assert result.get("is_error") is True
+        text = (ms.addressbook_dir / f"{uid}.md").read_text(encoding="utf-8")
+        assert "injected" not in text
+        assert "wecom:imposter" not in text
+
+    def test_write_lands_in_workspace_addressbook(self, tmp_path):
+        """End-to-end: a ``remember_user`` call from a sub-agent's
+        ``MemoryStore`` must persist in the workspace root's
+        ``addressbook/``, not under the sub-agent's own ``.pip/``."""
+        ms, workspace_pip = self._sub_store(tmp_path)
 
         class _FakeCh:
             name = "wecom"
@@ -306,8 +386,56 @@ class TestRememberUser:
         body = files[0].read_text(encoding="utf-8")
         assert "Alice" in body
         # The sub-agent dir stays addressbook-free.
+        sub_dir = ms.agent_dir
         assert not (sub_dir / "addressbook").exists()
         assert not (sub_dir / "users").exists()
+
+
+class TestLookupUser:
+    """``lookup_user`` is the lazy-load counterpart to ``remember_user``:
+    the addressbook is no longer auto-injected, so the model reads
+    profiles on demand by user_id.
+
+    * ``None`` store or missing ``user_id`` → is_error.
+    * Unknown id → is_error with the id in the message so the model
+      can distinguish "typo" from "storage wired wrong".
+    * Known id → returns the raw markdown body (name, identifiers,
+      notes intact).
+    """
+
+    def _call(self, ctx, args):
+        handler = _tool(_memory_tools(ctx), "lookup_user").handler
+        return _run(handler(args))
+
+    def test_missing_user_id_is_error(self, tmp_path):
+        ms = _make_store(tmp_path / "agents")
+        result = self._call(McpContext(memory_store=ms), {})
+        assert result.get("is_error") is True
+        assert "required" in _text_of(result).lower()
+
+    def test_unknown_id_is_error(self, tmp_path):
+        ms = _make_store(tmp_path / "agents")
+        result = self._call(
+            McpContext(memory_store=ms), {"user_id": "deadbeef"},
+        )
+        assert result.get("is_error") is True
+        assert "deadbeef" in _text_of(result)
+
+    def test_known_id_returns_profile_body(self, tmp_path):
+        ms = _make_store(tmp_path / "agents")
+        uid, _ = ms.create_contact(
+            sender_id="alice", channel="cli",
+            name="Alice", call_me="Ali", notes="likes terse replies",
+        )
+        result = self._call(
+            McpContext(memory_store=ms), {"user_id": uid},
+        )
+        assert result.get("is_error") is not True
+        body = _text_of(result)
+        assert "Alice" in body
+        assert "Ali" in body
+        assert "likes terse replies" in body
+        assert "cli:alice" in body
 
 
 # ---------------------------------------------------------------------------

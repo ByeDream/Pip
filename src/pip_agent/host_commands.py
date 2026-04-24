@@ -857,8 +857,9 @@ def _create_agent_on_disk(
     The new agent inherits the default (``pip-boy``) agent's **full**
     persona body — Core Philosophy, System Communication, Tone,
     Identity Recognition, Tool Calling, Memory guidance, etc. — so
-    it actually knows how to interpret the ``## Addressbook`` block
-    that :meth:`MemoryStore.enrich_prompt` injects at prompt time.
+    it knows how to interpret the ``user_id`` carried on each
+    ``<user_query>`` and can call ``lookup_user`` to resolve it
+    against the shared addressbook on demand.
 
     Only the ``# Identity`` section is rewritten, to flag the
     sibling relationship with Pip-Boy. The identity body still

@@ -6,7 +6,8 @@ Task, TodoWrite, Skill, …) is delegated to Claude Code's built-ins.
 
 Tools currently exposed:
 
-* Memory: ``memory_search``, ``memory_write``, ``remember_user``, ``reflect``
+* Memory: ``memory_search``, ``memory_write``, ``remember_user``,
+  ``lookup_user``, ``reflect``
 * Cron: ``cron_add``, ``cron_remove``, ``cron_update``, ``cron_list``
 * Channel: ``send_file``
 """
@@ -44,6 +45,10 @@ class McpContext:
 
     Populated fresh by :class:`AgentHost` before each ``query()`` call so
     handlers see the correct agent/session/channel identity.
+
+    ``user_id`` is the caller's resolved addressbook id — empty when the
+    sender is not yet registered (``<user_query user_id="unverified">``).
+    It gates ``remember_user``'s create-vs-update branch.
     """
 
     memory_store: MemoryStore | None = None
@@ -54,6 +59,7 @@ class McpContext:
     channel: Channel | None = None
     peer_id: str = ""
     sender_id: str = ""
+    user_id: str = ""
 
 
 def build_mcp_server(ctx: McpContext) -> McpSdkServerConfig:
@@ -116,18 +122,64 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
     async def remember_user(args: dict[str, Any]) -> dict[str, Any]:
         if ctx.memory_store is None:
             return _error("Memory store not available.")
+
         ch_name = ctx.channel.name if ctx.channel else "cli"
-        sid = args.get("sender_id") or ctx.sender_id
+        sid = ctx.sender_id
         if sid and ch_name and sid.startswith(f"{ch_name}:"):
             sid = sid[len(ch_name) + 1:]
-        result = ctx.memory_store.update_user_profile(
-            sender_id=sid, channel=ch_name,
-            name=args.get("name", ""),
-            call_me=args.get("call_me", ""),
-            timezone=args.get("timezone", ""),
-            notes=args.get("notes", ""),
+
+        fields: dict[str, str] = {
+            "name": args.get("name", "") or "",
+            "call_me": args.get("call_me", "") or "",
+            "timezone": args.get("timezone", "") or "",
+            "notes": args.get("notes", "") or "",
+        }
+        target_id_arg = (args.get("user_id") or "").strip()
+        current_user_id = ctx.user_id or ""
+
+        # ACL: verified callers can only update their OWN record. They
+        # cannot invent new contacts (risk of impersonation) nor
+        # rewrite someone else's profile. The errors are surfaced to
+        # the model so it learns the constraint instead of silently
+        # retrying with the same args.
+        if current_user_id:
+            if target_id_arg and target_id_arg != current_user_id:
+                return _error(
+                    "remember_user is only allowed to update your OWN "
+                    f"profile ({current_user_id}). To record information "
+                    f"about another contact (user_id={target_id_arg}), "
+                    "use memory_write instead."
+                )
+            result = ctx.memory_store.update_contact(
+                current_user_id,
+                sender_id=sid, channel=ch_name,
+                **fields,
+            )
+            return _text(result)
+
+        # Unverified caller — introduce-yourself handshake. They may
+        # only create a fresh contact; targeting an existing user_id
+        # would let an anonymous sender hijack that profile's identifiers.
+        if target_id_arg:
+            return _error(
+                "Cannot update an existing contact while unverified. "
+                "Omit user_id to create a new entry for the current sender."
+            )
+        new_id, msg = ctx.memory_store.create_contact(
+            sender_id=sid, channel=ch_name, **fields,
         )
-        return _text(result)
+        return _text(f"{msg} user_id={new_id}")
+
+    async def lookup_user(args: dict[str, Any]) -> dict[str, Any]:
+        if ctx.memory_store is None:
+            return _error("Memory store not available.")
+        user_id = (args.get("user_id") or "").strip()
+        if not user_id:
+            return _error("'user_id' is required.")
+        content = ctx.memory_store.load_profile_by_id(user_id)
+        if content is None:
+            return _error(f"No contact with user_id={user_id}.")
+        return _text(content)
 
     async def reflect(args: dict[str, Any]) -> dict[str, Any]:
         """Trigger L1 reflection over the current Claude Code session JSONL.
@@ -221,19 +273,29 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
         SdkMcpTool(
             name="remember_user",
             description=(
-                "Remember or update a contact in the workspace-shared "
-                "addressbook (<workspace>/.pip/addressbook/). Use when an "
-                "unverified user reveals who they are, or to update a "
-                "verified user's info. All agents (root and sub-agents) "
-                "read and write the same addressbook, so a contact saved "
-                "from any agent is immediately visible to every other."
+                "Record or update a contact in the workspace-shared "
+                "addressbook (<workspace>/.pip/addressbook/<user_id>.md). "
+                "This tool is strictly self-directed: "
+                "• If the caller is verified (the current <user_query> "
+                "carries a user_id), it updates that caller's own "
+                "profile only. Passing a different user_id is refused. "
+                "• If the caller is unverified, it creates a brand new "
+                "contact with a freshly-minted 8-hex user_id and "
+                "records the current sender's channel:sender_id. "
+                "To note facts ABOUT someone else, use memory_write, "
+                "not this tool. All agents share one addressbook."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "sender_id": {
+                    "user_id": {
                         "type": "string",
-                        "description": "Raw sender_id without channel prefix.",
+                        "description": (
+                            "Optional. Only meaningful for verified callers, "
+                            "and must equal your own user_id. Omit to default "
+                            "to the current caller. Passing a different id is "
+                            "refused."
+                        ),
                     },
                     "name": {"type": "string", "description": "The user's real name."},
                     "call_me": {
@@ -251,6 +313,31 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
                 },
             },
             handler=remember_user,
+        ),
+        SdkMcpTool(
+            name="lookup_user",
+            description=(
+                "Read a contact's full profile from the shared "
+                "addressbook by user_id. Use this to resolve the "
+                "user_id on the current <user_query> into a name, "
+                "preferences, timezone, and notes — the addressbook "
+                "is NOT auto-injected into context, so call this "
+                "whenever you need details beyond the raw id. "
+                "Returns the raw markdown profile."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": (
+                            "8-hex user_id as seen on <user_query user_id=...>."
+                        ),
+                    },
+                },
+                "required": ["user_id"],
+            },
+            handler=lookup_user,
         ),
         SdkMcpTool(
             name="reflect",

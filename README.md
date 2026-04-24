@@ -34,8 +34,12 @@ One Pip-Boy host, many surfaces. All channels feed into the same inbound message
 
 ### User identity & ACL
 
-- **Shared addressbook** — Every contact the agent recognizes lives in one flat directory at `<workspace>/.pip/addressbook/<name>.md`. The root agent and every sub-agent read and write the same addressbook, so a user recorded from any agent is immediately known to every other. There is no special "owner" role — the local CLI user is just another entry, remembered via `remember_user` after a first-contact conversation.
-- **`remember_user` MCP tool** — How the agent stores / updates a contact's name, preferred form of address, timezone, notes, and channel identifiers.
+- **Shared addressbook, uuid-keyed** — Every contact lives at `<workspace>/.pip/addressbook/<user_id>.md` where `<user_id>` is an opaque 8-hex handle (e.g. `9c8b2a3e`). Root and every sub-agent read and write the same addressbook. There is no "owner" role; the local CLI user is just another entry registered through conversation.
+- **Lazy loading, not eager injection** — Contact profiles are **not** dumped into the system prompt. Every `<user_query>` carries a `user_id` attribute (or the literal `unverified`), and the agent calls `lookup_user(user_id)` on demand when it needs the name / preferences / notes. Prompt tokens stay flat as the addressbook grows.
+- **`remember_user` MCP tool** — Strictly self-directed:
+  - An unverified caller creates a new entry; the tool mints a fresh `user_id` and records the current `channel:sender_id` as the first identifier.
+  - A verified caller can only update their **own** record. Attempting to target another `user_id` is refused with an error the model sees, so it can switch to `memory_write` for facts about third parties.
+- **`lookup_user` MCP tool** — Returns the raw markdown profile for a given `user_id`. The single read path for everything the model wants to know about who's talking.
 - **ACL gate** — All commands are open on every channel except the `/subagent` lifecycle family and `/exit`, which are **CLI-only**. The `/help` output on remote channels (WeCom, WeChat) hides these commands entirely, so remote peers don't even learn they exist.
 
 ### Durable scheduling
@@ -186,7 +190,7 @@ Unknown slash commands (and unknown `/subagent` subcommands) fail fast with an `
 ├── .pip/                        # pip-boy (root agent) + workspace runtime
 │   ├── persona.md               # pip-boy persona + YAML frontmatter
 │   ├── HEARTBEAT.md
-│   ├── addressbook/             # Shared contacts (.md) — every agent reads / writes here
+│   ├── addressbook/             # Shared contacts — <user_id>.md per contact, loaded on demand via lookup_user
 │   ├── cron.json                # pip-boy's scheduled jobs
 │   ├── state.json               # Memory pipeline cursors
 │   ├── memories.json            # L2 consolidated memories

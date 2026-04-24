@@ -650,10 +650,10 @@ class TestSubagentCommand:
     def test_create_inherits_pip_boy_guidance(self, tmp_path: Path):
         """New sub-agents must ship with the full operational persona
         (Identity Recognition, Tool Calling, Memory, etc.), not just
-        a 4-line identity stub. Otherwise they see the injected
-        ``## Addressbook`` block in their prompt but have no framework
-        to interpret it — exactly the "sub-agent doesn't know who the
-        user is" bug from the identity-redesign thread."""
+        a 4-line identity stub. Otherwise they receive a ``user_id``
+        on each ``<user_query>`` but have no framework telling them
+        to call ``lookup_user`` — exactly the "sub-agent doesn't know
+        who the user is" bug from the identity-redesign thread."""
         self._seed_rich_pip_boy_persona(tmp_path)
         ctx = _build_ctx(_cli_inbound("/subagent create helper"), tmp_path)
         result = dispatch_command(ctx)

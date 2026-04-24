@@ -23,7 +23,7 @@ class TestFormatPrompt:
         assert isinstance(out, str)
         assert "<user_query" in out
         assert 'from="cli:cli-user"' in out
-        assert 'status="unverified"' in out
+        assert 'user_id="unverified"' in out
         assert "hello" in out
 
     def test_cron_sentinel_wraps_regardless_of_channel(self):
@@ -54,7 +54,7 @@ class TestFormatPrompt:
         out = _format_prompt(inbound, None)
         assert "<user_query" in out
         assert 'from="wechat:u123"' in out
-        assert 'status="unverified"' in out
+        assert 'user_id="unverified"' in out
 
     def test_remote_group_includes_group_attr(self):
         inbound = InboundMessage(

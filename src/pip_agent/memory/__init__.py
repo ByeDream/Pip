@@ -14,14 +14,18 @@ For the root ``pip-boy`` agent ``<agent_dir>`` is ``WORKDIR/.pip``.
 For a sub-agent ``X`` it is ``WORKDIR/X/.pip``.
 
 Addressbook (user profiles) is **workspace-shared** — one flat directory
-under the root ``.pip`` that every agent reads and writes:
+under the root ``.pip`` that every agent reads and writes. Every contact
+is keyed by a stable opaque ``user_id`` (8-char hex) so the model can
+pass identities around without confusing them for human names:
 
-    <workspace_pip_dir>/addressbook/<name>.md
+    <workspace_pip_dir>/addressbook/<user_id>.md
 
 There is no "owner" concept. Whoever is using Pip is just another
 contact the agent learns through conversation and records via
 ``remember_user``. Sub-agents use the same tool and see the same
-addressbook as the root agent.
+addressbook as the root agent. Profile *content* is never auto-injected
+into the system prompt — the agent loads it on demand via
+``lookup_user`` using the ``user_id`` carried on each ``<user_query>``.
 
 Construction
 ~~~~~~~~~~~~
@@ -37,6 +41,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 import threading
 import time
 from datetime import datetime, timezone
@@ -259,6 +264,13 @@ class MemoryStore:
 
     # ------------------------------------------------------------------
     # Addressbook (user profiles, workspace-shared, tool-managed)
+    #
+    # Each contact is keyed by an opaque 8-char hex ``user_id`` that
+    # doubles as its filename (``<user_id>.md``). The agent passes this
+    # id around in ``<user_query user_id=...>`` wrappers and retrieves
+    # details on demand via ``lookup_user``. Profile *content* is never
+    # injected into the system prompt — lazy loading keeps token cost
+    # flat no matter how many contacts accumulate.
     # ------------------------------------------------------------------
 
     _FIELD_MAP: dict[str, str] = {
@@ -273,11 +285,20 @@ class MemoryStore:
         return self.pip_dir / "addressbook"
 
     def _all_profile_paths(self) -> list[Path]:
-        """Return every contact file in the shared addressbook."""
         ab = self.addressbook_dir
         if not ab.is_dir():
             return []
         return sorted(ab.glob("*.md"))
+
+    @staticmethod
+    def _generate_user_id() -> str:
+        """Opaque 8-char hex id — stable, collision-safe for pre-release scale."""
+        return secrets.token_hex(4)
+
+    @staticmethod
+    def extract_user_id(path: Path) -> str:
+        """Derive ``user_id`` from a contact file path (filename stem)."""
+        return path.stem
 
     def find_profile_by_sender(
         self, channel: str, sender_id: str,
@@ -287,120 +308,149 @@ class MemoryStore:
             return None
         target = f"{channel}:{sender_id}"
         expected = f"- `{target}`"
-        paths = self._all_profile_paths()
-        log.debug(
-            "find_profile_by_sender: expected=%r paths=%d", expected, len(paths),
-        )
-        for path in paths:
-            try:
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    stripped = line.strip()
-                    if stripped == expected:
-                        return path
-                    if stripped.startswith("- `") and ":" in stripped:
-                        log.debug(
-                            "  candidate in %s: %r (match=%s)",
-                            path.name, stripped, stripped == expected,
-                        )
-            except OSError:
-                continue
-        log.debug("find_profile_by_sender: no match for %r", expected)
-        return None
-
-    def _find_user_by_name(self, name: str) -> Path | None:
-        """Find a contact whose Name or What to call them matches."""
-        if not name:
-            return None
-        target_lower = name.strip().lower()
         for path in self._all_profile_paths():
             try:
                 for line in path.read_text(encoding="utf-8").splitlines():
-                    stripped = line.strip()
-                    for prefix in ("- **Name:**", "- **What to call them:**"):
-                        if stripped.startswith(prefix):
-                            val = stripped[len(prefix):].strip().lower()
-                            if val and val == target_lower:
-                                return path
+                    if line.strip() == expected:
+                        return path
             except OSError:
                 continue
         return None
 
-    @staticmethod
-    def extract_profile_name(path: Path) -> str:
-        """Read 'What to call them' or 'Name' from a profile file."""
+    def load_profile_by_id(self, user_id: str) -> str | None:
+        """Return the markdown body of ``<user_id>.md``, or None."""
+        if not user_id or not _USER_ID_RE.fullmatch(user_id):
+            return None
+        path = self.addressbook_dir / f"{user_id}.md"
+        if not path.is_file():
+            return None
         try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+    def _read_profile_fields(
+        self, path: Path,
+    ) -> tuple[dict[str, str], list[str]]:
+        """Parse an existing contact file into (fields, identifiers)."""
+        current: dict[str, str] = {}
+        current_ids: list[str] = []
+        if not path.is_file():
+            return current, current_ids
+        try:
+            in_ids = False
             for line in path.read_text(encoding="utf-8").splitlines():
                 stripped = line.strip()
-                if stripped.startswith("- **What to call them:**"):
-                    val = stripped[len("- **What to call them:**"):].strip()
-                    if val:
-                        return val
-                if stripped.startswith("- **Name:**"):
-                    val = stripped[len("- **Name:**"):].strip()
-                    if val:
-                        return val
+                for key, label in self._FIELD_MAP.items():
+                    prefix = f"- **{label}:**"
+                    if stripped.startswith(prefix):
+                        current[key] = stripped[len(prefix):].strip()
+                if stripped == "- **Identifiers:**":
+                    in_ids = True
+                    continue
+                if in_ids:
+                    if stripped.startswith("- `") and stripped.endswith("`"):
+                        current_ids.append(stripped[3:-1])
+                    elif stripped.startswith("- **"):
+                        in_ids = False
         except OSError:
             pass
-        return ""
+        return current, current_ids
 
-    def update_user_profile(
+    def _write_profile(
+        self,
+        user_id: str,
+        fields: dict[str, str],
+        identifiers: list[str],
+    ) -> Path:
+        display = fields.get("call_me") or fields.get("name") or "User"
+        lines = [
+            f"# {display}", "",
+            "_Profile managed by Pip._", "",
+            f"- **ID:** {user_id}",
+        ]
+        for key, label in self._FIELD_MAP.items():
+            lines.append(f"- **{label}:** {fields.get(key, '')}")
+        if identifiers:
+            lines.append("- **Identifiers:**")
+            for ident in identifiers:
+                lines.append(f"  - `{ident}`")
+        lines.append("")
+
+        target = self.addressbook_dir / f"{user_id}.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write so a crash mid-flush can't leave a contact
+        # half-written — the file is the source of truth for identity
+        # binding and the aliases list.
+        from pip_agent.fileutil import atomic_write
+        atomic_write(target, "\n".join(lines))
+        return target
+
+    def create_contact(
         self,
         *,
         sender_id: str = "",
         channel: str = "",
         **fields: str,
-    ) -> str:
-        """Create or update a contact in the shared addressbook.
+    ) -> tuple[str, str]:
+        """Register a brand-new contact. Returns ``(user_id, message)``.
 
-        A sender already bound to a profile (matching ``channel:sender_id``
-        in its Identifiers list) is locked to that profile. An unbound
-        sender may join an existing profile by Name match or create a
-        brand new contact.
+        Used by the ``remember_user`` tool when the caller is unverified
+        (i.e. the introduce-yourself handshake). The new contact gets a
+        freshly-minted 8-hex ``user_id`` and the caller's current
+        ``channel:sender_id`` is recorded as its first identifier.
         """
         if sender_id and channel and sender_id.startswith(f"{channel}:"):
             sender_id = sender_id[len(channel) + 1:]
 
-        new_id = f"{channel}:{sender_id}" if sender_id and channel else ""
-        ab = self.addressbook_dir
-        ab.mkdir(parents=True, exist_ok=True)
+        new_fields: dict[str, str] = {
+            k: v for k, v in fields.items() if k in self._FIELD_MAP and v
+        }
+        identifiers: list[str] = []
+        if sender_id and channel:
+            identifiers.append(f"{channel}:{sender_id}")
 
-        registered_path = (
-            self.find_profile_by_sender(channel, sender_id) if new_id else None
+        # Retry until we land a non-colliding id. 8 hex chars = 2^32
+        # keyspace; collision on a pre-release addressbook is astronomically
+        # unlikely but the guard is cheap.
+        for _ in range(16):
+            uid = self._generate_user_id()
+            if not (self.addressbook_dir / f"{uid}.md").exists():
+                break
+        else:
+            raise RuntimeError("could not allocate a free user_id")
+
+        self._write_profile(uid, new_fields, identifiers)
+        return uid, f"Created contact {uid}."
+
+    def update_contact(
+        self,
+        user_id: str,
+        *,
+        sender_id: str = "",
+        channel: str = "",
+        **fields: str,
+    ) -> str:
+        """Update an existing contact by ``user_id``.
+
+        Optionally records a newly-seen ``channel:sender_id`` pair if
+        the caller is reaching this contact from an identifier the
+        profile hasn't seen before.
+        """
+        if not _USER_ID_RE.fullmatch(user_id):
+            return f"Invalid user_id: {user_id!r}."
+
+        path = self.addressbook_dir / f"{user_id}.md"
+        if not path.is_file():
+            return f"No contact with user_id={user_id}."
+
+        if sender_id and channel and sender_id.startswith(f"{channel}:"):
+            sender_id = sender_id[len(channel) + 1:]
+        new_sender_key = (
+            f"{channel}:{sender_id}" if sender_id and channel else ""
         )
 
-        if registered_path:
-            target_path = registered_path
-        else:
-            name = fields.get("name") or fields.get("call_me") or ""
-            existing = self._find_user_by_name(name) if name else None
-            if existing:
-                target_path = existing
-            else:
-                safe = _sanitize_filename(name or sender_id or "unknown")
-                target_path = ab / f"{safe}.md"
-
-        current: dict[str, str] = {}
-        current_ids: list[str] = []
-        if target_path.is_file():
-            try:
-                in_ids = False
-                for line in target_path.read_text(encoding="utf-8").splitlines():
-                    stripped = line.strip()
-                    for key, label in self._FIELD_MAP.items():
-                        prefix = f"- **{label}:**"
-                        if stripped.startswith(prefix):
-                            current[key] = stripped[len(prefix):].strip()
-                    if stripped == "- **Identifiers:**":
-                        in_ids = True
-                        continue
-                    if in_ids:
-                        if stripped.startswith("- `") and stripped.endswith("`"):
-                            current_ids.append(stripped[3:-1])
-                        elif stripped.startswith("- **"):
-                            in_ids = False
-            except OSError:
-                pass
-
+        current, current_ids = self._read_profile_fields(path)
         updated_keys: list[str] = []
         for key, value in fields.items():
             if key not in self._FIELD_MAP or not value:
@@ -411,36 +461,17 @@ class MemoryStore:
                 current[key] = value
             updated_keys.append(key)
 
-        if new_id and new_id not in current_ids:
-            current_ids.append(new_id)
+        if new_sender_key and new_sender_key not in current_ids:
+            current_ids.append(new_sender_key)
             updated_keys.append("identifier")
 
         if not updated_keys:
             return "No fields to update."
 
-        display = current.get("call_me") or current.get("name") or "User"
-        lines = [
-            f"# {display}", "",
-            "_Profile managed by Pip._", "",
-        ]
-        for key, label in self._FIELD_MAP.items():
-            val = current.get(key, "")
-            lines.append(f"- **{label}:** {val}")
-        if current_ids:
-            lines.append("- **Identifiers:**")
-            for ident in current_ids:
-                lines.append(f"  - `{ident}`")
-        lines.append("")
-
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic write so a crash mid-flush (Ctrl+C, OOM, power loss)
-        # can't leave a contact half-written. The file is the source
-        # of truth for identity binding and the aliases list — a
-        # truncated write would silently demote a user to "unregistered"
-        # on the next load.
-        from pip_agent.fileutil import atomic_write
-        atomic_write(target_path, "\n".join(lines))
-        return f"Updated addressbook entry ({target_path.name}): {', '.join(updated_keys)}"
+        self._write_profile(user_id, current, current_ids)
+        return (
+            f"Updated addressbook entry ({user_id}): {', '.join(updated_keys)}"
+        )
 
     # ------------------------------------------------------------------
     # Search / Recall
@@ -496,26 +527,16 @@ class MemoryStore:
         """Inject dynamic context into the system prompt.
 
         Layers (injected in order):
-          1. ## Addressbook — every known contact (workspace-shared)
-          2. ## Judgment Principles — per-agent axioms
-          3. ## Recalled Context — TF-IDF matched memories
-          4. ## Context — runtime metadata
-          5. ## Channel — channel hints
-        """
-        sections: list[str] = []
-        for path in self._all_profile_paths():
-            try:
-                text = path.read_text(encoding="utf-8").strip()
-                if text:
-                    sections.append(text)
-            except OSError:
-                continue
-        if sections:
-            system_prompt = _insert_after_identity(
-                system_prompt,
-                "## Addressbook\n\n" + "\n\n---\n\n".join(sections),
-            )
+          1. ## Judgment Principles — per-agent axioms
+          2. ## Recalled Context — TF-IDF matched memories
+          3. ## Context — runtime metadata
+          4. ## Channel — channel hints
 
+        Note: addressbook content is **not** injected here. The agent
+        receives the caller's ``user_id`` on each ``<user_query>`` and
+        loads the profile on demand via the ``lookup_user`` tool. This
+        keeps the prompt token cost flat as the addressbook grows.
+        """
         axioms = self.load_axioms()
         if axioms:
             wrapped = _wrap_axioms(axioms)
@@ -567,28 +588,20 @@ class MemoryStore:
 # Helpers
 # ----------------------------------------------------------------------
 
-_SAFE_RE = re.compile(r"[^a-zA-Z0-9_\-]")
-
-
-def _sanitize_filename(name: str) -> str:
-    """Turn a display name into a safe filename stem (no extension)."""
-    s = _SAFE_RE.sub("_", name.strip().lower())
-    s = re.sub(r"_+", "_", s).strip("_")
-    return s or "unknown"
+# Addressbook user_id: lowercase 8-hex (``secrets.token_hex(4)``).
+# Anchored so foreign inputs (e.g. sender IDs, filenames with extensions)
+# don't accidentally pass validation.
+_USER_ID_RE = re.compile(r"[0-9a-f]{8}")
 
 
 # ----------------------------------------------------------------------
 # Prompt section helpers
 # ----------------------------------------------------------------------
 
-# Scaffold personas use top-level ``# Identity`` headings; the builtin
-# fallback and older tests use ``## Identity``. The injection logic
-# must find either — otherwise the User/Axioms sections silently fall
-# back to "prepend/append at the edges" and end up in the wrong part
-# of the prompt.
-_IDENTITY_RE = re.compile(r"^#+\s+Identity\b", re.MULTILINE)
+# Axioms inject *before* the Rules heading (both scaffold ``# Rules``
+# and legacy ``## Rules``). Addressbook injection was removed when
+# contact profiles moved to lazy ``lookup_user`` loading.
 _RULES_RE = re.compile(r"^#+\s+Rules\b", re.MULTILINE)
-_ANY_HEADING_RE = re.compile(r"^#+\s+\S", re.MULTILINE)
 _BULLET_RE = re.compile(r"^\s*[-*+]\s+(.*)$")
 
 
@@ -635,28 +648,6 @@ def _wrap_axioms(text: str) -> str:
     if not saw_bullet or not items:
         return text.strip()
     return "\n".join(f"<axiom>{item}</axiom>" for item in items)
-
-
-def _insert_after_identity(prompt: str, section: str) -> str:
-    """Insert a section after the Identity heading. Falls back to prepend.
-
-    The "next heading" search is level-agnostic: we cut off at the
-    first heading of any depth that follows Identity, so personas
-    using either ``# Identity`` + ``# Core Philosophy`` (scaffold
-    style) or ``## Identity`` + ``## Rules`` (builtin / legacy)
-    both work.
-    """
-    m = _IDENTITY_RE.search(prompt)
-    if not m:
-        return section + "\n\n" + prompt
-
-    next_heading = _ANY_HEADING_RE.search(prompt, m.end())
-    if next_heading:
-        pos = next_heading.start()
-    else:
-        pos = len(prompt)
-
-    return prompt[:pos].rstrip() + "\n\n" + section + "\n\n" + prompt[pos:].lstrip()
 
 
 def _insert_before_rules(prompt: str, section: str) -> str:

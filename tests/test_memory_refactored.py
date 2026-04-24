@@ -160,113 +160,27 @@ class TestPurgeObservations:
 
 
 # ---------------------------------------------------------------------------
-# enrich_prompt: addressbook injection + heading tolerance
+# Addressbook: lazy-load model (enrich_prompt never injects contacts)
 # ---------------------------------------------------------------------------
 
 
-class TestEnrichPromptAddressbookInjection:
-    """Regression guard for a two-part bug:
+class TestAddressbookLazyLoad:
+    """The addressbook moved from eager-inject-into-system-prompt to
+    lazy ``lookup_user``-on-demand. These tests encode the two new
+    invariants this refactor is supposed to guarantee:
 
-    1. ``_IDENTITY_RE`` only matched ``## Identity`` (two hashes), so
-       the shipped scaffold (``# Identity``, single hash) fell out of
-       the fast-path and the addressbook block was prepended *before*
-       the Identity heading — a semantically wrong location that some
-       models latched onto as "chrome" instead of context.
-    2. Sub-agents needed a shared addressbook with the root agent,
-       but their persona bodies were a 4-line stub with no guidance
-       about how to read it, so they happily answered "I don't know
-       who you are" while the contact data sat right there in the
-       prompt.
-
-    We cover the injection-position half here; the persona-inheritance
-    half is exercised in ``tests/test_host_commands.py::TestSubagentCommand``.
+    1. ``enrich_prompt`` must NEVER materialise contact content into
+       the system prompt, no matter how many profiles exist. Prompt
+       cost stays flat as the addressbook grows.
+    2. ``find_profile_by_sender`` still works across the root/sub-agent
+       split (shared workspace addressbook), and the returned
+       ``user_id`` is stable — it's what the model sees on every
+       ``<user_query user_id=...>`` wrapper.
     """
 
-    def _store_with_contact(
-        self, tmp_path: Path, contact_body: str, *, filename: str = "eric.md",
-    ) -> MemoryStore:
-        """Build a sub-agent store whose workspace-level addressbook
-        contains one contact. ``agent_dir`` lives under
-        ``<workspace>/sub/.pip`` so we can verify the sub-agent reads
-        the root's addressbook rather than a local copy."""
-        workspace_pip = tmp_path / ".pip"
-        (workspace_pip / "addressbook").mkdir(parents=True)
-        (workspace_pip / "addressbook" / filename).write_text(
-            contact_body, encoding="utf-8",
-        )
-        agent_dir = tmp_path / "sub" / ".pip"
-        agent_dir.mkdir(parents=True)
-        return MemoryStore(
-            agent_dir=agent_dir,
-            workspace_pip_dir=workspace_pip,
-            agent_id="sub",
-        )
-
-    def test_single_hash_identity_injects_addressbook_after_identity(
+    def _seed_sub_agent_store(
         self, tmp_path: Path,
-    ):
-        """Scaffold-style ``# Identity`` headings must not bypass the
-        post-Identity injection point."""
-        store = self._store_with_contact(
-            tmp_path, "# Eric\n- `cli:cli-user` — Eric\n",
-        )
-        base = (
-            "# Identity\n\nYou are Sub.\n\n"
-            "# Core Philosophy\n\nKeep it simple.\n"
-        )
-        out = store.enrich_prompt(
-            base, user_text="hello", channel="cli", agent_id="sub",
-            workdir=str(tmp_path / "sub"), sender_id="cli-user",
-        )
-        assert "Eric" in out
-        identity_pos = out.find("# Identity")
-        ab_pos = out.find("## Addressbook")
-        philosophy_pos = out.find("# Core Philosophy")
-        assert 0 <= identity_pos < ab_pos < philosophy_pos, out
-
-    def test_double_hash_identity_still_works(self, tmp_path: Path):
-        """Legacy ``## Identity`` (two hashes) must still match — the
-        builtin fallback persona uses that form."""
-        store = self._store_with_contact(
-            tmp_path, "# Eric\n- `cli:cli-user` — Eric\n",
-        )
-        base = "## Identity\n\nYou are Sub.\n\n## Rules\n\nBe kind.\n"
-        out = store.enrich_prompt(
-            base, user_text="hello", channel="cli", agent_id="sub",
-            workdir=str(tmp_path / "sub"), sender_id="cli-user",
-        )
-        identity_pos = out.find("## Identity")
-        ab_pos = out.find("## Addressbook")
-        rules_pos = out.find("## Rules")
-        assert 0 <= identity_pos < ab_pos < rules_pos, out
-
-    def test_sub_agent_sees_workspace_addressbook(self, tmp_path: Path):
-        """The shared-addressbook invariant: the sub-agent's
-        ``MemoryStore`` has ``agent_dir = <workspace>/sub/.pip`` but
-        ``workspace_pip_dir = <workspace>/.pip``, and contacts live
-        only at the latter. The injected content must come from the
-        workspace-root ``addressbook/``."""
-        store = self._store_with_contact(
-            tmp_path,
-            "# Eric\n- **Notes:** Pacific time\n- `cli:cli-user`\n",
-        )
-        out = store.enrich_prompt(
-            "# Identity\n\nYou are Sub.\n",
-            user_text="",
-            channel="cli",
-            agent_id="sub",
-            workdir=str(tmp_path / "sub"),
-            sender_id="cli-user",
-        )
-        assert "Eric" in out
-        assert "Pacific time" in out
-
-    def test_sub_agent_remember_user_writes_to_root_addressbook(
-        self, tmp_path: Path,
-    ):
-        """A sub-agent's ``update_user_profile`` must land in the
-        workspace-root addressbook, not a local sub-agent copy — that's
-        the whole point of the shared addressbook."""
+    ) -> tuple[MemoryStore, Path]:
         workspace_pip = tmp_path / ".pip"
         workspace_pip.mkdir(parents=True)
         agent_dir = tmp_path / "sub" / ".pip"
@@ -276,38 +190,123 @@ class TestEnrichPromptAddressbookInjection:
             workspace_pip_dir=workspace_pip,
             agent_id="sub",
         )
-        result = store.update_user_profile(
-            sender_id="alice", channel="wecom",
-            name="Alice", call_me="Alice",
-        )
-        assert "alice" in result.lower()
-        root_ab = workspace_pip / "addressbook"
-        assert any(p.name == "alice.md" for p in root_ab.glob("*.md"))
-        # No local addressbook was created under the sub-agent dir.
-        assert not (agent_dir / "addressbook").exists()
-        assert not (agent_dir / "users").exists()
+        return store, workspace_pip
 
-    def test_no_contacts_does_not_inject_addressbook_section(
-        self, tmp_path: Path,
-    ):
-        """Empty addressbook → no ``## Addressbook`` section at all,
-        not an empty one."""
-        workspace_pip = tmp_path / ".pip"
-        workspace_pip.mkdir(parents=True)
-        agent_dir = tmp_path / "sub" / ".pip"
-        agent_dir.mkdir(parents=True)
-        store = MemoryStore(
-            agent_dir=agent_dir,
-            workspace_pip_dir=workspace_pip,
-            agent_id="sub",
+    def test_enrich_prompt_never_injects_addressbook(self, tmp_path: Path):
+        store, _ = self._seed_sub_agent_store(tmp_path)
+        # Populate the workspace addressbook with a contact that has
+        # very distinctive content — if any byte of it leaks into the
+        # system prompt, the assertion below will spot it.
+        store.create_contact(
+            sender_id="cli-user", channel="cli",
+            name="Eric", call_me="Eric", notes="Pacific time",
         )
+
         out = store.enrich_prompt(
             "# Identity\n\nYou are Sub.\n",
-            user_text="",
-            channel="cli",
-            agent_id="sub",
-            workdir=str(tmp_path / "sub"),
-            sender_id="cli-user",
+            user_text="hello",
+            channel="cli", agent_id="sub",
+            workdir=str(tmp_path / "sub"), sender_id="cli-user",
         )
         assert "## Addressbook" not in out
         assert "## User" not in out
+        assert "Eric" not in out
+        assert "Pacific time" not in out
+
+    def test_empty_addressbook_is_also_silent(self, tmp_path: Path):
+        """No contacts → no placeholder heading either."""
+        store, _ = self._seed_sub_agent_store(tmp_path)
+        out = store.enrich_prompt(
+            "# Identity\n\nYou are Sub.\n",
+            user_text="", channel="cli", agent_id="sub",
+            workdir=str(tmp_path / "sub"), sender_id="cli-user",
+        )
+        assert "## Addressbook" not in out
+
+    def test_sub_agent_create_contact_lands_in_root_addressbook(
+        self, tmp_path: Path,
+    ):
+        """Shared addressbook invariant: the sub-agent's
+        ``create_contact`` must land in the workspace root's
+        ``addressbook/``, not a local sub-agent copy."""
+        store, workspace_pip = self._seed_sub_agent_store(tmp_path)
+        uid, msg = store.create_contact(
+            sender_id="alice", channel="wecom",
+            name="Alice", call_me="Alice",
+        )
+        assert uid and len(uid) == 8
+        root_ab = workspace_pip / "addressbook"
+        assert (root_ab / f"{uid}.md").is_file()
+        # Sub-agent dir stays addressbook-free.
+        agent_dir = store.agent_dir
+        assert not (agent_dir / "addressbook").exists()
+        assert not (agent_dir / "users").exists()
+
+    def test_find_profile_by_sender_returns_uuid_stem(self, tmp_path: Path):
+        """The user_id written to ``<user_query>`` is the filename stem
+        returned by ``find_profile_by_sender`` — this test pins that
+        contract so a refactor of the storage layout can't silently
+        break the prompt wrapper."""
+        store, _ = self._seed_sub_agent_store(tmp_path)
+        uid, _ = store.create_contact(
+            sender_id="alice", channel="wecom", name="Alice",
+        )
+        path = store.find_profile_by_sender("wecom", "alice")
+        assert path is not None
+        assert store.extract_user_id(path) == uid
+
+    def test_load_profile_by_id_roundtrips_written_fields(
+        self, tmp_path: Path,
+    ):
+        """``lookup_user`` (which calls ``load_profile_by_id``) must
+        see every field ``remember_user`` wrote. This is the lazy-load
+        round-trip the new design depends on."""
+        store, _ = self._seed_sub_agent_store(tmp_path)
+        uid, _ = store.create_contact(
+            sender_id="alice", channel="cli",
+            name="Alice", call_me="Ali", timezone="Asia/Shanghai",
+            notes="prefers terse replies",
+        )
+        body = store.load_profile_by_id(uid)
+        assert body is not None
+        assert "Alice" in body
+        assert "Ali" in body
+        assert "Asia/Shanghai" in body
+        assert "prefers terse replies" in body
+        assert "`cli:alice`" in body
+
+    def test_load_profile_by_id_rejects_bad_ids(self, tmp_path: Path):
+        """Non-hex / wrong-length inputs must not resolve to anything —
+        we don't want ``lookup_user("../../passwd")`` to escape the
+        addressbook dir via filename shenanigans."""
+        store, _ = self._seed_sub_agent_store(tmp_path)
+        assert store.load_profile_by_id("") is None
+        assert store.load_profile_by_id("not-hex!") is None
+        assert store.load_profile_by_id("../passwd") is None
+        assert store.load_profile_by_id("deadbeef") is None  # well-formed but absent
+
+    def test_update_contact_appends_new_identifier(self, tmp_path: Path):
+        """A verified user reaching out from a fresh channel should be
+        recognisable next time — ``update_contact`` appends the new
+        ``channel:sender_id`` to the Identifiers list."""
+        store, _ = self._seed_sub_agent_store(tmp_path)
+        uid, _ = store.create_contact(
+            sender_id="alice", channel="cli", name="Alice",
+        )
+        store.update_contact(
+            uid, sender_id="alice-wecom", channel="wecom",
+            notes="reached via WeCom",
+        )
+        body = store.load_profile_by_id(uid)
+        assert body is not None
+        assert "`cli:alice`" in body
+        assert "`wecom:alice-wecom`" in body
+        assert "reached via WeCom" in body
+
+    def test_update_contact_rejects_unknown_user_id(self, tmp_path: Path):
+        """Updating a non-existent id is a clear error — we must not
+        silently mint a blank profile at that id."""
+        store, _ = self._seed_sub_agent_store(tmp_path)
+        result = store.update_contact("deadbeef", name="X")
+        assert "No contact" in result
+        assert not list(store.addressbook_dir.glob("*.md"))

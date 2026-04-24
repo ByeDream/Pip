@@ -21,6 +21,7 @@ from typing import Any
 
 from pip_agent import host_commands
 from pip_agent.agent_runner import QueryResult, run_query
+
 # Tier 3 cold-start: only import the light channel primitives at module
 # import time. Wechat / wecom pull ``aibot`` and ``aiohttp`` (~450 ms +
 # ~180 ms on a warm machine); CLI-only launches never need them, and
@@ -335,6 +336,12 @@ def _format_text_prompt(
        ``cli:cli-user`` identifier so the local terminal user goes
        through the same verify / ``remember_user`` flow as a remote
        peer — there is no "owner" shortcut anymore.
+
+    The ``user_id`` attribute carries the caller's opaque addressbook
+    id (8-hex) when the sender is registered, or the literal
+    ``"unverified"`` otherwise. The agent resolves this id into a
+    human-meaningful profile on demand via ``lookup_user`` — contact
+    details are never auto-injected into the system prompt.
     """
     clean_text = _LEADING_AT_RE.sub("", inbound.text, count=1)
 
@@ -343,25 +350,24 @@ def _format_text_prompt(
     if inbound.sender_id == _HEARTBEAT_SENDER:
         return f"<heartbeat>\n{clean_text}\n</heartbeat>"
 
-    sender_status = "unverified"
+    user_id = "unverified"
     if memory_store and inbound.sender_id:
         profile = memory_store.find_profile_by_sender(
             inbound.channel, inbound.sender_id,
         )
         if profile:
-            name = memory_store.extract_profile_name(profile)
-            sender_status = f"verified:{name}" if name else "verified"
+            user_id = memory_store.extract_user_id(profile)
 
     if inbound.is_group:
         return (
             f'<user_query from="{inbound.channel}:{inbound.sender_id}"'
-            f' status="{sender_status}" group="true">'
+            f' user_id="{user_id}" group="true">'
             f"\n{clean_text}\n</user_query>"
         )
     if inbound.sender_id:
         return (
             f'<user_query from="{inbound.channel}:{inbound.sender_id}"'
-            f' status="{sender_status}">'
+            f' user_id="{user_id}">'
             f"\n{clean_text}\n</user_query>"
         )
     return f"<user_query>\n{clean_text}\n</user_query>"
@@ -1335,6 +1341,17 @@ class AgentHost:
         peer_id: str = "",
         session_id: str = "",
     ) -> McpContext:
+        # Resolve the caller's addressbook user_id so tools like
+        # ``remember_user`` can enforce self-update-only ACLs. Mirrors
+        # the ``<user_query user_id=...>`` the model sees on the same
+        # turn — keeping the two in sync is what makes the ACL meaningful.
+        user_id = ""
+        if svc.memory_store and sender_id and channel is not None:
+            profile = svc.memory_store.find_profile_by_sender(
+                channel.name, sender_id,
+            )
+            if profile:
+                user_id = svc.memory_store.extract_user_id(profile)
         return McpContext(
             memory_store=svc.memory_store,
             workdir=svc.paths.cwd,
@@ -1343,6 +1360,7 @@ class AgentHost:
             sender_id=sender_id,
             channel=channel,
             peer_id=peer_id,
+            user_id=user_id,
             scheduler=self._scheduler,
         )
 
