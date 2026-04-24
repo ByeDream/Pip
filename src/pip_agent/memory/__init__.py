@@ -650,8 +650,9 @@ class MemoryStore:
 
         axioms = self.load_axioms()
         if axioms:
+            wrapped = _wrap_axioms(axioms)
             system_prompt = _insert_before_rules(
-                system_prompt, f"## Judgment Principles\n\n{axioms}",
+                system_prompt, f"## Judgment Principles\n\n{wrapped}",
             )
 
         recalled = self.auto_recall(user_text)
@@ -750,6 +751,52 @@ def _sanitize_filename(name: str) -> str:
 _IDENTITY_RE = re.compile(r"^#+\s+Identity\b", re.MULTILINE)
 _RULES_RE = re.compile(r"^#+\s+Rules\b", re.MULTILINE)
 _ANY_HEADING_RE = re.compile(r"^#+\s+\S", re.MULTILINE)
+_BULLET_RE = re.compile(r"^\s*[-*+]\s+(.*)$")
+
+
+def _wrap_axioms(text: str) -> str:
+    """Wrap each bullet of the axioms markdown list in ``<axiom>`` tags.
+
+    L3 distillation writes ``axioms.md`` as a plain markdown list so
+    humans can read it via ``/axioms`` and ``distill_axioms`` stays a
+    simple text-in / text-out function. For prompt injection we want
+    each principle to be *structurally* distinct so the model can
+    recognize axioms as high-weight priors instead of ordinary list
+    items — wrapping here (not in the LLM prompt) keeps the tagging
+    deterministic and independent of model format adherence.
+
+    Consecutive non-bullet lines are folded into the previous bullet
+    so a rare multi-line principle still becomes one ``<axiom>``.
+    If the text contains no bullets, returns it stripped as-is —
+    safer than silently dropping content we don't recognize.
+    """
+    items: list[str] = []
+    current: list[str] = []
+    saw_bullet = False
+
+    def _flush() -> None:
+        if not current:
+            return
+        joined = " ".join(part.strip() for part in current).strip()
+        if joined:
+            items.append(joined)
+        current.clear()
+
+    for line in text.splitlines():
+        match = _BULLET_RE.match(line)
+        if match:
+            _flush()
+            current.append(match.group(1))
+            saw_bullet = True
+        elif line.strip():
+            current.append(line.strip())
+        else:
+            _flush()
+    _flush()
+
+    if not saw_bullet or not items:
+        return text.strip()
+    return "\n".join(f"<axiom>{item}</axiom>" for item in items)
 
 
 def _insert_after_identity(prompt: str, section: str) -> str:
