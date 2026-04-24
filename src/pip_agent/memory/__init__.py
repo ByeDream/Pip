@@ -676,36 +676,6 @@ class MemoryStore:
         return system_prompt
 
     # ------------------------------------------------------------------
-    # Factory reset
-    # ------------------------------------------------------------------
-
-    def clear_observations(self) -> int:
-        """Delete all observation files. Returns count of files removed."""
-        with self._io_lock:
-            obs_dir = self.agent_dir / "observations"
-            if not obs_dir.is_dir():
-                return 0
-            count = 0
-            for fp in obs_dir.glob("*.jsonl"):
-                fp.unlink(missing_ok=True)
-                count += 1
-            return count
-
-    def factory_reset(self) -> None:
-        """Remove L1/L2/L3 files and scheduler state for this agent.
-
-        Does not touch persona.md, users/, owner.md, or bindings.
-        """
-        with self._io_lock:
-            obs_dir = self.agent_dir / "observations"
-            if obs_dir.is_dir():
-                for fp in obs_dir.glob("*.jsonl"):
-                    fp.unlink(missing_ok=True)
-            for name in ("memories.json", "axioms.md", "state.json"):
-                p = self.agent_dir / name
-                p.unlink(missing_ok=True)
-
-    # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------
 
