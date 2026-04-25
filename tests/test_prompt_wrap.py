@@ -73,6 +73,29 @@ class TestFormatPrompt:
         assert "@Pip" not in out
         assert "hey" in out
 
+    def test_raw_passthrough_returns_text_verbatim(self):
+        # ``/T <payload>`` path: the SDK expects ``query(prompt="/compact")``
+        # for built-in slash commands. Wrapping it in ``<user_query>``
+        # turns it back into ordinary user text and the model just
+        # describes what ``/compact`` is. Raw mode must skip the wrap.
+        inbound = InboundMessage(
+            text="/compact", sender_id="cli-user", channel="cli",
+            peer_id="cli-user",
+        )
+        out = _format_prompt(inbound, None, raw_passthrough=True)
+        assert out == "/compact"
+
+    def test_raw_passthrough_strips_sentinel_handling(self):
+        # Even if the inbound carries a sentinel sender id, raw mode
+        # must not re-wrap with <cron_task>/<heartbeat> — the operator
+        # explicitly asked for verbatim passthrough.
+        inbound = InboundMessage(
+            text="/context", sender_id="__heartbeat__", channel="cli",
+            peer_id="cli-user",
+        )
+        out = _format_prompt(inbound, None, raw_passthrough=True)
+        assert out == "/context"
+
 
 # ---------------------------------------------------------------------------
 # Multimodal (Phase 7): attachments flip the return type from str to

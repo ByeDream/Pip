@@ -131,6 +131,99 @@ class TestDispatchRecognition:
         assert "unknown command" in body
         assert "/help" in body
 
+    def test_slash_t_passthrough_for_claude_code(self, tmp_path: Path):
+        ctx = _build_ctx(_cli_inbound("/T /login"), tmp_path)
+        result = dispatch_command(ctx)
+        assert result.handled is False
+        assert result.agent_user_text == "/login"
+        assert result.response is None
+
+    def test_slash_t_preserves_payload_case(self, tmp_path: Path):
+        ctx = _build_ctx(_cli_inbound("/T /Login"), tmp_path)
+        result = dispatch_command(ctx)
+        assert result.handled is False
+        assert result.agent_user_text == "/Login"
+
+    def test_slash_t_requires_whitespace_not_tool_prefix(self, tmp_path: Path):
+        ctx = _build_ctx(_cli_inbound("/Tool"), tmp_path)
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        assert "unknown command" in (result.response or "").lower()
+
+    def test_slash_t_bare_is_usage(self, tmp_path: Path):
+        ctx = _build_ctx(_cli_inbound("/T"), tmp_path)
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        assert "usage" in (result.response or "").lower()
+
+    def test_slash_t_lowercase_is_accepted(self, tmp_path: Path):
+        # Operators in shell habitually type lowercase; /t should
+        # behave the same as /T so the prefix isn't a foot-gun.
+        ctx = _build_ctx(_cli_inbound("/t /compact"), tmp_path)
+        result = dispatch_command(ctx)
+        assert result.handled is False
+        assert result.agent_user_text == "/compact"
+
+    def test_slash_t_unknown_slash_warns_when_caps_known(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # When the SDK has reported its dispatch list (via SystemMessage
+        # init -> sdk_caps), typos that aren't in that list short-circuit
+        # at the host with a hint instead of paying a subprocess
+        # round-trip just for the SDK to reject them.
+        from pip_agent import sdk_caps
+        sdk_caps.reset_for_test()
+        sdk_caps.record(["compact", "context", "cost", "model"])
+        try:
+            ctx = _build_ctx(_cli_inbound("/T /comapct"), tmp_path)
+            result = dispatch_command(ctx)
+            assert result.handled is True
+            body = (result.response or "")
+            assert "/comapct" in body
+            assert "/compact" in body  # closest-match suggestion
+        finally:
+            sdk_caps.reset_for_test()
+
+    def test_slash_t_known_slash_passes_through_when_caps_known(
+        self, tmp_path: Path,
+    ):
+        from pip_agent import sdk_caps
+        sdk_caps.reset_for_test()
+        sdk_caps.record(["compact", "context"])
+        try:
+            ctx = _build_ctx(_cli_inbound("/T /Compact"), tmp_path)
+            result = dispatch_command(ctx)
+            assert result.handled is False
+            assert result.agent_user_text == "/Compact"
+        finally:
+            sdk_caps.reset_for_test()
+
+    def test_slash_t_no_warning_when_caps_unknown(self, tmp_path: Path):
+        # Pre-init (caps not yet observed) we must not gate at all —
+        # the SDK is the authority, the host just trusts the operator.
+        from pip_agent import sdk_caps
+        sdk_caps.reset_for_test()
+        ctx = _build_ctx(_cli_inbound("/T /unheard-of"), tmp_path)
+        result = dispatch_command(ctx)
+        assert result.handled is False
+        assert result.agent_user_text == "/unheard-of"
+
+    def test_slash_t_text_payload_passes_through_unchecked(
+        self, tmp_path: Path,
+    ):
+        # Non-slash payload (e.g. ``/T hello``) is plain text the user
+        # wants delivered raw to the model — no slash gating applies.
+        from pip_agent import sdk_caps
+        sdk_caps.reset_for_test()
+        sdk_caps.record(["compact"])
+        try:
+            ctx = _build_ctx(_cli_inbound("/T hello world"), tmp_path)
+            result = dispatch_command(ctx)
+            assert result.handled is False
+            assert result.agent_user_text == "/T hello world".split(" ", 1)[1]
+        finally:
+            sdk_caps.reset_for_test()
+
     def test_typo_suggests_close_command(self, tmp_path: Path):
         # ``/subagnet`` is one transposition away from ``/subagent`` —
         # we want the hint surfaced so the user doesn't have to guess.

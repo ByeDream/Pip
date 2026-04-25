@@ -85,9 +85,10 @@ def main(argv: list[str] | None = None) -> None:
         "--version", action="store_true", help="Show version and exit",
     )
     parser.add_argument(
-        "--wechat", metavar="AGENT_ID", default=None,
+        "--wechat", nargs="?", metavar="AGENT_ID", default=None, const="",
         help=(
-            "Log a new WeChat account in via QR and bind it to AGENT_ID. "
+            "Log a new WeChat account in via QR and bind it to AGENT_ID "
+            "(defaults to the main agent when omitted). "
             "The scan runs in the background so the CLI stays usable "
             "(/wechat cancel aborts the scan, /exit aborts everything)."
         ),

@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +44,7 @@ from pip_agent.routing import (
     AgentRegistry,
     BindingTable,
     build_session_key,
+    normalize_agent_id,
     resolve_effective_config,
 )
 from pip_agent.streaming_session import StaleSessionError, StreamingSession
@@ -489,6 +490,8 @@ def _materialize_attachments(
 def _format_prompt(
     inbound: InboundMessage,
     memory_store: MemoryStore | None,
+    *,
+    raw_passthrough: bool = False,
 ) -> str | list[dict[str, Any]]:
     """Build the user-visible prompt from an InboundMessage.
 
@@ -516,8 +519,21 @@ def _format_prompt(
     the content inline. Binary ``file`` attachments and ``voice``
     attachments become descriptive text markers (the channel has
     already done ASR for voice).
+
+    Raw passthrough
+    ---------------
+    ``/T <payload>`` (see :mod:`pip_agent.host_commands`) sets
+    ``raw_passthrough=True``. We then return ``inbound.text`` verbatim
+    (no ``<user_query>`` wrapper, no sentinel tags) because the SDK
+    expects bare ``"/compact"``-style strings to dispatch built-in
+    Claude Code slash commands; wrapping in XML turns them back into
+    ordinary user messages. Attachments are dropped in that mode —
+    raw passthrough is meant for control commands, not multimodal turns.
     """
     import base64
+
+    if raw_passthrough:
+        return inbound.text if isinstance(inbound.text, str) else ""
 
     text = _format_text_prompt(inbound, memory_store)
 
@@ -1452,8 +1468,9 @@ class AgentHost:
             # expensive prompt enrichment + SDK subprocess spawn. Dispatch
             # runs cheaply off in-memory registry / bindings / memory-store
             # state; its response (if any) is routed back through the same
-            # channel that delivered the inbound. Unknown slashes fall
-            # through to the agent so the LLM can still interpret them.
+            # channel that delivered the inbound. Unknown slashes are host
+            # errors; use ``/T <text>`` to forward Claude Code slash input
+            # (e.g. ``/T /login``) without burning a turn on a typo.
             with _profile.span_sync("host.dispatch_command"):
                 cmd_result = host_commands.dispatch_command(
                     host_commands.CommandContext(
@@ -1475,6 +1492,17 @@ class AgentHost:
                 self._deliver_command_response(inbound, cmd_result.response)
                 return None
 
+            # ``/T <payload>`` requested raw SDK passthrough — substitute
+            # the inbound text and skip the wrappers / disk-side effects
+            # that only make sense for normal turns. We compute this once
+            # so format_prompt and the materialize gate stay in sync.
+            raw_passthrough = cmd_result.agent_user_text is not None
+            prompt_inbound = inbound
+            if raw_passthrough:
+                prompt_inbound = replace(
+                    inbound, text=cmd_result.agent_user_text or "",
+                )
+
             sk = build_session_key(
                 agent_id=eff.id,
                 channel=inbound.channel,
@@ -1486,7 +1514,11 @@ class AgentHost:
 
             agent_cwd = svc.paths.cwd
             base_prompt = eff.system_prompt(workdir=str(agent_cwd))
-            user_text = inbound.text if isinstance(inbound.text, str) else ""
+            user_text = (
+                prompt_inbound.text
+                if isinstance(prompt_inbound.text, str)
+                else ""
+            )
             with _profile.span_sync(
                 "memory.enrich_prompt",
                 agent_id=eff.id,
@@ -1507,18 +1539,29 @@ class AgentHost:
             # filename on the same second. Has to run after slash dispatch
             # (no point persisting a file the user intended for a host
             # command) but before prompt formatting.
-            with _profile.span_sync(
-                "host.materialize_attachments",
-                n=len(inbound.attachments or []),
-            ):
-                _materialize_attachments(
-                    inbound,
-                    workdir=agent_cwd,
-                    incoming_dir=svc.paths.incoming_dir,
-                )
+            #
+            # Skipped under ``/T`` raw passthrough: the operator is
+            # dispatching an SDK control command, not a multimodal turn,
+            # and ``_format_prompt(raw_passthrough=True)`` already drops
+            # attachments. Materialising would leak files into the
+            # agent's incoming inbox that nothing references.
+            if not raw_passthrough:
+                with _profile.span_sync(
+                    "host.materialize_attachments",
+                    n=len(inbound.attachments or []),
+                ):
+                    _materialize_attachments(
+                        inbound,
+                        workdir=agent_cwd,
+                        incoming_dir=svc.paths.incoming_dir,
+                    )
 
             with _profile.span_sync("host.format_prompt"):
-                prompt = _format_prompt(inbound, svc.memory_store)
+                prompt = _format_prompt(
+                    prompt_inbound,
+                    svc.memory_store,
+                    raw_passthrough=raw_passthrough,
+                )
 
             ch = self._channel_mgr.get(inbound.channel)
             reply_peer = inbound.peer_id
@@ -2080,35 +2123,89 @@ def _sweep_legacy_wechat(
         )
 
 
+def _resolve_wechat_login_target(
+    raw_target: str | None,
+    registry: AgentRegistry,
+) -> tuple[str | None, str | None]:
+    """Resolve ``--wechat`` target to a concrete agent id.
+
+    Returns ``(agent_id, error_message)``:
+    - ``raw_target is None``: flag not supplied, no-op.
+    - ``raw_target == ""``: flag supplied without value; bind to default agent.
+    - non-empty value: normalize + validate that the agent exists.
+    """
+    if raw_target is None:
+        return None, None
+    if raw_target == "":
+        return registry.default_agent().id, None
+    candidate = normalize_agent_id(raw_target)
+    if registry.get_agent(candidate) is None:
+        return None, (
+            f"Invalid --wechat agent_id {raw_target!r}: "
+            f"agent {candidate!r} does not exist."
+        )
+    return candidate, None
+
+
 def _wechat_is_needed(
-    state_dir: Path,
+    registry: AgentRegistry,
     binding_table: BindingTable,
-    wechat_login_for: str | None,
+    *,
+    wechat_qr_wanted: bool = False,
 ) -> bool:
     """Decide whether to construct / register the WeChat channel at all.
 
-    Rules (any one suffices):
+    WeChat runtime is enabled when any of the following is true:
 
-    1. ``--wechat <agent_id>`` was passed (new login coming).
-    2. Any credential file under ``credentials/wechat/*.json`` exists
-       (pre-existing accounts to resume).
-    3. Any tier-3 ``account_id=...`` binding exists (operator or
-       previous runtime persisted a routing rule).
+    1. The operator asked for a QR login via ``--wechat`` (a concrete
+       target was resolved; invalid ids short-circuit earlier and never
+       reach here with ``wechat_qr_wanted=True``). This must work even
+       when no tier-3 bindings exist yet: the first scan creates the
+       account + binding.
 
-    Returning ``False`` skips the WeChat import entirely, preserving
-    cold-start speed for CLI-only workflows. The only per-boot cost
-    here is a directory scan.
+    2. At least one *valid* tier-3 ``account_id=...`` binding exists
+       (binding points to a known agent, non-empty account id). This
+       covers steady-state operation: resume polling and inbound
+       routing even when ``--wechat`` was not passed.
     """
-    if wechat_login_for:
+    if wechat_qr_wanted:
         return True
-    cred_dir = state_dir / "credentials" / "wechat"
-    if cred_dir.is_dir():
-        for _ in cred_dir.glob("*.json"):
-            return True
     for b in binding_table.list_all():
-        if b.tier == 3 and b.match_key == "account_id":
-            return True
+        if b.tier != 3 or b.match_key != "account_id":
+            continue
+        if not (b.match_value or "").strip():
+            continue
+        if registry.get_agent(b.agent_id) is None:
+            continue
+        return True
     return False
+
+
+def _banner_transports(
+    channel_mgr: ChannelManager,
+    wechat_controller: WeChatController | None,
+    *,
+    wechat_poll_threads: int = 0,
+) -> list[str]:
+    """Channel names for the boot banner: only transports with live I/O.
+
+    ``ChannelManager.list_channels`` reflects registration (objects exist).
+    The banner is stricter: **wechat** is shown only when a long-poll
+    thread is running (``wechat_poll_threads > 0``) or a QR scan worker
+    is in flight; otherwise a registered but idle wechat stack (all
+    accounts logged out, no scan) is omitted. **cli** and **wecom** are
+    included whenever those channels are registered; their reader / WS
+    thread is started before or right after the banner in ``run_host``.
+    """
+    names: list[str] = []
+    if channel_mgr.get("cli") is not None:
+        names.append("cli")
+    if channel_mgr.get("wechat") is not None and wechat_controller is not None:
+        if wechat_poll_threads > 0 or wechat_controller.is_qr_in_progress():
+            names.append("wechat")
+    if channel_mgr.get("wecom") is not None:
+        names.append("wecom")
+    return names
 
 
 def run_host(wechat_login_for: str | None = None) -> None:
@@ -2122,12 +2219,10 @@ def run_host(wechat_login_for: str | None = None) -> None:
     * **CLI** is always registered.
     * **WeCom** is registered iff ``WECOM_BOT_ID`` + ``WECOM_BOT_SECRET``
       env vars are set.
-    * **WeChat** is registered iff any of:
-      - at least one credential file exists in
-        ``<workspace>/.pip/credentials/wechat/*.json``,
-      - at least one tier-3 ``account_id=...`` binding exists, or
-      - ``--wechat <agent_id>`` was passed (triggers a background QR
-        login that stays out of the main CLI thread).
+    * **WeChat** is registered when either (a) a *resolved* ``--wechat``
+      QR login was requested, or (b) at least one *valid* tier-3
+      ``account_id=...`` binding exists (known agent, non-empty account
+      id) so inbound routing + polling can resume.
 
     UTF-8 console setup (for Windows CJK input) is not done here — it must
     happen *before* :mod:`logging` is configured, so
@@ -2138,10 +2233,7 @@ def run_host(wechat_login_for: str | None = None) -> None:
     from pip_agent import _profile
     from pip_agent.scaffold import ensure_workspace
 
-    _profile.cold_start(
-        "run_host_entered",
-        wechat_login=bool(wechat_login_for),
-    )
+    _profile.cold_start("run_host_entered", wechat_login=wechat_login_for is not None)
 
     ensure_workspace(WORKDIR)
     settings.check_required()
@@ -2149,6 +2241,12 @@ def run_host(wechat_login_for: str | None = None) -> None:
     registry = AgentRegistry(WORKDIR)
     binding_table = BindingTable()
     binding_table.load(BINDINGS_PATH)
+    wechat_login_target, wechat_login_error = _resolve_wechat_login_target(
+        wechat_login_for, registry,
+    )
+    if wechat_login_error:
+        print(f"  [wechat] ERROR: {wechat_login_error}")
+    wechat_qr_wanted = wechat_login_target is not None
     _profile.cold_start(
         "registry_ready",
         agents=len(registry.list_agents()),
@@ -2177,7 +2275,10 @@ def run_host(wechat_login_for: str | None = None) -> None:
     bg_threads: list[threading.Thread] = []
 
     wechat_controller: WeChatController | None = None
-    if _wechat_is_needed(state_dir, binding_table, wechat_login_for):
+    wechat_poll_threads = 0
+    if _wechat_is_needed(
+        registry, binding_table, wechat_qr_wanted=wechat_qr_wanted,
+    ):
         try:
             # Deferred import: keeps CLI cold-start off the wechat
             # (qrcode / cryptography / httpx) dependency graph when
@@ -2211,6 +2312,7 @@ def run_host(wechat_login_for: str | None = None) -> None:
             # last boot) will show up in ``/wechat list`` as logged_in=no
             # and need ``/wechat add <agent_id>`` to re-scan.
             started = wechat_controller.spawn_polls_for_all_logged_in()
+            wechat_poll_threads = started
             _profile.cold_start(
                 "wechat_poll_spawned",
                 threads=started,
@@ -2246,11 +2348,6 @@ def run_host(wechat_login_for: str | None = None) -> None:
         except Exception as exc:
             print(f"  [wecom] Init failed: {exc}")
 
-    _profile.cold_start(
-        "channels_ready",
-        channels=channel_mgr.list_channels(),
-    )
-
     scheduler = HostScheduler(
         registry=registry,
         msg_queue=msg_queue,
@@ -2269,21 +2366,28 @@ def run_host(wechat_login_for: str | None = None) -> None:
     )
     _profile.cold_start("host_ready")
 
-    # Kick off ``--wechat <agent_id>`` as a background QR worker AFTER
+    # Kick off ``--wechat [agent_id]`` as a background QR worker AFTER
     # the host is fully constructed. The worker is a daemon thread, so
     # the main CLI loop can still accept input (including ``/wechat
     # cancel`` and ``/exit``) while the user decides whether to scan.
-    # Unknown agent ids short-circuit with a one-line error here so the
-    # operator sees the mistake before the CLI prompt prints.
-    if wechat_login_for:
+    # Unknown agent ids short-circuit earlier via
+    # ``_resolve_wechat_login_target``.
+    if wechat_login_target:
         if wechat_controller is None:
             print(
-                "  [wechat] --wechat was supplied but the WeChat channel "
-                "could not be initialised; ignoring.",
+                "  [wechat] QR login skipped: WeChat channel failed to initialise "
+                "(see the error line above, if any).",
             )
         else:
-            accepted, msg = wechat_controller.start_qr_login(wechat_login_for)
+            accepted, msg = wechat_controller.start_qr_login(wechat_login_target)
             print(f"  [wechat] {msg}")
+
+    banner_transports = _banner_transports(
+        channel_mgr,
+        wechat_controller,
+        wechat_poll_threads=wechat_poll_threads,
+    )
+    _profile.cold_start("channels_ready", channels=banner_transports)
 
     from pip_agent import __version__
 
@@ -2296,7 +2400,7 @@ def run_host(wechat_login_for: str | None = None) -> None:
         "============================================\n"
         "  Welcome, Vault Dweller. Type '/exit' to\n"
         "  power down.\n"
-        f"  Channels: {', '.join(channel_mgr.list_channels())}\n"
+        f"  Channels: {', '.join(banner_transports) if banner_transports else 'none'}\n"
         f"  Agents: {agents_list}\n"
         "============================================"
     )

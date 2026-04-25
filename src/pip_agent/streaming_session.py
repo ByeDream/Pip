@@ -316,6 +316,12 @@ class StreamingSession:
                                     )
                                 if sid:
                                     self.session_id = sid
+                                # See :mod:`pip_agent.sdk_caps` — capture
+                                # the dispatchable slash list once so
+                                # ``/T`` and ``/help`` can reason about
+                                # which slashes the SDK will actually run.
+                                from pip_agent import sdk_caps
+                                sdk_caps.record(message.data.get("slash_commands"))
                                 _profile.event(
                                     "stream.session_init",
                                     session_key=self.session_key,

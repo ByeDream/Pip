@@ -24,6 +24,7 @@ from claude_agent_sdk import (
     query,
 )
 
+from pip_agent import sdk_caps
 from pip_agent.hooks import build_hooks
 from pip_agent.mcp_tools import McpContext, build_mcp_server
 
@@ -268,6 +269,11 @@ async def run_query(
                     if message.subtype == "init":
                         result.session_id = message.data.get("session_id")
                         log.info("Session: %s", result.session_id)
+                        # Capture the SDK's dispatchable slash list once
+                        # per process so ``/T`` can warn on typos and
+                        # ``/help`` can list what is actually reachable
+                        # in headless mode (see :mod:`pip_agent.sdk_caps`).
+                        sdk_caps.record(message.data.get("slash_commands"))
                         # PROFILE
                         _profile.event(
                             "runner.session_init",

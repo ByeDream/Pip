@@ -65,6 +65,8 @@ class TestRunHostFlushesOnCtrlC:
             def register(self, _ch: Any) -> None: ...
             def list_channels(self) -> list[str]:
                 return ["cli"]
+            def get(self, name: str) -> Any:
+                return object() if name == "cli" else None
             def close_all(self) -> None:
                 self._closed += 1
 
@@ -155,6 +157,8 @@ class TestRunHostFlushesOnCtrlC:
             def register(self, _ch: Any) -> None: ...
             def list_channels(self) -> list[str]:
                 return ["cli"]
+            def get(self, name: str) -> Any:
+                return object() if name == "cli" else None
             def close_all(self) -> None:
                 close_calls.append(1)
 

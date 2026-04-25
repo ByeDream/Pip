@@ -36,9 +36,16 @@ Contract
     a regular contact; identity is tracked in the shared
     ``addressbook/`` via the ``remember_user`` tool.
 
-* Unknown ``/foo`` is **NOT handled**. The caller forwards it to the
-  agent, which can treat it as free-form text. That preserves the old
-  "LLM can interpret slash-commands it doesn't recognize" escape valve.
+* Unknown ``/foo`` is **handled** with a terse error so typos never
+  burn an LLM turn. To forward a Claude Code built-in slash command
+  (e.g. ``/compact``) through to the SDK subprocess, use ``/T /compact``
+  — the ``/T`` prefix sends the payload as the **raw SDK prompt**
+  (no ``<user_query>`` wrapper), which is what the SDK expects for
+  ``slash_commands`` dispatch. Note that some slashes are interactive
+  only (e.g. ``/login``, ``/clear``) and will not work in headless mode
+  regardless of how they are sent — that is a Claude Code limitation,
+  not a Pip-Boy one. See ``/help`` and the SDK ``slash_commands``
+  list in the ``system/init`` message for what is dispatchable.
 
 Out of scope (intentional omissions for v0.4.0)
 -----------------------------------------------
@@ -65,6 +72,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from pip_agent import sdk_caps
 from pip_agent.channels import InboundMessage
 from pip_agent.routing import (
     AgentConfig,
@@ -130,6 +138,7 @@ class CommandContext:
 class CommandResult:
     handled: bool
     response: str | None = None
+    agent_user_text: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +150,26 @@ class CommandResult:
 # slash detection below doesn't miss the command. Only leading mentions
 # are stripped; a ``@user`` mid-argument is passed through unchanged.
 _AT_MENTION_RE = re.compile(r"^(?:@\S*\s+)+")
+
+
+# ``/T <payload>`` — explicit SDK passthrough. Case-insensitive to match
+# the mixed-case habits of operators in shells; the **payload** still
+# preserves its original case (some slashes have arguments where case
+# matters). Whitespace between ``/T`` and ``<payload>`` is mandatory so
+# unrelated commands like ``/Tool`` / ``/team`` (none today, but keep
+# the namespace open) are not swallowed by this rule.
+_T_BARE_RE = re.compile(r"(?i)^/T\s*$")
+_T_PREFIX_RE = re.compile(r"(?i)^/T\s+(.*)$", re.DOTALL)
+
+
+_T_USAGE = (
+    "Usage: `/T <text>` — forwards <text> to the SDK as a raw prompt "
+    "(no `<user_query>` wrapper). Use it to dispatch Claude Code slash "
+    "commands such as `/T /compact` or `/T /context`. Some slashes "
+    "(e.g. `/login`, `/clear`) only work in the interactive Claude "
+    "Code CLI and will not run via SDK regardless. `/T` must be "
+    "followed by whitespace before the payload."
+)
 
 
 def _suggest_command(cmd: str) -> str | None:
@@ -159,8 +188,10 @@ def _suggest_command(cmd: str) -> str | None:
 def dispatch_command(ctx: CommandContext) -> CommandResult:
     """Try to intercept the inbound as a slash command.
 
-    Returns ``CommandResult(handled=False)`` if the text isn't a
-    recognised command — the caller should route it to the agent.
+    Returns ``CommandResult(handled=False)`` if the text should become an
+    agent/SDK turn — either unrecognized as a host command (after
+    stripping ``/T`` passthrough) or an explicit ``/T <payload>`` with
+    ``agent_user_text`` set for the caller to substitute.
     """
     raw = ctx.inbound.text
     if not isinstance(raw, str):
@@ -169,6 +200,44 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
     text = _AT_MENTION_RE.sub("", raw.strip()).strip()
     if not text.startswith("/"):
         return CommandResult(handled=False)
+
+    if _T_BARE_RE.match(text):
+        return CommandResult(handled=True, response=_T_USAGE)
+
+    m_pt = _T_PREFIX_RE.match(text)
+    if m_pt:
+        payload = m_pt.group(1).strip()
+        if not payload:
+            return CommandResult(handled=True, response=_T_USAGE)
+        # If the payload looks like a slash command and we have already
+        # observed the SDK's dispatchable list (via ``SystemMessage(init)``
+        # → :mod:`pip_agent.sdk_caps`), gate typos here so the user sees
+        # an immediate hint instead of paying a subprocess round-trip
+        # only for the SDK to reply ``"/foo isn't available in this
+        # environment."``. When caps are still unknown (boot before the
+        # first agent turn), we fall through and let the SDK arbitrate.
+        if payload.startswith("/"):
+            first_token = payload.split(None, 1)[0]
+            slash_name = first_token.lstrip("/").strip().lower()
+            caps = sdk_caps.get()
+            if caps is not None and slash_name and slash_name not in caps:
+                hint = ""
+                if caps:
+                    from difflib import get_close_matches
+                    matches = get_close_matches(
+                        slash_name, sorted(caps), n=1, cutoff=0.6,
+                    )
+                    if matches:
+                        hint = f" Did you mean `/{matches[0]}`?"
+                return CommandResult(
+                    handled=True,
+                    response=(
+                        f"`{first_token}` is not in this SDK session's "
+                        f"slash list.{hint} Run `/help` to see what is "
+                        "dispatchable."
+                    ),
+                )
+        return CommandResult(handled=False, agent_user_text=payload)
 
     parts = text.split(None, 1)
     cmd = parts[0].lower()
@@ -217,6 +286,13 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
 
 _HELP_COMMON = """\
 Available commands:
+
+  /T <text>                     Forward <text> to the SDK as a raw prompt
+                                (e.g. `/T /compact` to dispatch a Claude
+                                Code slash command; typos like `/hlp` stay
+                                host errors, never LLM turns).
+                                Some slashes are interactive-only and won't
+                                work in SDK mode (`/login`, `/clear`).
 
   /help                         Show this help
   /status                       Show current agent / session / binding
@@ -283,6 +359,16 @@ def _cmd_help(ctx: CommandContext, _args: str) -> CommandResult:
     text = _HELP_COMMON
     if ctx.inbound.channel == "cli":
         text = text + "\n" + _HELP_CLI_EXTRA
+    caps = sdk_caps.get()
+    if caps:
+        # Surface what ``/T <slash>`` will actually dispatch in the
+        # current SDK session. Cached lazily on the first
+        # ``SystemMessage(init)``; absent before any agent turn has run.
+        slashes = ", ".join(f"/{n}" for n in sorted(caps))
+        text = (
+            f"{text}\n\nSDK passthrough slashes (use with `/T`):\n"
+            f"  {slashes}"
+        )
     return CommandResult(handled=True, response=text)
 
 
