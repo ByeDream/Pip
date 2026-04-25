@@ -27,9 +27,10 @@ The two observable bottlenecks — `pywinauto` attach (~130 ms) and
 `aibot` import (~400 ms) — are **external library costs**, not ours.
 Both are deferred until the respective channel is enabled. Since
 channel enablement is now on-demand (WeCom only when
-`WECOM_BOT_ID`/`WECOM_BOT_SECRET` are present, WeChat only when
-`credentials/wechat/*.json` exists or `--wechat <agent_id>` is passed),
-a CLI-only boot pays neither cost.
+`WECOM_BOT_ID`/`WECOM_BOT_SECRET` are present, WeChat auto-started only
+when a valid tier-3 `account_id=...` binding already exists; first-time
+scans bootstrap lazily via `/wechat add <agent_id>`), a CLI-only boot
+pays neither cost.
 
 See `cold_start.*` events in any profile for the exact breakdown on a
 given run.

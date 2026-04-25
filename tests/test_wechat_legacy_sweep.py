@@ -4,7 +4,7 @@ The user chose "fresh start" for migration: the one-time sweep in
 ``agent_host._sweep_legacy_wechat`` deletes
 ``<state_dir>/wechat_session.json`` and any tier-4 ``channel=wechat``
 bindings, then logs WARNINGS so operators know to re-scan with
-``--wechat <agent_id>``.
+``/wechat add <agent_id>``.
 
 Tests here cover the two artefacts independently so a regression in
 one path doesn't mask a regression in the other.

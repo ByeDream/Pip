@@ -17,6 +17,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from pip_agent import host_commands
@@ -649,15 +650,18 @@ class AgentHost:
         channel_mgr: ChannelManager,
         scheduler: HostScheduler | None = None,
         wechat_controller: "WeChatController | None" = None,
+        wechat_bootstrap: Callable[[], "WeChatController"] | None = None,
     ) -> None:
         self._registry = registry
         self._binding_table = binding_table
         self._channel_mgr = channel_mgr
         self._scheduler = scheduler
-        # ``None`` unless WeChat is actually in use for this run — the
-        # slash-command surface degrades gracefully to "WeChat isn't
-        # configured" when absent.
+        # ``None`` until something registers WeChat (boot path with
+        # existing bindings, or lazy bootstrap from ``/wechat add``).
+        # ``_wechat_bootstrap`` is the closure that builds + wires the
+        # controller into the host's queue/lock/stop/channel_mgr.
         self._wechat_controller = wechat_controller
+        self._wechat_bootstrap = wechat_bootstrap
 
         self._sessions = _load_sessions()
         self._agents: dict[str, _PerAgent] = {}
@@ -794,6 +798,28 @@ class AgentHost:
             )
             self._agents[agent_id] = _PerAgent(memory_store=ms, paths=paths)
         return self._agents[agent_id]
+
+    def ensure_wechat_controller(self) -> "WeChatController":
+        """Return the live WeChat controller, building one if absent.
+
+        Boot only spins up the WeChat stack when valid tier-3 bindings
+        already exist (see :func:`_wechat_is_needed`). For first-time
+        operators, ``/wechat add <agent_id>`` calls this to lazily
+        register the channel and instantiate the controller — that's
+        the single entry point for "I want WeChat now". Subsequent
+        calls return the cached controller; bootstrap exceptions
+        propagate to the caller (the slash command surfaces them as a
+        host-level error).
+        """
+        if self._wechat_controller is not None:
+            return self._wechat_controller
+        if self._wechat_bootstrap is None:
+            raise RuntimeError(
+                "WeChat bootstrap is not wired on this AgentHost; "
+                "this is a programming error.",
+            )
+        self._wechat_controller = self._wechat_bootstrap()
+        return self._wechat_controller
 
     def invalidate_agent_cache(self, agent_id: str) -> None:
         """Drop a per-agent service + its session rows.
@@ -1482,6 +1508,7 @@ class AgentHost:
                         scheduler=self._scheduler,
                         invalidate_agent=self.invalidate_agent_cache,
                         wechat_controller=self._wechat_controller,
+                        ensure_wechat_controller=self.ensure_wechat_controller,
                     ),
                 )
             if cmd_result.handled:
@@ -2087,7 +2114,7 @@ def _sweep_legacy_wechat(
     divining which agent the legacy bot belonged to and guessing a
     synthetic account_id), the user explicitly chose a "fresh start":
     the legacy session is dropped, the tier-4 binding is dropped, and
-    operators re-scan via ``--wechat <agent_id>``. This sweep is
+    operators re-scan via ``/wechat add <agent_id>``. This sweep is
     idempotent and runs every boot; after the first launch post-upgrade
     it's a no-op and can eventually be removed.
     """
@@ -2097,7 +2124,7 @@ def _sweep_legacy_wechat(
             legacy_session.unlink()
             log.warning(
                 "Dropped legacy single-account WeChat session at %s — "
-                "use `pip-boy --wechat <agent_id>` to re-scan and bind.",
+                "use `/wechat add <agent_id>` to re-scan and bind.",
                 legacy_session,
             )
         except OSError as exc:
@@ -2119,57 +2146,27 @@ def _sweep_legacy_wechat(
             log.warning("Failed to save bindings after legacy sweep: %s", exc)
         log.warning(
             "Dropped legacy tier-4 channel=wechat binding — re-bind via "
-            "`pip-boy --wechat <agent_id>` or `/wechat add <agent_id>`.",
+            "`/wechat add <agent_id>`.",
         )
-
-
-def _resolve_wechat_login_target(
-    raw_target: str | None,
-    registry: AgentRegistry,
-) -> tuple[str | None, str | None]:
-    """Resolve ``--wechat`` target to a concrete agent id.
-
-    Returns ``(agent_id, error_message)``:
-    - ``raw_target is None``: flag not supplied, no-op.
-    - ``raw_target == ""``: flag supplied without value; bind to default agent.
-    - non-empty value: normalize + validate that the agent exists.
-    """
-    if raw_target is None:
-        return None, None
-    if raw_target == "":
-        return registry.default_agent().id, None
-    candidate = normalize_agent_id(raw_target)
-    if registry.get_agent(candidate) is None:
-        return None, (
-            f"Invalid --wechat agent_id {raw_target!r}: "
-            f"agent {candidate!r} does not exist."
-        )
-    return candidate, None
 
 
 def _wechat_is_needed(
     registry: AgentRegistry,
     binding_table: BindingTable,
-    *,
-    wechat_qr_wanted: bool = False,
 ) -> bool:
-    """Decide whether to construct / register the WeChat channel at all.
+    """Decide whether to construct / register the WeChat channel at boot.
 
-    WeChat runtime is enabled when any of the following is true:
+    WeChat is auto-started at boot only when at least one *valid* tier-3
+    ``account_id=...`` binding exists (binding points to a known agent,
+    non-empty account id). That covers steady-state operation: resume
+    polling and inbound routing for accounts that were already scanned in.
 
-    1. The operator asked for a QR login via ``--wechat`` (a concrete
-       target was resolved; invalid ids short-circuit earlier and never
-       reach here with ``wechat_qr_wanted=True``). This must work even
-       when no tier-3 bindings exist yet: the first scan creates the
-       account + binding.
-
-    2. At least one *valid* tier-3 ``account_id=...`` binding exists
-       (binding points to a known agent, non-empty account id). This
-       covers steady-state operation: resume polling and inbound
-       routing even when ``--wechat`` was not passed.
+    First-time scan has no boot-time signal — operators run
+    ``/wechat add <agent_id>`` from the CLI, which lazily bootstraps the
+    channel via :meth:`AgentHost.ensure_wechat_controller`. There is no
+    longer a ``--wechat`` launch flag; the slash command is the single
+    entry point.
     """
-    if wechat_qr_wanted:
-        return True
     for b in binding_table.list_all():
         if b.tier != 3 or b.match_key != "account_id":
             continue
@@ -2179,6 +2176,42 @@ def _wechat_is_needed(
             continue
         return True
     return False
+
+
+def _build_wechat_controller(
+    *,
+    state_dir: Path,
+    registry: AgentRegistry,
+    binding_table: BindingTable,
+    bindings_path: Path,
+    msg_queue: list["InboundMessage"],
+    q_lock: threading.Lock,
+    stop_event: threading.Event,
+    channel_mgr: ChannelManager,
+) -> "tuple[WeChatController, int]":
+    """Construct the WeChat channel + controller and register them.
+
+    Returns ``(controller, started_polls)``. Used both at boot (when
+    ``_wechat_is_needed`` is true) and on demand from ``/wechat add``
+    via :meth:`AgentHost.ensure_wechat_controller`. Centralises the
+    wiring (channel registration, controller fields, poll spawning) so
+    the boot path and the lazy path stay in sync.
+    """
+    from pip_agent.channels.wechat import WeChatChannel
+
+    wechat_channel = WeChatChannel(state_dir)
+    channel_mgr.register(wechat_channel)
+    controller = WeChatController(
+        channel=wechat_channel,
+        registry=registry,
+        bindings=binding_table,
+        bindings_path=bindings_path,
+        msg_queue=msg_queue,
+        q_lock=q_lock,
+        stop_event=stop_event,
+    )
+    started = controller.spawn_polls_for_all_logged_in()
+    return controller, started
 
 
 def _banner_transports(
@@ -2208,7 +2241,7 @@ def _banner_transports(
     return names
 
 
-def run_host(wechat_login_for: str | None = None) -> None:
+def run_host() -> None:
     """Blocking multi-channel entry point.
 
     Starts channel threads, then enters an asyncio event loop that processes
@@ -2219,10 +2252,12 @@ def run_host(wechat_login_for: str | None = None) -> None:
     * **CLI** is always registered.
     * **WeCom** is registered iff ``WECOM_BOT_ID`` + ``WECOM_BOT_SECRET``
       env vars are set.
-    * **WeChat** is registered when either (a) a *resolved* ``--wechat``
-      QR login was requested, or (b) at least one *valid* tier-3
-      ``account_id=...`` binding exists (known agent, non-empty account
-      id) so inbound routing + polling can resume.
+    * **WeChat** is auto-registered at boot iff at least one *valid*
+      tier-3 ``account_id=...`` binding already exists (known agent,
+      non-empty account id) so polling + routing resume on restart.
+      First-time scans go through ``/wechat add <agent_id>`` from the
+      CLI, which lazily bootstraps the channel via
+      :meth:`AgentHost.ensure_wechat_controller`.
 
     UTF-8 console setup (for Windows CJK input) is not done here — it must
     happen *before* :mod:`logging` is configured, so
@@ -2233,7 +2268,7 @@ def run_host(wechat_login_for: str | None = None) -> None:
     from pip_agent import _profile
     from pip_agent.scaffold import ensure_workspace
 
-    _profile.cold_start("run_host_entered", wechat_login=wechat_login_for is not None)
+    _profile.cold_start("run_host_entered")
 
     ensure_workspace(WORKDIR)
     settings.check_required()
@@ -2241,12 +2276,6 @@ def run_host(wechat_login_for: str | None = None) -> None:
     registry = AgentRegistry(WORKDIR)
     binding_table = BindingTable()
     binding_table.load(BINDINGS_PATH)
-    wechat_login_target, wechat_login_error = _resolve_wechat_login_target(
-        wechat_login_for, registry,
-    )
-    if wechat_login_error:
-        print(f"  [wechat] ERROR: {wechat_login_error}")
-    wechat_qr_wanted = wechat_login_target is not None
     _profile.cold_start(
         "registry_ready",
         agents=len(registry.list_agents()),
@@ -2274,48 +2303,55 @@ def run_host(wechat_login_for: str | None = None) -> None:
     q_lock = threading.Lock()
     bg_threads: list[threading.Thread] = []
 
+    # Closure used both for the boot path and as the lazy bootstrap
+    # passed into ``AgentHost`` for ``/wechat add``-driven first launch.
+    # All host-wide refs (queue, lock, stop event, channel manager) are
+    # captured by reference, so ``ensure_wechat_controller`` constructs
+    # a controller that's wired into the *same* event plumbing as a
+    # boot-time controller would be.
+    def _wechat_bootstrap() -> "WeChatController":
+        # Deferred import: keeps CLI cold-start off the wechat
+        # (qrcode / cryptography / httpx) dependency graph when nothing
+        # points at WeChat.
+        controller, _started = _build_wechat_controller(
+            state_dir=state_dir,
+            registry=registry,
+            binding_table=binding_table,
+            bindings_path=BINDINGS_PATH,
+            msg_queue=msg_queue,
+            q_lock=q_lock,
+            stop_event=stop_event,
+            channel_mgr=channel_mgr,
+        )
+        return controller
+
     wechat_controller: WeChatController | None = None
     wechat_poll_threads = 0
-    if _wechat_is_needed(
-        registry, binding_table, wechat_qr_wanted=wechat_qr_wanted,
-    ):
+    if _wechat_is_needed(registry, binding_table):
         try:
-            # Deferred import: keeps CLI cold-start off the wechat
-            # (qrcode / cryptography / httpx) dependency graph when
-            # nothing points at WeChat.
-            from pip_agent.channels.wechat import WeChatChannel
             _profile.cold_start("wechat_import_done")
-
-            wechat_channel = WeChatChannel(state_dir)
-            _profile.cold_start(
-                "wechat_instance_ready",
-                accounts=len(wechat_channel.account_ids()),
-                logged_in=sum(
-                    1 for aid in wechat_channel.account_ids()
-                    if (acc := wechat_channel.get_account(aid)) and acc.is_logged_in
-                ),
-            )
-            channel_mgr.register(wechat_channel)
-
-            wechat_controller = WeChatController(
-                channel=wechat_channel,
+            wechat_controller, wechat_poll_threads = _build_wechat_controller(
+                state_dir=state_dir,
                 registry=registry,
-                bindings=binding_table,
+                binding_table=binding_table,
                 bindings_path=BINDINGS_PATH,
                 msg_queue=msg_queue,
                 q_lock=q_lock,
                 stop_event=stop_event,
+                channel_mgr=channel_mgr,
             )
-
-            # Resume polling for every account that still has a live
-            # token. Accounts whose session expired (e.g. ret=-14 on
-            # last boot) will show up in ``/wechat list`` as logged_in=no
-            # and need ``/wechat add <agent_id>`` to re-scan.
-            started = wechat_controller.spawn_polls_for_all_logged_in()
-            wechat_poll_threads = started
+            _profile.cold_start(
+                "wechat_instance_ready",
+                accounts=len(wechat_controller.channel.account_ids()),
+                logged_in=sum(
+                    1 for aid in wechat_controller.channel.account_ids()
+                    if (acc := wechat_controller.channel.get_account(aid))
+                    and acc.is_logged_in
+                ),
+            )
             _profile.cold_start(
                 "wechat_poll_spawned",
-                threads=started,
+                threads=wechat_poll_threads,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("WeChat init failed")
@@ -2363,24 +2399,9 @@ def run_host(wechat_login_for: str | None = None) -> None:
         channel_mgr=channel_mgr,
         scheduler=scheduler,
         wechat_controller=wechat_controller,
+        wechat_bootstrap=_wechat_bootstrap,
     )
     _profile.cold_start("host_ready")
-
-    # Kick off ``--wechat [agent_id]`` as a background QR worker AFTER
-    # the host is fully constructed. The worker is a daemon thread, so
-    # the main CLI loop can still accept input (including ``/wechat
-    # cancel`` and ``/exit``) while the user decides whether to scan.
-    # Unknown agent ids short-circuit earlier via
-    # ``_resolve_wechat_login_target``.
-    if wechat_login_target:
-        if wechat_controller is None:
-            print(
-                "  [wechat] QR login skipped: WeChat channel failed to initialise "
-                "(see the error line above, if any).",
-            )
-        else:
-            accepted, msg = wechat_controller.start_qr_login(wechat_login_target)
-            print(f"  [wechat] {msg}")
 
     banner_transports = _banner_transports(
         channel_mgr,

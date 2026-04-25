@@ -84,15 +84,6 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--version", action="store_true", help="Show version and exit",
     )
-    parser.add_argument(
-        "--wechat", nargs="?", metavar="AGENT_ID", default=None, const="",
-        help=(
-            "Log a new WeChat account in via QR and bind it to AGENT_ID "
-            "(defaults to the main agent when omitted). "
-            "The scan runs in the background so the CLI stays usable "
-            "(/wechat cancel aborts the scan, /exit aborts everything)."
-        ),
-    )
     args = parser.parse_args(argv)
 
     if args.version:
@@ -115,11 +106,11 @@ def main(argv: list[str] | None = None) -> None:
     from pip_agent import _profile
 
     _profile.bootstrap()
-    _profile.cold_start("logging_ready", wechat=bool(args.wechat))
+    _profile.cold_start("logging_ready")
 
     from pip_agent.agent_host import run_host
     _profile.cold_start("run_host_imported")
-    run_host(wechat_login_for=args.wechat)
+    run_host()
 
 
 if __name__ == "__main__":

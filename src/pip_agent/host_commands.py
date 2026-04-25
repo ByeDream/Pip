@@ -116,11 +116,25 @@ class CommandContext:
     wechat_controller: "WeChatController | None" = None
     """Host hook into the multi-account WeChat lifecycle.
 
-    Set to ``None`` when the current run doesn't have the WeChat
-    channel enabled (``/wechat *`` commands then respond with a hint).
-    See :class:`pip_agent.wechat_controller.WeChatController` for the
+    Set to ``None`` when the current run hasn't built the WeChat
+    channel yet (no valid tier-3 bindings, no operator-driven QR
+    login). ``/wechat add`` will lazily call
+    :attr:`ensure_wechat_controller` to bootstrap on first use; the
+    other ``/wechat *`` sub-commands degrade with a hint instead of
+    bootstrapping silently. See
+    :class:`pip_agent.wechat_controller.WeChatController` for the
     actual surface; slash handlers never touch :class:`WeChatChannel`
     directly.
+    """
+    ensure_wechat_controller: Callable[[], "WeChatController"] | None = None
+    """Lazy bootstrap for the WeChat stack.
+
+    ``None`` outside of the live host (e.g. unit tests) — handlers
+    must check before calling. Wired by :class:`AgentHost` to its
+    :meth:`ensure_wechat_controller`, which constructs + registers the
+    WeChat channel and a :class:`WeChatController` against the host's
+    inbound queue / stop event. Raises on bootstrap failure; the
+    caller surfaces the exception as a host-level error.
     """
     invalidate_agent: Callable[[str], None] | None = None
     """Host hook to drop an agent's cached services + session rows.
@@ -214,8 +228,8 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
         # → :mod:`pip_agent.sdk_caps`), gate typos here so the user sees
         # an immediate hint instead of paying a subprocess round-trip
         # only for the SDK to reply ``"/foo isn't available in this
-        # environment."``. When caps are still unknown (boot before the
-        # first agent turn), we fall through and let the SDK arbitrate.
+        # environment."``. Non-slash payloads pass through verbatim —
+        # ``/T`` is "raw passthrough", no further rules.
         if payload.startswith("/"):
             first_token = payload.split(None, 1)[0]
             slash_name = first_token.lstrip("/").strip().lower()
@@ -289,10 +303,12 @@ Available commands:
 
   /T <text>                     Forward <text> to the SDK as a raw prompt
                                 (e.g. `/T /compact` to dispatch a Claude
-                                Code slash command; typos like `/hlp` stay
-                                host errors, never LLM turns).
-                                Some slashes are interactive-only and won't
-                                work in SDK mode (`/login`, `/clear`).
+                                Code slash command; typos like `/T /hlp`
+                                stay host errors, never LLM turns).
+                                Some slashes are interactive-only and
+                                won't work in SDK mode (`/login`,
+                                `/clear`). Available SDK slashes are
+                                listed at the end of `/help` once known.
 
   /help                         Show this help
   /status                       Show current agent / session / binding
@@ -323,7 +339,11 @@ CLI-only commands (unavailable on remote channels):
   /wechat list                  List registered WeChat accounts + bindings
   /wechat add <agent_id>        Start QR login; bind new account to <agent_id>
   /wechat cancel                Abort an in-progress QR login
-  /wechat remove <account_id>   Stop polling, delete credential + binding
+  /wechat remove <id>           Stop polling, delete credential + binding.
+                                <id> = an account_id (LHS of `/wechat
+                                list`) → removes that one account, or
+                                an agent_id (RHS) → detaches every WeChat
+                                account currently bound to that agent.
 
   /subagent                     pip-boy only: list known sub-agents
   /subagent create <label>      pip-boy only: create a new sub-agent.
@@ -359,16 +379,21 @@ def _cmd_help(ctx: CommandContext, _args: str) -> CommandResult:
     text = _HELP_COMMON
     if ctx.inbound.channel == "cli":
         text = text + "\n" + _HELP_CLI_EXTRA
+    # Surface what ``/T <slash>`` will actually dispatch in the current
+    # SDK session. Cached lazily on the first ``SystemMessage(init)``
+    # (see :mod:`pip_agent.sdk_caps`); absent before any agent turn has
+    # run, so we render a placeholder explaining the lazy-fill instead
+    # of silently omitting the section.
     caps = sdk_caps.get()
     if caps:
-        # Surface what ``/T <slash>`` will actually dispatch in the
-        # current SDK session. Cached lazily on the first
-        # ``SystemMessage(init)``; absent before any agent turn has run.
         slashes = ", ".join(f"/{n}" for n in sorted(caps))
-        text = (
-            f"{text}\n\nSDK passthrough slashes (use with `/T`):\n"
-            f"  {slashes}"
+        body = f"  {slashes}"
+    else:
+        body = (
+            "  (populated after the first agent turn — send any message "
+            "to this agent first, then re-run `/help`)"
         )
+    text = f"{text}\n\nSDK passthrough slashes (use with `/T`):\n{body}"
     return CommandResult(handled=True, response=text)
 
 
@@ -1517,7 +1542,9 @@ _WECHAT_USAGE = (
     "  /wechat list                   — show registered accounts + bindings\n"
     "  /wechat add <agent_id>         — start QR login, bind new account to <agent_id>\n"
     "  /wechat cancel                 — abort an in-progress QR login\n"
-    "  /wechat remove <account_id>    — stop polling, delete credential + binding"
+    "  /wechat remove <id>            — stop polling, delete credential + binding\n"
+    "                                   (<id> = account_id [removes one]\n"
+    "                                        or agent_id  [detaches all of its accounts])"
 )
 
 
@@ -1534,14 +1561,28 @@ def _cmd_wechat(ctx: CommandContext, args: str) -> CommandResult:
     sub = tail[0].lower() if tail else ""
     rest = tail[1:]
 
+    # ``add`` is the bootstrap entry point — when the WeChat stack
+    # hasn't been built yet (no valid tier-3 bindings at boot),
+    # construct it now via the host callback. This removes the need
+    # for a launch flag: a fresh install can ``/wechat add <agent_id>``
+    # to scan its first account without restarting.
+    if controller is None and sub == "add" and ctx.ensure_wechat_controller is not None:
+        try:
+            controller = ctx.ensure_wechat_controller()
+        except Exception as exc:  # noqa: BLE001
+            return CommandResult(
+                handled=True,
+                response=f"WeChat init failed: {exc}",
+            )
+
     if controller is None:
         return CommandResult(
             handled=True,
             response=(
-                "WeChat channel is not active for this run. Launch with "
-                "`pip-boy --wechat <agent_id>` to initialise it, or drop "
-                "a credential file under `.pip/credentials/wechat/` and "
-                "restart."
+                "WeChat channel is not active for this run. "
+                "Run `/wechat add <agent_id>` to scan a new account in, "
+                "or drop a credential file under "
+                "`.pip/credentials/wechat/` and restart."
             ),
         )
 
@@ -1590,16 +1631,53 @@ def _cmd_wechat(ctx: CommandContext, args: str) -> CommandResult:
         if not rest:
             return CommandResult(
                 handled=True,
-                response="Usage: /wechat remove <account_id>",
+                response="Usage: /wechat remove <account_id|agent_id>",
             )
-        account_id = rest[0]
-        removed = controller.remove_account(account_id)
+        target = rest[0]
+        # Preferred path: ``target`` is an account_id (the canonical
+        # primary key, what ``/wechat list`` displays on the LHS).
+        # account_id → agent_id is globally unique because
+        # ``WeChatController._qr_worker`` always rewrites the binding on
+        # re-scan, so an account_id resolves to at most one binding.
+        if controller.remove_account(target):
+            return CommandResult(
+                handled=True,
+                response=f"Removed account {target} (credential + binding).",
+            )
+        # Fallback: ``target`` may be an agent_id. The ``/wechat list``
+        # output shows ``account_id -> agent_id``; users naturally try
+        # the RHS too. Semantics: detach **every** WeChat account from
+        # this agent (one agent → many accounts is allowed). We list
+        # what was removed so the operator can see the blast radius.
+        bound = [
+            b.match_value
+            for b in ctx.bindings.list_all()
+            if b.tier == 3
+            and b.match_key == "account_id"
+            and b.agent_id == target
+            and (b.match_value or "").strip()
+        ]
+        if not bound:
+            return CommandResult(
+                handled=True,
+                response=(
+                    f"No account or binding found for {target!r}. "
+                    "Run `/wechat list` to see registered accounts."
+                ),
+            )
+        removed = [aid for aid in bound if controller.remove_account(aid)]
+        if not removed:
+            return CommandResult(
+                handled=True,
+                response=f"No accounts removed for agent {target!r}.",
+            )
+        plural = "s" if len(removed) > 1 else ""
+        ids = ", ".join(removed)
         return CommandResult(
             handled=True,
             response=(
-                f"Removed account {account_id} (credential + binding)."
-                if removed else
-                f"No account or binding found for {account_id!r}."
+                f"Removed {len(removed)} account{plural} bound to "
+                f"agent {target!r}: {ids} (credential + binding)."
             ),
         )
 

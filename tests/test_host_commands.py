@@ -89,13 +89,16 @@ def _build_ctx(
     memory_store: _FakeMemoryStore | None = None,
     scheduler: Any | None = None,
     invalidate_agent: Any | None = None,
+    wechat_controller: Any | None = None,
+    bindings: BindingTable | None = None,
 ) -> CommandContext:
     # v2 layout: workspace root is the source of truth; each agent
     # has its own nested ``.pip/`` dir.
     workspace = tmp_path / "workspace"
     (workspace / ".pip").mkdir(parents=True, exist_ok=True)
     registry = AgentRegistry(workspace)
-    bindings = BindingTable()
+    if bindings is None:
+        bindings = BindingTable()
     return CommandContext(
         inbound=inbound,
         registry=registry,
@@ -104,6 +107,7 @@ def _build_ctx(
         memory_store=memory_store,  # type: ignore[arg-type]
         scheduler=scheduler,
         invalidate_agent=invalidate_agent,
+        wechat_controller=wechat_controller,
     )
 
 
@@ -211,8 +215,9 @@ class TestDispatchRecognition:
     def test_slash_t_text_payload_passes_through_unchecked(
         self, tmp_path: Path,
     ):
-        # Non-slash payload (e.g. ``/T hello``) is plain text the user
-        # wants delivered raw to the model — no slash gating applies.
+        # ``/T`` is "raw passthrough" — non-slash payloads forward to the
+        # SDK verbatim with no host-level gating, even when caps are
+        # known. Slash gating only applies to ``/...`` payloads.
         from pip_agent import sdk_caps
         sdk_caps.reset_for_test()
         sdk_caps.record(["compact"])
@@ -220,7 +225,7 @@ class TestDispatchRecognition:
             ctx = _build_ctx(_cli_inbound("/T hello world"), tmp_path)
             result = dispatch_command(ctx)
             assert result.handled is False
-            assert result.agent_user_text == "/T hello world".split(" ", 1)[1]
+            assert result.agent_user_text == "hello world"
         finally:
             sdk_caps.reset_for_test()
 
@@ -347,6 +352,40 @@ class TestHandlerOutputs:
             "/exit",
         ):
             assert cmd in body, cmd
+
+    def test_help_renders_sdk_passthrough_section_when_unknown(
+        self, tmp_path: Path,
+    ):
+        # ``sdk_caps`` is empty pre-init. /help must still announce the
+        # SDK passthrough section so the user knows the feature exists
+        # and how to populate it (otherwise they'd think /T has no
+        # supported slashes at all).
+        from pip_agent import sdk_caps
+        sdk_caps.reset_for_test()
+        try:
+            ctx = _build_ctx(_cli_inbound("/help"), tmp_path)
+            result = dispatch_command(ctx)
+            body = result.response or ""
+            assert "SDK passthrough slashes" in body
+            assert "after the first agent turn" in body
+        finally:
+            sdk_caps.reset_for_test()
+
+    def test_help_lists_sdk_passthrough_slashes_when_known(
+        self, tmp_path: Path,
+    ):
+        from pip_agent import sdk_caps
+        sdk_caps.reset_for_test()
+        sdk_caps.record(["/compact", "/context"])
+        try:
+            ctx = _build_ctx(_cli_inbound("/help"), tmp_path)
+            result = dispatch_command(ctx)
+            body = result.response or ""
+            assert "SDK passthrough slashes" in body
+            assert "/compact" in body
+            assert "/context" in body
+        finally:
+            sdk_caps.reset_for_test()
 
     def test_help_on_remote_hides_cli_only_commands(self, tmp_path: Path):
         # WeCom / WeChat users must not even learn that /subagent and
@@ -1445,6 +1484,176 @@ class TestSubagentReset:
         result = dispatch_command(reset_ctx)
         assert result.handled, result.response
         assert called == ["helper"]
+
+
+# ---------------------------------------------------------------------------
+# /wechat remove — accepts account_id (LHS of `/wechat list`) or agent_id
+# when that agent has exactly one bound account. Multi-account agents
+# refuse to guess.
+# ---------------------------------------------------------------------------
+
+
+class _FakeWeChatController:
+    """Minimal ``WeChatController`` stub for ``/wechat`` dispatch tests."""
+
+    def __init__(self, accounts: set[str] | None = None) -> None:
+        self._accounts = set(accounts or set())
+        self.removed: list[str] = []
+        self.qr_calls: list[str] = []
+
+    def remove_account(self, account_id: str) -> bool:
+        if account_id in self._accounts:
+            self._accounts.remove(account_id)
+            self.removed.append(account_id)
+            return True
+        return False
+
+    def start_qr_login(self, agent_id: str) -> tuple[bool, str]:
+        self.qr_calls.append(agent_id)
+        return True, f"QR scan started for agent {agent_id}"
+
+
+class TestWechatRemove:
+    def test_remove_by_account_id_succeeds(self, tmp_path: Path) -> None:
+        from pip_agent.routing import Binding
+        bindings = BindingTable()
+        bindings.add(Binding(
+            agent_id="test", tier=3,
+            match_key="account_id", match_value="bot-a@im.bot",
+        ))
+        wc = _FakeWeChatController({"bot-a@im.bot"})
+        ctx = _build_ctx(
+            _cli_inbound("/wechat remove bot-a@im.bot"), tmp_path,
+            wechat_controller=wc, bindings=bindings,
+        )
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        assert "Removed account bot-a@im.bot" in (result.response or "")
+        assert wc.removed == ["bot-a@im.bot"]
+
+    def test_remove_by_agent_id_when_unique(self, tmp_path: Path) -> None:
+        from pip_agent.routing import Binding
+        bindings = BindingTable()
+        bindings.add(Binding(
+            agent_id="test", tier=3,
+            match_key="account_id", match_value="bot-a@im.bot",
+        ))
+        wc = _FakeWeChatController({"bot-a@im.bot"})
+        ctx = _build_ctx(
+            _cli_inbound("/wechat remove test"), tmp_path,
+            wechat_controller=wc, bindings=bindings,
+        )
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        body = result.response or ""
+        assert "bot-a@im.bot" in body
+        assert "test" in body
+        assert wc.removed == ["bot-a@im.bot"]
+
+    def test_remove_by_agent_id_detaches_all_bound_accounts(
+        self, tmp_path: Path,
+    ) -> None:
+        # One agent → many WeChat accounts is allowed (an account_id is
+        # globally unique, but an agent can host several). ``/wechat
+        # remove <agent_id>`` is the "stop using WeChat for this agent"
+        # button; it detaches every bound account in one go and reports
+        # the blast radius so the operator can audit it.
+        from pip_agent.routing import Binding
+        bindings = BindingTable()
+        bindings.add(Binding(
+            agent_id="dual", tier=3,
+            match_key="account_id", match_value="bot-a@im.bot",
+        ))
+        bindings.add(Binding(
+            agent_id="dual", tier=3,
+            match_key="account_id", match_value="bot-b@im.bot",
+        ))
+        wc = _FakeWeChatController({"bot-a@im.bot", "bot-b@im.bot"})
+        ctx = _build_ctx(
+            _cli_inbound("/wechat remove dual"), tmp_path,
+            wechat_controller=wc, bindings=bindings,
+        )
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        body = result.response or ""
+        assert "Removed 2 accounts" in body
+        assert "dual" in body
+        assert "bot-a@im.bot" in body
+        assert "bot-b@im.bot" in body
+        assert sorted(wc.removed) == ["bot-a@im.bot", "bot-b@im.bot"]
+
+    def test_add_lazily_bootstraps_when_controller_absent(
+        self, tmp_path: Path,
+    ) -> None:
+        # Fresh install: no bindings, no boot-time WeChat. ``/wechat
+        # add`` is the only entry point now (no more ``--wechat`` flag),
+        # so it must self-bootstrap via ``ensure_wechat_controller``.
+        wc = _FakeWeChatController()
+        ensured: list[str] = []
+
+        def _ensure() -> Any:
+            ensured.append("called")
+            return wc
+
+        ctx = _build_ctx(
+            _cli_inbound("/wechat add pip-boy"), tmp_path,
+            wechat_controller=None,
+        )
+        ctx.ensure_wechat_controller = _ensure  # type: ignore[assignment]
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        assert ensured == ["called"]
+        assert wc.qr_calls == ["pip-boy"]
+        assert "QR scan started" in (result.response or "")
+
+    def test_add_surfaces_bootstrap_failure(self, tmp_path: Path) -> None:
+        def _boom() -> Any:
+            raise RuntimeError("disk full")
+
+        ctx = _build_ctx(
+            _cli_inbound("/wechat add pip-boy"), tmp_path,
+            wechat_controller=None,
+        )
+        ctx.ensure_wechat_controller = _boom  # type: ignore[assignment]
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        body = result.response or ""
+        assert "WeChat init failed" in body
+        assert "disk full" in body
+
+    def test_list_does_not_bootstrap(self, tmp_path: Path) -> None:
+        # Only ``add`` triggers bootstrap. ``list``/``cancel``/``remove``
+        # without an active controller stay as informational hints —
+        # there's nothing for them to operate on yet.
+        called: list[str] = []
+
+        def _ensure() -> Any:
+            called.append("nope")
+            raise AssertionError("must not bootstrap on /wechat list")
+
+        ctx = _build_ctx(
+            _cli_inbound("/wechat list"), tmp_path,
+            wechat_controller=None,
+        )
+        ctx.ensure_wechat_controller = _ensure  # type: ignore[assignment]
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        assert called == []
+        assert "/wechat add" in (result.response or "")
+
+    def test_remove_unknown_target_points_to_list(self, tmp_path: Path) -> None:
+        bindings = BindingTable()
+        wc = _FakeWeChatController(set())
+        ctx = _build_ctx(
+            _cli_inbound("/wechat remove ghost"), tmp_path,
+            wechat_controller=wc, bindings=bindings,
+        )
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        body = result.response or ""
+        assert "ghost" in body
+        assert "/wechat list" in body
+        assert wc.removed == []
 
 
 # ---------------------------------------------------------------------------
