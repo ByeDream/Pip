@@ -5,6 +5,7 @@ You MUST call at least one tool before replying — do not short-circuit to `HEA
 - `memory_search` with a broad query (e.g. `"recent"`, the user's name, current project) to surface what's been on their mind.
 - `Bash` for a quick `git status` / `git log --oneline -5` if the user has been coding.
 - `cron_list` to surface anything overdue or misconfigured.
+- `reflect` to extract observations from the current session's transcript delta. Cheap when the cursor hasn't moved (no LLM call); useful when there's been substantive interaction since the last reflect / compact.
 
 After the tool returns, decide:
 

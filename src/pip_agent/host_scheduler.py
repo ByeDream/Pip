@@ -52,6 +52,15 @@ _TICK_SECONDS = 5.0
 _CRON_FILE = "cron.json"
 _HEARTBEAT_FILE = "HEARTBEAT.md"
 
+# Heartbeat cooldown after any completed turn. While
+# ``now - last_activity_at < _HEARTBEAT_COOLDOWN_SECONDS`` we suppress
+# heartbeat ticks WITHOUT advancing ``state.last_fire_at``, so the moment
+# the cooldown clears the next 5 s tick can fire — we are deferring, not
+# dropping, the missed interval. Hard-coded by design: this is a UX
+# guardrail (don't fire while the user is actively chatting), not a
+# tuning knob.
+_HEARTBEAT_COOLDOWN_SECONDS = 60
+
 # Cron auto-disable: after this many consecutive failed runs, flip
 # ``enabled=False`` on the job so we stop burning an SDK cold start every
 # interval on something that is broken. The count resets to 0 on the first
@@ -66,6 +75,16 @@ _DREAM_CYCLE_KEY = "dream_cycle_count"
 # gate compares against it. Defined here to keep the contract visible
 # from the scheduler side.
 _LAST_ACTIVITY_KEY = "last_activity_at"
+
+# Reply target of the most recent NON-scheduler inbound. Written by
+# ``AgentHost._prepare_turn`` whenever a real user message arrives,
+# read by ``_tick_heartbeat`` to route the heartbeat back to wherever
+# the user last spoke from (instead of the old hard-coded CLI). Group
+# inbounds are deliberately excluded on the write side so a heartbeat
+# never barges into a group chat.
+_LAST_INBOUND_CHANNEL_KEY = "last_inbound_channel"
+_LAST_INBOUND_PEER_KEY = "last_inbound_peer_id"
+_LAST_INBOUND_ACCOUNT_KEY = "last_inbound_account_id"
 
 
 class _Sender:
@@ -795,6 +814,26 @@ class HostScheduler:
     def _tick_heartbeat(
         self, agent_id: str, pip_dir: Path, now: float,
     ) -> None:
+        """Maybe enqueue one heartbeat for ``agent_id``.
+
+        Gates, in order (cheapest first):
+
+        1. ``HEARTBEAT.md`` exists.
+        2. ``heartbeat_interval > 0`` and we're in the active window.
+        3. ``state.last_fire_at`` says the interval has elapsed.
+        4. **Activity cooldown** — if any turn (user, cron, heartbeat)
+           completed within the last ``_HEARTBEAT_COOLDOWN_SECONDS``,
+           skip *without* advancing ``state.last_fire_at`` so the next
+           tick after the cooldown clears fires immediately rather than
+           waiting another full interval.
+        5. Pending coalesce — previous heartbeat still in flight.
+
+        The single ``load_state`` call inside the cooldown gate also
+        provides the channel / peer / account_id for routing; we never
+        read the agent's ``state.json`` twice in one tick. ``state.json``
+        being missing or unreadable falls open: cooldown does not block
+        and the channel falls back to the historical CLI default.
+        """
         hb_file = pip_dir / _HEARTBEAT_FILE
         if not hb_file.is_file():
             return
@@ -809,6 +848,33 @@ class HostScheduler:
         )
         if now - state.last_fire_at < interval:
             return
+
+        try:
+            state_data = self._make_store(agent_id).load_state()
+        except Exception:
+            state_data = {}
+
+        last_activity = float(state_data.get(_LAST_ACTIVITY_KEY) or 0.0)
+        if (
+            last_activity > 0
+            and (now - last_activity) < _HEARTBEAT_COOLDOWN_SECONDS
+        ):
+            # Active conversation window — defer this tick. Crucially
+            # do NOT touch ``state.last_fire_at``: as soon as the
+            # cooldown clears (60 s after the last completed turn), the
+            # very next 5 s tick will satisfy the interval gate again
+            # and fire. Setting ``last_fire_at = now`` here would push
+            # the heartbeat out by a full ``heartbeat_interval``, which
+            # is the opposite of what the user expects.
+            return
+
+        target_channel = (
+            str(state_data.get(_LAST_INBOUND_CHANNEL_KEY) or "") or "cli"
+        )
+        target_peer = (
+            str(state_data.get(_LAST_INBOUND_PEER_KEY) or "") or "cli-user"
+        )
+        target_account = str(state_data.get(_LAST_INBOUND_ACCOUNT_KEY) or "")
 
         pending_key = _pending_key_heartbeat(agent_id)
         with self._pending_lock:
@@ -843,8 +909,9 @@ class HostScheduler:
             InboundMessage(
                 text=payload,
                 sender_id=_Sender.HEARTBEAT,
-                channel="cli",
-                peer_id="cli-user",
+                channel=target_channel,
+                peer_id=target_peer,
+                account_id=target_account,
                 agent_id=agent_id,
                 source_job_id=pending_key,
             )

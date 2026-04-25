@@ -36,7 +36,12 @@ from pip_agent.channels import (
     send_with_retry,
 )
 from pip_agent.config import WORKDIR, settings
-from pip_agent.host_scheduler import HostScheduler
+from pip_agent.host_scheduler import (
+    _LAST_INBOUND_ACCOUNT_KEY,
+    _LAST_INBOUND_CHANNEL_KEY,
+    _LAST_INBOUND_PEER_KEY,
+    HostScheduler,
+)
 from pip_agent.mcp_tools import McpContext
 from pip_agent.memory import MemoryStore
 from pip_agent.memory.transcript_source import locate_session_jsonl
@@ -154,6 +159,56 @@ def _is_ephemeral_sender(sender_id: str) -> bool:
     add it here. User / channel messages are never ephemeral.
     """
     return sender_id in (_CRON_SENDER, _HEARTBEAT_SENDER)
+
+
+def _persist_last_inbound_target(
+    inbound: InboundMessage,
+    memory_store: MemoryStore,
+    *,
+    agent_id: str = "",
+) -> bool:
+    """Stamp the heartbeat reply target into ``state.json``.
+
+    Records ``(channel, peer_id, account_id)`` of ``inbound`` so the
+    host scheduler can route the next heartbeat back to wherever the
+    user last spoke from, instead of falling through to the historical
+    CLI default. Returns ``True`` if a write happened, ``False`` if the
+    inbound was filtered out.
+
+    Filters (each one prevents the write entirely):
+
+    * **Scheduler-injected senders** — letting ``__cron__`` /
+      ``__heartbeat__`` overwrite the channel would clobber the user's
+      real channel onto the scheduler's ``cli`` default the moment any
+      background turn fires, defeating the whole feature.
+    * **Group inbounds** (``is_group=True``) — heartbeat is a 1:1
+      proactive nudge; broadcasting "checking in" into a guild is the
+      wrong default.
+    * **Empty channel** — nothing meaningful to record.
+
+    Failures (corrupt state, disk error) are swallowed at debug level —
+    the heartbeat scheduler's read side falls open to CLI, so a missed
+    write degrades gracefully.
+    """
+    if inbound.sender_id in (_CRON_SENDER, _HEARTBEAT_SENDER):
+        return False
+    if inbound.is_group:
+        return False
+    if not inbound.channel:
+        return False
+    try:
+        st = memory_store.load_state()
+        st[_LAST_INBOUND_CHANNEL_KEY] = inbound.channel
+        st[_LAST_INBOUND_PEER_KEY] = inbound.peer_id or ""
+        st[_LAST_INBOUND_ACCOUNT_KEY] = inbound.account_id or ""
+        memory_store.save_state(st)
+        return True
+    except Exception:
+        log.debug(
+            "persist last_inbound_* failed for agent=%s",
+            agent_id, exc_info=True,
+        )
+        return False
 
 
 @dataclass
@@ -1489,6 +1544,14 @@ class AgentHost:
                 eff = resolve_effective_config(agent_cfg, binding)
 
                 svc = self._get_agent_services(eff.id)
+
+                # Stamp the heartbeat reply target so the scheduler can
+                # route the next heartbeat back to whichever channel the
+                # user last spoke from (skips scheduler-injected /
+                # group inbounds — see helper for the contract).
+                _persist_last_inbound_target(
+                    inbound, svc.memory_store, agent_id=eff.id,
+                )
 
             # Short-circuit host-layer slash commands BEFORE we do the more
             # expensive prompt enrichment + SDK subprocess spawn. Dispatch

@@ -194,12 +194,16 @@ class TestAddressbookLazyLoad:
 
     def test_enrich_prompt_never_injects_addressbook(self, tmp_path: Path):
         store, _ = self._seed_sub_agent_store(tmp_path)
-        # Populate the workspace addressbook with a contact that has
-        # very distinctive content — if any byte of it leaks into the
-        # system prompt, the assertion below will spot it.
+        # Populate the workspace addressbook with a contact whose
+        # fields are obvious nonsense tokens — they MUST be unique
+        # enough that ``not in out`` can't be tripped by the rendered
+        # ``workdir`` (``tmp_path`` typically embeds the OS username,
+        # so realistic names like "Eric" alias straight onto a
+        # ``C:\Users\Eric...`` substring on dev machines).
         store.create_contact(
             sender_id="cli-user", channel="cli",
-            name="Eric", call_me="Eric", notes="Pacific time",
+            name="Zorblax", call_me="Zorblax",
+            notes="addressbook-leak-canary-xyzzy",
         )
 
         out = store.enrich_prompt(
@@ -210,8 +214,8 @@ class TestAddressbookLazyLoad:
         )
         assert "## Addressbook" not in out
         assert "## User" not in out
-        assert "Eric" not in out
-        assert "Pacific time" not in out
+        assert "Zorblax" not in out
+        assert "addressbook-leak-canary-xyzzy" not in out
 
     def test_empty_addressbook_is_also_silent(self, tmp_path: Path):
         """No contacts → no placeholder heading either."""

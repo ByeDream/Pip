@@ -364,6 +364,160 @@ class TestHeartbeatTick:
         assert queue[0].sender_id == _Sender.HEARTBEAT
 
 
+class TestHeartbeatCooldown:
+    """Activity cooldown: any turn (user, cron, heartbeat) completed within
+    the last ``_HEARTBEAT_COOLDOWN_SECONDS`` (60 s) blocks the next
+    heartbeat tick *without* consuming the interval. Once the cooldown
+    clears, the very next tick fires — we defer, not drop.
+    """
+
+    @staticmethod
+    def _arm(tmp_path: Path):
+        """Common test setup: HEARTBEAT.md + interval-already-elapsed state."""
+        sched, queue, _ = _make_sched(tmp_path)
+        (tmp_path / "agents" / "pip-boy" / "HEARTBEAT.md").write_text(
+            "ping", encoding="utf-8",
+        )
+        now = time.time()
+        sched._heartbeat_state["pip-boy"] = _HeartbeatState(last_fire_at=now - 120)
+        return sched, queue, now
+
+    @patch("pip_agent.host_scheduler.settings")
+    def test_recent_activity_blocks_fire(
+        self, mock_settings, tmp_path: Path
+    ):
+        mock_settings.heartbeat_interval = 60
+        mock_settings.heartbeat_active_start = 0
+        mock_settings.heartbeat_active_end = 24
+        sched, queue, now = self._arm(tmp_path)
+        sched._make_store("pip-boy").save_state(
+            {"last_activity_at": now - 30}
+        )
+
+        sched._tick(now)
+
+        assert queue == []
+
+    @patch("pip_agent.host_scheduler.settings")
+    def test_cooldown_does_not_consume_interval(
+        self, mock_settings, tmp_path: Path
+    ):
+        """The blocked tick must NOT advance ``state.last_fire_at`` — once
+        the cooldown clears, the next tick at the same ``now`` fires.
+        """
+        mock_settings.heartbeat_interval = 60
+        mock_settings.heartbeat_active_start = 0
+        mock_settings.heartbeat_active_end = 24
+        sched, queue, now = self._arm(tmp_path)
+        store = sched._make_store("pip-boy")
+
+        store.save_state({"last_activity_at": now - 30})
+        sched._tick(now)
+        assert queue == []
+
+        store.save_state({"last_activity_at": now - 90})
+        sched._tick(now)
+        assert len(queue) == 1
+        assert queue[0].sender_id == _Sender.HEARTBEAT
+
+    @patch("pip_agent.host_scheduler.settings")
+    def test_stale_activity_does_not_block(
+        self, mock_settings, tmp_path: Path
+    ):
+        mock_settings.heartbeat_interval = 60
+        mock_settings.heartbeat_active_start = 0
+        mock_settings.heartbeat_active_end = 24
+        sched, queue, now = self._arm(tmp_path)
+        sched._make_store("pip-boy").save_state(
+            {"last_activity_at": now - 3600}
+        )
+
+        sched._tick(now)
+
+        assert len(queue) == 1
+
+
+class TestHeartbeatChannelFollows:
+    """Heartbeat routes to the channel/peer/account_id of the most recent
+    non-scheduler inbound, falling back to the historical CLI default
+    when no record exists yet.
+    """
+
+    @staticmethod
+    def _arm(tmp_path: Path, *, state: dict | None = None):
+        sched, queue, _ = _make_sched(tmp_path)
+        (tmp_path / "agents" / "pip-boy" / "HEARTBEAT.md").write_text(
+            "ping", encoding="utf-8",
+        )
+        now = time.time()
+        sched._heartbeat_state["pip-boy"] = _HeartbeatState(last_fire_at=now - 120)
+        if state is not None:
+            sched._make_store("pip-boy").save_state(state)
+        return sched, queue, now
+
+    @patch("pip_agent.host_scheduler.settings")
+    def test_default_when_no_state(
+        self, mock_settings, tmp_path: Path
+    ):
+        mock_settings.heartbeat_interval = 60
+        mock_settings.heartbeat_active_start = 0
+        mock_settings.heartbeat_active_end = 24
+        sched, queue, now = self._arm(tmp_path)
+
+        sched._tick(now)
+
+        assert len(queue) == 1
+        assert queue[0].channel == "cli"
+        assert queue[0].peer_id == "cli-user"
+        assert queue[0].account_id == ""
+
+    @patch("pip_agent.host_scheduler.settings")
+    def test_follows_recorded_target(
+        self, mock_settings, tmp_path: Path
+    ):
+        mock_settings.heartbeat_interval = 60
+        mock_settings.heartbeat_active_start = 0
+        mock_settings.heartbeat_active_end = 24
+        sched, queue, now = self._arm(
+            tmp_path,
+            state={
+                "last_inbound_channel": "wecom",
+                "last_inbound_peer_id": "user-abc",
+                "last_inbound_account_id": "bot-1",
+            },
+        )
+
+        sched._tick(now)
+
+        assert len(queue) == 1
+        msg = queue[0]
+        assert msg.channel == "wecom"
+        assert msg.peer_id == "user-abc"
+        assert msg.account_id == "bot-1"
+
+    @patch("pip_agent.host_scheduler.settings")
+    def test_partial_state_falls_back_per_field(
+        self, mock_settings, tmp_path: Path
+    ):
+        """A state.json with only the channel set must not leak an empty
+        ``peer_id`` into the inbound — each field falls back independently
+        to its CLI default.
+        """
+        mock_settings.heartbeat_interval = 60
+        mock_settings.heartbeat_active_start = 0
+        mock_settings.heartbeat_active_end = 24
+        sched, queue, now = self._arm(
+            tmp_path, state={"last_inbound_channel": "wecom"},
+        )
+
+        sched._tick(now)
+
+        assert len(queue) == 1
+        assert queue[0].channel == "wecom"
+        assert queue[0].peer_id == "cli-user"
+        assert queue[0].account_id == ""
+
+
 class TestCronCoalescing:
     """Regression tests for the "every-30s job floods the queue" bug.
 
