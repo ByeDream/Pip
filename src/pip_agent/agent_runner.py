@@ -244,10 +244,8 @@ async def run_query(
     cannot tell the difference between "agent is thinking" and "agent
     crashed").
     """
+    from pip_agent import _profile  # PROFILE
     from pip_agent.models import is_model_invalid_error
-
-    # PROFILE
-    from pip_agent import _profile
 
     # ``[""]`` means "no tier-resolved candidate, let the SDK pick its
     # own default". Keeping at least one element through the loop means
