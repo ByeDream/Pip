@@ -27,6 +27,7 @@ from pip_agent.mcp_tools import (
     McpContext,
     _cron_tools,
     _memory_tools,
+    _plugin_tools,
     build_mcp_server,
 )
 from pip_agent.memory import MemoryStore
@@ -662,11 +663,194 @@ class TestBuildMcpServer:
 
         mem_names = {t.name for t in _memory_tools(ctx)}
         cron_names = {t.name for t in _cron_tools(ctx)}
+        plugin_names = {t.name for t in _plugin_tools(ctx)}
         # Channel tools depend on having a channel on ctx for the
         # send_file handler to do anything useful, but they're still
         # registered here — that's precisely the regression we care
         # about (channel tools silently missing from the registry).
-        expected = mem_names | cron_names | {"send_file"}
+        expected = mem_names | cron_names | plugin_names | {"send_file"}
         assert "memory_search" in expected
         assert "cron_list" in expected
         assert "send_file" in expected
+        assert "plugin_list" in expected
+        assert "plugin_install" in expected
+
+
+# ---------------------------------------------------------------------------
+# Plugin tools — wrap the bundled Claude Code CLI; tests mock
+# ``plugins._run`` so they never spawn the real binary.
+# ---------------------------------------------------------------------------
+
+
+class TestPluginTools:
+    """Contract:
+
+    * Every tool's ``input_schema`` is well-formed for the SDK
+      (object root, scope enum where applicable).
+    * Read tools (``plugin_list``, ``plugin_marketplace_list``,
+      ``plugin_search``) emit JSON or a friendly empty-state message.
+    * Write tools (``plugin_install``, ``plugin_marketplace_add``)
+      validate the ``scope`` argument and propagate ``ctx.workdir``
+      to the subprocess for project / local scopes.
+    * Destructive operations (``uninstall``, ``disable``,
+      ``marketplace_remove``) are deliberately NOT exposed — the agent
+      only gets read + additive surface; humans drive removal via
+      ``/plugin``.
+    """
+
+    @staticmethod
+    def _patch_run(monkeypatch, results):
+        from pip_agent import plugins as plug
+
+        calls = []
+        queue = list(results)
+
+        async def _fake(*argv, cwd=None, timeout=None):
+            calls.append({"argv": list(argv), "cwd": cwd})
+            if not queue:
+                return ("", "", 0)
+            return queue.pop(0)
+
+        monkeypatch.setattr(plug, "_run", _fake)
+        return calls
+
+    def test_only_additive_ops_are_exposed(self):
+        names = {t.name for t in _plugin_tools(McpContext())}
+        assert names == {
+            "plugin_list",
+            "plugin_search",
+            "plugin_install",
+            "plugin_marketplace_add",
+            "plugin_marketplace_list",
+        }
+        # Belt-and-braces: catch the regression where a future
+        # contributor "helpfully" adds uninstall / disable to the
+        # MCP surface. Those stay on /plugin host commands.
+        assert "plugin_uninstall" not in names
+        assert "plugin_disable" not in names
+        assert "plugin_marketplace_remove" not in names
+
+    def test_install_schema_advertises_scope_enum(self):
+        tool = _tool(_plugin_tools(McpContext()), "plugin_install")
+        scope = tool.input_schema["properties"]["scope"]
+        assert scope["type"] == "string"
+        assert set(scope["enum"]) == {"user", "project", "local"}
+        assert "spec" in tool.input_schema["required"]
+
+    def test_marketplace_add_schema_requires_source(self):
+        tool = _tool(_plugin_tools(McpContext()), "plugin_marketplace_add")
+        assert "source" in tool.input_schema["required"]
+        scope = tool.input_schema["properties"]["scope"]
+        assert set(scope["enum"]) == {"user", "project", "local"}
+
+    def test_plugin_list_returns_json_text(self, monkeypatch):
+        self._patch_run(monkeypatch, [
+            (json.dumps([{"name": "x", "scope": "user"}]), "", 0),
+        ])
+        tool = _tool(_plugin_tools(McpContext()), "plugin_list")
+        result = _run(tool.handler({"available": False}))
+        assert result.get("is_error") is not True
+        parsed = json.loads(_text_of(result))
+        assert parsed[0]["name"] == "x"
+
+    def test_plugin_list_passes_available_flag(self, monkeypatch):
+        calls = self._patch_run(monkeypatch, [("[]", "", 0)])
+        tool = _tool(_plugin_tools(McpContext()), "plugin_list")
+        _run(tool.handler({"available": True}))
+        assert "--available" in calls[0]["argv"]
+
+    def test_plugin_search_empty_query_is_error(self, monkeypatch):
+        self._patch_run(monkeypatch, [])  # nothing should be called
+        tool = _tool(_plugin_tools(McpContext()), "plugin_search")
+        result = _run(tool.handler({"query": "  "}))
+        assert result.get("is_error") is True
+
+    def test_plugin_search_filters_locally(self, monkeypatch):
+        self._patch_run(monkeypatch, [
+            (json.dumps([
+                {"name": "pdf-tools", "description": "Read PDFs"},
+                {"name": "browser", "description": "Web fetch"},
+            ]), "", 0),
+        ])
+        tool = _tool(_plugin_tools(McpContext()), "plugin_search")
+        result = _run(tool.handler({"query": "pdf"}))
+        assert result.get("is_error") is not True
+        body = _text_of(result)
+        assert "pdf-tools" in body
+        assert "browser" not in body
+
+    def test_plugin_search_no_match_returns_friendly_text(self, monkeypatch):
+        self._patch_run(monkeypatch, [
+            (json.dumps([{"name": "browser", "description": "Web fetch"}]), "", 0),
+        ])
+        tool = _tool(_plugin_tools(McpContext()), "plugin_search")
+        result = _run(tool.handler({"query": "nope"}))
+        assert result.get("is_error") is not True
+        assert "no plugins matched" in _text_of(result).lower()
+
+    def test_plugin_install_default_scope_user(self, monkeypatch, tmp_path):
+        calls = self._patch_run(monkeypatch, [("ok\n", "", 0)])
+        tool = _tool(
+            _plugin_tools(McpContext(workdir=tmp_path)), "plugin_install",
+        )
+        result = _run(tool.handler({"spec": "web-search"}))
+        assert result.get("is_error") is not True
+        assert calls[0]["argv"] == [
+            "plugin", "install", "web-search", "-s", "user",
+        ]
+
+    def test_plugin_install_project_scope_uses_workdir(
+        self, monkeypatch, tmp_path,
+    ):
+        calls = self._patch_run(monkeypatch, [("ok\n", "", 0)])
+        tool = _tool(
+            _plugin_tools(McpContext(workdir=tmp_path)), "plugin_install",
+        )
+        _run(tool.handler({"spec": "foo", "scope": "project"}))
+        assert calls[0]["argv"][-2:] == ["-s", "project"]
+        # cwd MUST be the agent's workdir for project / local scopes
+        # — otherwise CC writes to ``.claude/`` in the host's cwd and
+        # per-agent isolation breaks.
+        assert calls[0]["cwd"] == tmp_path
+
+    def test_plugin_install_invalid_scope_is_error(self, monkeypatch):
+        self._patch_run(monkeypatch, [])  # nothing should be called
+        tool = _tool(_plugin_tools(McpContext()), "plugin_install")
+        result = _run(tool.handler({"spec": "x", "scope": "global"}))
+        assert result.get("is_error") is True
+        assert "invalid scope" in _text_of(result).lower()
+
+    def test_marketplace_list_empty_state_is_friendly(self, monkeypatch):
+        self._patch_run(monkeypatch, [("\n", "", 0)])
+        tool = _tool(_plugin_tools(McpContext()), "plugin_marketplace_list")
+        result = _run(tool.handler({}))
+        assert result.get("is_error") is not True
+        assert "no marketplaces configured" in _text_of(result).lower()
+
+    def test_marketplace_add_propagates_source_and_scope(
+        self, monkeypatch, tmp_path,
+    ):
+        calls = self._patch_run(monkeypatch, [("added\n", "", 0)])
+        tool = _tool(
+            _plugin_tools(McpContext(workdir=tmp_path)),
+            "plugin_marketplace_add",
+        )
+        result = _run(tool.handler(
+            {"source": "anthropics/claude-code", "scope": "local"},
+        ))
+        assert result.get("is_error") is not True
+        argv = calls[0]["argv"]
+        assert argv == [
+            "plugin", "marketplace", "add",
+            "anthropics/claude-code", "--scope", "local",
+        ]
+        assert calls[0]["cwd"] == tmp_path
+
+    def test_subprocess_error_becomes_is_error(self, monkeypatch):
+        self._patch_run(monkeypatch, [
+            ("", "marketplace not registered", 1),
+        ])
+        tool = _tool(_plugin_tools(McpContext()), "plugin_install")
+        result = _run(tool.handler({"spec": "x"}))
+        assert result.get("is_error") is True
+        assert "marketplace not registered" in _text_of(result)

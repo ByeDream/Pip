@@ -261,7 +261,13 @@ async def run_query(
                     else None
                 ),
                 permission_mode="bypassPermissions",
-                setting_sources=["project", "user"],
+                # Load all three Claude Code settings tiers so plugins
+                # installed via ``/plugin install --scope {user|project|local}``
+                # are picked up by the next ``query()`` regardless of where
+                # the user (or agent) chose to land them. ``local`` files
+                # are silently absent on a fresh checkout — that's fine,
+                # the SDK skips missing sources.
+                setting_sources=["user", "project", "local"],
                 env=_build_env(),
                 mcp_servers={"pip": mcp_server},
                 hooks=hooks,

@@ -1660,6 +1660,219 @@ class TestWechatRemove:
 
 
 # ---------------------------------------------------------------------------
+# /plugin dispatch — wraps the bundled Claude Code CLI; we mock the
+# subprocess seam (``plugins._run``) so tests never hit the real binary.
+# ---------------------------------------------------------------------------
+
+
+class TestPluginDispatch:
+
+    @staticmethod
+    def _patch_run(monkeypatch, results: list[tuple[str, str, int]]):
+        """Replace ``plugins._run`` with a recorder.
+
+        ``results`` queues ``(stdout, stderr, returncode)`` per call so
+        a single test can simulate multi-step flows (e.g. ``search`` →
+        ``list --available --json``).
+        """
+        from pip_agent import plugins as plug
+
+        calls: list[dict[str, Any]] = []
+        queue = list(results)
+
+        async def _fake(*argv: str, cwd=None, timeout=None):
+            calls.append({"argv": list(argv), "cwd": cwd})
+            if not queue:
+                return ("", "", 0)
+            return queue.pop(0)
+
+        monkeypatch.setattr(plug, "_run", _fake)
+        return calls
+
+    def test_help_prints_usage(self, tmp_path: Path):
+        ctx = _build_ctx(_cli_inbound("/plugin"), tmp_path)
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        assert "/plugin install" in (result.response or "")
+
+    def test_list_installed(self, tmp_path: Path, monkeypatch):
+        import json as _json
+
+        calls = self._patch_run(monkeypatch, [
+            (_json.dumps([
+                {"name": "web-search", "scope": "user", "description": "Web search"},
+            ]), "", 0),
+        ])
+        ctx = _build_ctx(_cli_inbound("/plugin list"), tmp_path)
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        body = result.response or ""
+        assert "web-search" in body
+        assert "scope=user" in body
+        # Argv must NOT carry --available unless explicitly requested.
+        argv = calls[0]["argv"]
+        assert "--available" not in argv
+        assert "--json" in argv
+
+    def test_list_available_passes_flag(self, tmp_path: Path, monkeypatch):
+        calls = self._patch_run(monkeypatch, [("[]", "", 0)])
+        ctx = _build_ctx(_cli_inbound("/plugin list --available"), tmp_path)
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        assert "--available" in calls[0]["argv"]
+
+    def test_list_available_unwraps_envelope_shape(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # Regression guard: the bundled CLI returns
+        # ``{"installed":[],"available":[…]}`` for ``--available``,
+        # not a flat array. The host previously wrapped the dict in a
+        # one-element list and rendered "Available plugins (1): ?".
+        # We assert end-to-end that the names land in the response and
+        # the count is the marketplace catalogue size.
+        import json as _json
+
+        envelope = _json.dumps({
+            "installed": [],
+            "available": [
+                {
+                    "name": "exa",
+                    "description": "Exa AI web search",
+                    "marketplaceName": "claude-plugins-official",
+                },
+                {
+                    "name": "firecrawl",
+                    "description": "Web scraping + LLM-ready markdown",
+                    "marketplaceName": "claude-plugins-official",
+                },
+            ],
+        })
+        self._patch_run(monkeypatch, [(envelope, "", 0)])
+        ctx = _build_ctx(_cli_inbound("/plugin list --available"), tmp_path)
+        result = dispatch_command(ctx)
+        body = result.response or ""
+        assert "Available plugins (2):" in body
+        assert "exa" in body
+        assert "firecrawl" in body
+        # marketplaceName should surface as ``market=`` annotation.
+        assert "market=claude-plugins-official" in body
+        # No literal dict / question-mark fallback in the output.
+        assert "': '" not in body
+        assert " ?" not in body.replace(" - ", " ")
+
+    def test_search_filters_locally(self, tmp_path: Path, monkeypatch):
+        import json as _json
+
+        self._patch_run(monkeypatch, [
+            (_json.dumps([
+                {"name": "pdf-tools", "description": "Read PDFs"},
+                {"name": "browser", "description": "Web fetch"},
+            ]), "", 0),
+        ])
+        ctx = _build_ctx(_cli_inbound("/plugin search pdf"), tmp_path)
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        body = result.response or ""
+        assert "pdf-tools" in body
+        assert "browser" not in body
+
+    def test_install_default_scope_user(self, tmp_path: Path, monkeypatch):
+        calls = self._patch_run(monkeypatch, [("Installed.\n", "", 0)])
+        ctx = _build_ctx(_cli_inbound("/plugin install web-search"), tmp_path)
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        argv = calls[0]["argv"]
+        assert argv == [
+            "plugin", "install", "web-search", "-s", "user",
+        ]
+
+    def test_install_project_scope_uses_active_agent_cwd(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # The host MUST hand the subprocess the active agent's workdir
+        # for project / local scopes; otherwise the resulting
+        # ``.claude/`` lands in the host's cwd, defeating per-agent
+        # isolation. ``_active_agent_cwd`` reads it from the registry,
+        # which our default ``_build_ctx`` initialises against
+        # ``<tmp_path>/workspace``.
+        calls = self._patch_run(monkeypatch, [("ok\n", "", 0)])
+        ctx = _build_ctx(
+            _cli_inbound("/plugin install foo --scope project"), tmp_path,
+        )
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        argv = calls[0]["argv"]
+        assert argv[-2:] == ["-s", "project"]
+        # cwd must be a real Path under the test workspace, not None.
+        assert calls[0]["cwd"] is not None
+        assert "workspace" in str(calls[0]["cwd"])
+
+    def test_install_invalid_scope_fails_fast(self, tmp_path: Path, monkeypatch):
+        # Bad ``--scope`` must be rejected at the host BEFORE we spawn
+        # ``claude.exe`` — otherwise the user gets a confusing CLI
+        # error instead of an actionable host hint.
+        called = self._patch_run(monkeypatch, [])
+        ctx = _build_ctx(
+            _cli_inbound("/plugin install foo --scope global"), tmp_path,
+        )
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        body = (result.response or "").lower()
+        assert "invalid scope" in body
+        assert called == []
+
+    def test_marketplace_add_default_scope_user(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        calls = self._patch_run(monkeypatch, [("added\n", "", 0)])
+        ctx = _build_ctx(
+            _cli_inbound("/plugin marketplace add anthropics/claude-code"),
+            tmp_path,
+        )
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        argv = calls[0]["argv"]
+        assert argv == [
+            "plugin", "marketplace", "add",
+            "anthropics/claude-code", "--scope", "user",
+        ]
+
+    def test_marketplace_list_renders_items(self, tmp_path: Path, monkeypatch):
+        import json as _json
+
+        self._patch_run(monkeypatch, [
+            (_json.dumps([{"name": "official", "source": "anthropics/claude-code"}]),
+             "", 0),
+        ])
+        ctx = _build_ctx(_cli_inbound("/plugin marketplace list"), tmp_path)
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        body = result.response or ""
+        assert "official" in body
+        assert "anthropics/claude-code" in body
+
+    def test_subprocess_error_is_surfaced_tersely(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        self._patch_run(monkeypatch, [
+            ("", "marketplace 'foo' not found", 1),
+        ])
+        ctx = _build_ctx(_cli_inbound("/plugin install foo"), tmp_path)
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        body = result.response or ""
+        assert "Plugin command failed" in body
+        assert "marketplace 'foo' not found" in body
+
+    def test_unknown_subcommand_hints_close_match(self, tmp_path: Path):
+        ctx = _build_ctx(_cli_inbound("/plugin instal foo"), tmp_path)
+        result = dispatch_command(ctx)
+        assert result.handled is True
+        body = result.response or ""
+        assert "install" in body  # hinted as did-you-mean
+
+
+# ---------------------------------------------------------------------------
 # CommandResult shape (sanity)
 # ---------------------------------------------------------------------------
 

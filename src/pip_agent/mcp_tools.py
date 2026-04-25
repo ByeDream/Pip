@@ -10,6 +10,10 @@ Tools currently exposed:
   ``lookup_user``, ``reflect``
 * Cron: ``cron_add``, ``cron_remove``, ``cron_update``, ``cron_list``
 * Channel: ``send_file``
+* Plugin: ``plugin_list``, ``plugin_search``, ``plugin_install``,
+  ``plugin_marketplace_add``, ``plugin_marketplace_list``
+  (read + additive only — destructive ops live on the host
+  ``/plugin`` slash command)
 """
 
 from __future__ import annotations
@@ -67,7 +71,12 @@ class McpContext:
 
 def build_mcp_server(ctx: McpContext) -> McpSdkServerConfig:
     """Create the in-process MCP server with all Pip-Boy-unique tools."""
-    tools = _memory_tools(ctx) + _cron_tools(ctx) + _channel_tools(ctx)
+    tools = (
+        _memory_tools(ctx)
+        + _cron_tools(ctx)
+        + _channel_tools(ctx)
+        + _plugin_tools(ctx)
+    )
     # PROFILE — wrap every tool handler so each invocation shows up
     # as its own ``mcp.<name>`` span. Single-site interception means one
     # line to remove during cleanup.
@@ -674,5 +683,266 @@ def _channel_tools(ctx: McpContext) -> list[SdkMcpTool]:
                 "required": ["path"],
             },
             handler=send_file,
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Plugin tools — agent self-service for Claude Code plugins / marketplaces
+#
+# Why only additive operations are surfaced
+# -----------------------------------------
+# Claude Code's plugin / marketplace state is shared with the user's
+# global config (``~/.claude/`` for ``user`` scope, ``<cwd>/.claude/``
+# for project / local). Letting the agent ``uninstall`` / ``disable`` /
+# ``marketplace remove`` would let a single hostile turn wipe a user's
+# carefully curated plugin set. So the agent only gets:
+#
+#   * read (``plugin_list``, ``plugin_search``, ``plugin_marketplace_list``)
+#   * additive write (``plugin_install``, ``plugin_marketplace_add``)
+#
+# Removal stays a human decision via ``/plugin`` host commands.
+# This mirrors the Pip-Boy AGENTS.md principle "CONSTRAIN, SURFACE,
+# NEVER COACH": expose the eyes (list/search) and hands (install) the
+# agent needs, withhold the destructive ones.
+#
+# Scope (``user`` / ``project`` / ``local``)
+# ------------------------------------------
+# The schema offers all three values via a JSON ``enum`` so the SDK
+# advertises them to the agent automatically. When the agent picks
+# ``project`` or ``local``, the subprocess uses ``ctx.workdir`` so
+# the resulting ``.claude/`` files land beside *this* agent's project
+# — which is what "this agent installs a plugin for itself" should mean.
+# ---------------------------------------------------------------------------
+
+
+_PLUGIN_SCOPE_ENUM = {
+    "type": "string",
+    "enum": ["user", "project", "local"],
+    "description": (
+        "Where to record the change. 'user' = global "
+        "(~/.claude/settings.json). 'project' = this agent's "
+        "<cwd>/.claude/settings.json (gitable). 'local' = this "
+        "agent's <cwd>/.claude/settings.local.json (gitignored). "
+        "Defaults to 'user'."
+    ),
+}
+
+
+def _plugin_tools(ctx: McpContext) -> list[SdkMcpTool]:
+
+    async def plugin_list_tool(args: dict[str, Any]) -> dict[str, Any]:
+        from pip_agent import plugins as plug
+
+        available = bool(args.get("available", False))
+        try:
+            items = await plug.plugin_list(available=available, cwd=ctx.workdir)
+        except plug.PluginsCLINotFound as exc:
+            return _error(str(exc))
+        except plug.PluginsCLIError as exc:
+            return _error(str(exc))
+        return _text(json.dumps(items, indent=2, ensure_ascii=False))
+
+    async def plugin_search_tool(args: dict[str, Any]) -> dict[str, Any]:
+        from pip_agent import plugins as plug
+
+        query = (args.get("query") or "").strip()
+        if not query:
+            return _error("'query' is required.")
+        try:
+            items = await plug.plugin_search(query, cwd=ctx.workdir)
+        except plug.PluginsCLINotFound as exc:
+            return _error(str(exc))
+        except plug.PluginsCLIError as exc:
+            return _error(str(exc))
+        if not items:
+            return _text(
+                f"No plugins matched '{query}'. "
+                "Use plugin_marketplace_list to see configured sources, "
+                "or plugin_marketplace_add to register a new one."
+            )
+        return _text(json.dumps(items, indent=2, ensure_ascii=False))
+
+    async def plugin_install_tool(args: dict[str, Any]) -> dict[str, Any]:
+        from pip_agent import plugins as plug
+
+        spec = (args.get("spec") or "").strip()
+        if not spec:
+            return _error("'spec' is required (e.g. 'web-search' or 'web-search@anthropic').")
+        scope = args.get("scope", "user")
+        if scope not in ("user", "project", "local"):
+            return _error(
+                f"Invalid scope '{scope}'. Valid: user, project, local."
+            )
+        try:
+            out, err, _ = await plug.plugin_install(
+                spec, scope=scope, cwd=ctx.workdir,  # type: ignore[arg-type]
+            )
+        except plug.PluginsCLINotFound as exc:
+            return _error(str(exc))
+        except plug.PluginsCLIError as exc:
+            return _error(str(exc))
+        body = (out or err).strip() or f"Installed {spec} (scope={scope})."
+        return _text(body)
+
+    async def plugin_marketplace_add_tool(
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        from pip_agent import plugins as plug
+
+        source = (args.get("source") or "").strip()
+        if not source:
+            return _error(
+                "'source' is required (gh-repo like 'owner/name', "
+                "an https git url, or a local path)."
+            )
+        scope = args.get("scope", "user")
+        if scope not in ("user", "project", "local"):
+            return _error(
+                f"Invalid scope '{scope}'. Valid: user, project, local."
+            )
+        try:
+            out, err, _ = await plug.marketplace_add(
+                source, scope=scope, cwd=ctx.workdir,  # type: ignore[arg-type]
+            )
+        except plug.PluginsCLINotFound as exc:
+            return _error(str(exc))
+        except plug.PluginsCLIError as exc:
+            return _error(str(exc))
+        body = (out or err).strip() or (
+            f"Added marketplace {source} (scope={scope})."
+        )
+        return _text(body)
+
+    async def plugin_marketplace_list_tool(
+        _args: dict[str, Any],
+    ) -> dict[str, Any]:
+        from pip_agent import plugins as plug
+
+        try:
+            items = await plug.marketplace_list(cwd=ctx.workdir)
+        except plug.PluginsCLINotFound as exc:
+            return _error(str(exc))
+        except plug.PluginsCLIError as exc:
+            return _error(str(exc))
+        if not items:
+            return _text(
+                "No marketplaces configured. Use plugin_marketplace_add "
+                "to register one (e.g. 'anthropics/claude-code')."
+            )
+        return _text(json.dumps(items, indent=2, ensure_ascii=False))
+
+    return [
+        SdkMcpTool(
+            name="plugin_list",
+            description=(
+                "List Claude Code plugins. By default returns plugins "
+                "currently installed; pass available=true to list every "
+                "plugin offered by the configured marketplaces. Each "
+                "entry includes name, scope, marketplace source, and "
+                "(when installed) enabled state. Use this to check "
+                "what capabilities you already have before asking the "
+                "user to install something new."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "available": {
+                        "type": "boolean",
+                        "description": (
+                            "When true, return every plugin offered by "
+                            "configured marketplaces instead of only "
+                            "installed ones. Default false."
+                        ),
+                    },
+                },
+            },
+            handler=plugin_list_tool,
+        ),
+        SdkMcpTool(
+            name="plugin_search",
+            description=(
+                "Search marketplace-available plugins by case-insensitive "
+                "substring across name, description, and tags. Returns "
+                "the same shape as plugin_list(available=true) but "
+                "filtered. Use to discover a plugin that delivers a "
+                "capability the user is asking for (e.g. 'pdf', "
+                "'web search', 'figma')."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Substring to match. Empty / missing is "
+                            "rejected."
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+            handler=plugin_search_tool,
+        ),
+        SdkMcpTool(
+            name="plugin_install",
+            description=(
+                "Install a Claude Code plugin from a configured "
+                "marketplace. The plugin's commands, skills, and any "
+                "MCP servers it bundles become available on the next "
+                "agent turn (no restart needed). Marketplaces must "
+                "already be added; if a plugin you want isn't found, "
+                "use plugin_marketplace_add first."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "spec": {
+                        "type": "string",
+                        "description": (
+                            "Plugin name, optionally suffixed with "
+                            "'@<marketplace>' to disambiguate when the "
+                            "name appears in multiple sources."
+                        ),
+                    },
+                    "scope": _PLUGIN_SCOPE_ENUM,
+                },
+                "required": ["spec"],
+            },
+            handler=plugin_install_tool,
+        ),
+        SdkMcpTool(
+            name="plugin_marketplace_add",
+            description=(
+                "Register a Claude Code plugin marketplace so its "
+                "plugins become installable. Source can be a GitHub "
+                "'owner/repo' slug, an https git URL, or a local path. "
+                "The official catalogue lives at 'anthropics/claude-code'."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": (
+                            "GitHub 'owner/repo', https git URL, or "
+                            "local filesystem path."
+                        ),
+                    },
+                    "scope": _PLUGIN_SCOPE_ENUM,
+                },
+                "required": ["source"],
+            },
+            handler=plugin_marketplace_add_tool,
+        ),
+        SdkMcpTool(
+            name="plugin_marketplace_list",
+            description=(
+                "List currently-configured plugin marketplaces. Use "
+                "before plugin_search / plugin_install to confirm "
+                "which sources are reachable."
+            ),
+            input_schema={"type": "object", "properties": {}},
+            handler=plugin_marketplace_list_tool,
         ),
     ]

@@ -186,6 +186,37 @@ class Settings(BaseSettings):
     dream_min_observations: int = Field(default=20)
     dream_inactive_minutes: int = Field(default=30)
 
+    # Plugin marketplaces auto-registered at host cold-start. Comma-separated
+    # ``owner/repo`` (or any spec ``claude plugin marketplace add`` accepts).
+    # Empty string disables the bootstrap entirely. The default points at
+    # Anthropic's curated catalogue so a fresh checkout already has things
+    # like ``exa`` / ``firecrawl`` / ``brightdata-plugin`` discoverable via
+    # ``/plugin search`` without a manual ``marketplace add`` step.
+    #
+    # Idempotent: existing marketplaces are detected via ``marketplace list
+    # --json`` and skipped, so this fires at most one network clone per spec
+    # over the host's lifetime. Failures (offline, proxy down, malformed
+    # repo) are logged at WARNING and do NOT block startup — the rest of
+    # the host boots normally; the user just won't see those plugins in
+    # ``/plugin search`` until they retry.
+    bootstrap_marketplaces: str = Field(
+        default="anthropics/claude-plugins-official",
+    )
+
+    # Timeout (seconds) for plugin / marketplace operations that go to
+    # the network. Covers ``marketplace add`` / ``marketplace update``
+    # (git clone) and ``plugin install`` (clone + ``npm`` / ``uv``
+    # dependency fetch). Local-only operations (``list``, ``search``,
+    # ``uninstall``, ``enable``, ``disable``) keep the static 30 s cap
+    # in :mod:`pip_agent.plugins`.
+    #
+    # The 180 s default is the "would have succeeded if we'd waited"
+    # threshold observed for the bundled ``exa`` plugin install on a
+    # proxied connection — the original 30 s ceiling killed that one
+    # install at ~28 s. Bump higher (e.g. 600) for very slow proxies;
+    # lower if you'd rather fail fast and retry.
+    plugin_network_timeout_sec: float = Field(default=180.0)
+
     def check_required(self) -> None:
         """Host-level credential check.
 

@@ -323,6 +323,17 @@ Available commands:
                                 falls back to pip-boy (no-op when
                                 already on pip-boy)
 
+  /plugin help                  Show full /plugin usage
+  /plugin list [--available]    List installed (or marketplace-available) plugins
+  /plugin search <query>        Search marketplace plugins by name / tag / desc
+  /plugin install <spec>        Install a plugin (default scope=user;
+      [--scope SCOPE]           use --scope project|local for per-agent)
+  /plugin marketplace list      List configured marketplaces
+  /plugin marketplace add <src> Register a marketplace (gh-repo / url / path)
+      [--scope SCOPE]
+                                (also: enable / disable / uninstall / remove /
+                                 update — see `/plugin help`)
+
 Bindings:
   /bind in a group chat creates a guild-level binding; in a private
   chat, a peer-level binding. Bindings persist across restarts in
@@ -1721,6 +1732,500 @@ def _cmd_exit(ctx: CommandContext, _args: str) -> CommandResult:
 
 
 # ---------------------------------------------------------------------------
+# /plugin — Claude Code plugin / marketplace management
+# ---------------------------------------------------------------------------
+#
+# Why this lives on the host
+# --------------------------
+# Plugin install / uninstall mutates ``~/.claude/`` (or
+# ``<cwd>/.claude/``) which is the same state the SDK subprocess
+# reads on the next ``query()``. We don't cache it; ``plugins.py``
+# just shells out to the bundled ``claude.exe``. The host wrapper
+# exists so:
+#
+# * users can install plugins from chat (``/plugin install foo``)
+#   without leaving the conversation,
+# * three install scopes (``user`` / ``project`` / ``local``) are
+#   surfaced consistently with Claude Code's own CLI,
+# * destructive operations (``uninstall``, ``disable``, ``marketplace
+#   remove``) stay on the host surface; the agent-facing MCP variant
+#   intentionally only exposes additive ops (see ``mcp_tools._plugin_tools``).
+#
+# Scope semantics
+# ---------------
+# When ``--scope project`` or ``--scope local`` is given, the
+# subprocess inherits the **active agent's** workdir as ``cwd`` so
+# the resulting ``.claude/`` files land beside that agent's project,
+# not the host process's cwd. Each Pip-Boy sub-agent therefore has its
+# own per-project plugin set, just like CC's own per-project semantics.
+
+_PLUGIN_USAGE = (
+    "Usage:\n"
+    "  /plugin list [--available]\n"
+    "  /plugin search <query>\n"
+    "  /plugin install <spec> [--scope user|project|local]\n"
+    "  /plugin uninstall <name> [--scope user|project|local]\n"
+    "  /plugin enable <name> [--scope user|project|local]\n"
+    "  /plugin disable <name> [--scope user|project|local]\n"
+    "  /plugin marketplace list\n"
+    "  /plugin marketplace add <gh-repo|url|path> "
+    "[--scope user|project|local]\n"
+    "  /plugin marketplace remove <name>\n"
+    "  /plugin marketplace update [name]\n"
+    "  /plugin help\n"
+    "\n"
+    "<spec> is `<name>` or `<name>@<marketplace>` to disambiguate.\n"
+    "Default scope is `user` (global). `project` writes to the active "
+    "agent's `.claude/settings.json`; `local` writes to "
+    "`.claude/settings.local.json` (gitignored). Plugins from any "
+    "scope are picked up by the next agent turn."
+)
+
+_VALID_PLUGIN_SCOPES = {"user", "project", "local"}
+
+
+def _parse_plugin_flags(
+    tokens: list[str],
+) -> tuple[list[str], dict[str, str], str | None]:
+    """Split ``tokens`` into ``(positionals, flags, error)``.
+
+    Recognised flags: ``--scope``. Unrecognised ``--foo`` is rejected
+    so typos like ``--scop project`` fail fast instead of silently
+    going to the user-default scope.
+    """
+    allowed = {"--scope"}
+    positionals: list[str] = []
+    flags: dict[str, str] = {}
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.startswith("--"):
+            if tok not in allowed:
+                return [], {}, f"Unknown flag '{tok}'."
+            if i + 1 >= len(tokens):
+                return [], {}, f"Flag '{tok}' needs a value."
+            value = tokens[i + 1]
+            if tok == "--scope" and value not in _VALID_PLUGIN_SCOPES:
+                return [], {}, (
+                    f"Invalid scope '{value}'. "
+                    "Valid: user, project, local."
+                )
+            flags[tok] = value
+            i += 2
+            continue
+        positionals.append(tok)
+        i += 1
+    return positionals, flags, None
+
+
+def _active_agent_cwd(ctx: CommandContext) -> Path:
+    """Resolve the active agent's effective ``cwd``.
+
+    Used as the subprocess ``cwd`` for ``project`` / ``local`` scoped
+    operations so each sub-agent has its own per-project plugin set.
+    Falls back to ``Path.cwd()`` when registry paths aren't wired (unit
+    tests, very early bootstrap).
+    """
+    aid = _resolved_agent_id(ctx)
+    paths = ctx.registry.paths_for(aid)
+    if paths is not None:
+        return paths.cwd
+    return Path.cwd()
+
+
+def _truncate(s: str, limit: int = 60) -> str:
+    s = (s or "").replace("\n", " ").strip()
+    if len(s) <= limit:
+        return s
+    return s[: max(0, limit - 1)] + "\u2026"
+
+
+def _format_plugin_list(items: list[dict], available: bool) -> str:
+    if not items:
+        if available:
+            return (
+                "No plugins available. Add a marketplace first with "
+                "`/plugin marketplace add <gh-repo|url|path>`."
+            )
+        return "No plugins installed. Run `/plugin list --available`."
+
+    label = "Available" if available else "Installed"
+    lines = [f"{label} plugins ({len(items)}):"]
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = it.get("name") or it.get("id") or it.get("pluginId") or "?"
+        # ``scope`` only applies to *installed* records (where the CLI
+        # attaches ``user`` / ``project`` / ``local``). Available
+        # records carry a ``source`` dict (``{"source": "url", ...}``)
+        # which is neither a scope nor a marketplace and would render
+        # as a JSON blob if we forwarded it. Filter to strings only.
+        scope_raw = it.get("scope")
+        scope = scope_raw if isinstance(scope_raw, str) else ""
+        market_raw = (
+            it.get("marketplaceName")
+            or it.get("marketplace")
+            or it.get("source_marketplace")
+        )
+        market = market_raw if isinstance(market_raw, str) else ""
+        enabled = it.get("enabled")
+        flag = " [disabled]" if enabled is False else ""
+        desc = _truncate(str(it.get("description") or it.get("summary") or ""))
+        bits = [f"  {name}{flag}"]
+        if scope:
+            bits.append(f"scope={scope}")
+        if market and market != scope:
+            bits.append(f"market={market}")
+        head = " ".join(bits)
+        if desc:
+            lines.append(f"{head} — {desc}")
+        else:
+            lines.append(head)
+    return "\n".join(lines)
+
+
+def _format_marketplace_list(items: list[dict]) -> str:
+    if not items:
+        return (
+            "No marketplaces configured. "
+            "Add one with `/plugin marketplace add <gh-repo|url|path>`."
+        )
+    lines = [f"Marketplaces ({len(items)}):"]
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = it.get("name") or it.get("id") or "?"
+        # ``repo`` (``owner/repo``) is the most informative identifier
+        # the CLI exposes for github-sourced marketplaces. ``source``
+        # alone is just the constant string ``"github"`` and adds no
+        # operator value. Local-path / URL marketplaces carry only
+        # those fields, hence the chained fallback.
+        src = (
+            it.get("repo")
+            or it.get("url")
+            or it.get("path")
+            or it.get("source")
+            or ""
+        )
+        if not isinstance(src, str):
+            src = ""
+        scope = it.get("scope") if isinstance(it.get("scope"), str) else ""
+        plug_count = it.get("pluginCount") or it.get("plugins") or ""
+        bits = [f"  {name}"]
+        if scope:
+            bits.append(f"scope={scope}")
+        if plug_count:
+            bits.append(f"plugins={plug_count}")
+        if src:
+            bits.append(f"src={src}")
+        lines.append(" ".join(bits))
+    return "\n".join(lines)
+
+
+def _plugin_error_response(exc: Exception) -> CommandResult:
+    """Render a plugin subprocess error as a tidy chat response."""
+    from pip_agent.plugins import PluginsCLIError, PluginsCLINotFound
+
+    if isinstance(exc, PluginsCLINotFound):
+        return CommandResult(handled=True, response=str(exc))
+    if isinstance(exc, PluginsCLIError):
+        msg = (exc.stderr or exc.stdout or "").strip()
+        head = msg.splitlines()[0] if msg else f"exit code {exc.returncode}"
+        return CommandResult(
+            handled=True,
+            response=f"Plugin command failed: {head}",
+        )
+    log.exception("/plugin handler crashed")
+    return CommandResult(handled=True, response=f"[error] {exc}")
+
+
+def _plugin_list_handler(
+    ctx: CommandContext, tail: list[str],
+) -> CommandResult:
+    from pip_agent import plugins as plug
+
+    available = False
+    rest: list[str] = []
+    for tok in tail:
+        if tok in ("--available", "-a"):
+            available = True
+        else:
+            rest.append(tok)
+    if rest:
+        return CommandResult(
+            handled=True,
+            response=f"Unexpected argument: {rest[0]}\n{_PLUGIN_USAGE}",
+        )
+    cwd = _active_agent_cwd(ctx)
+    try:
+        items = plug.run_sync(plug.plugin_list(available=available, cwd=cwd))
+    except Exception as exc:  # noqa: BLE001
+        return _plugin_error_response(exc)
+    return CommandResult(
+        handled=True,
+        response=_format_plugin_list(items, available=available),
+    )
+
+
+def _plugin_search_handler(
+    ctx: CommandContext, tail: list[str],
+) -> CommandResult:
+    from pip_agent import plugins as plug
+
+    if not tail:
+        return CommandResult(
+            handled=True,
+            response="Usage: /plugin search <query>",
+        )
+    query = " ".join(tail).strip()
+    cwd = _active_agent_cwd(ctx)
+    try:
+        items = plug.run_sync(plug.plugin_search(query, cwd=cwd))
+    except Exception as exc:  # noqa: BLE001
+        return _plugin_error_response(exc)
+    if not items:
+        return CommandResult(
+            handled=True,
+            response=(
+                f"No plugins matched '{query}'. "
+                "Run `/plugin marketplace list` to see configured sources, "
+                "or `/plugin list --available` for the full catalogue."
+            ),
+        )
+    return CommandResult(
+        handled=True,
+        response=_format_plugin_list(items, available=True),
+    )
+
+
+def _plugin_install_handler(
+    ctx: CommandContext, tail: list[str],
+) -> CommandResult:
+    from pip_agent import plugins as plug
+
+    positionals, flags, err = _parse_plugin_flags(tail)
+    if err:
+        return CommandResult(handled=True, response=f"{err}\n{_PLUGIN_USAGE}")
+    if len(positionals) != 1:
+        return CommandResult(
+            handled=True,
+            response="Usage: /plugin install <spec> [--scope SCOPE]",
+        )
+    spec = positionals[0]
+    scope = flags.get("--scope", "user")
+    cwd = _active_agent_cwd(ctx)
+    try:
+        out, err_text, _ = plug.run_sync(
+            plug.plugin_install(spec, scope=scope, cwd=cwd),  # type: ignore[arg-type]
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _plugin_error_response(exc)
+    body = (out or err_text).strip() or f"Installed {spec} (scope={scope})."
+    return CommandResult(handled=True, response=body)
+
+
+def _plugin_uninstall_handler(
+    ctx: CommandContext, tail: list[str],
+) -> CommandResult:
+    from pip_agent import plugins as plug
+
+    positionals, flags, err = _parse_plugin_flags(tail)
+    if err:
+        return CommandResult(handled=True, response=f"{err}\n{_PLUGIN_USAGE}")
+    if len(positionals) != 1:
+        return CommandResult(
+            handled=True,
+            response="Usage: /plugin uninstall <name> [--scope SCOPE]",
+        )
+    name = positionals[0]
+    scope = flags.get("--scope")
+    cwd = _active_agent_cwd(ctx)
+    try:
+        out, err_text, _ = plug.run_sync(
+            plug.plugin_uninstall(name, scope=scope, cwd=cwd),  # type: ignore[arg-type]
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _plugin_error_response(exc)
+    body = (out or err_text).strip() or f"Uninstalled {name}."
+    return CommandResult(handled=True, response=body)
+
+
+def _plugin_enable_handler(
+    ctx: CommandContext, tail: list[str],
+) -> CommandResult:
+    from pip_agent import plugins as plug
+
+    positionals, flags, err = _parse_plugin_flags(tail)
+    if err:
+        return CommandResult(handled=True, response=f"{err}\n{_PLUGIN_USAGE}")
+    if len(positionals) != 1:
+        return CommandResult(
+            handled=True,
+            response="Usage: /plugin enable <name> [--scope SCOPE]",
+        )
+    name = positionals[0]
+    scope = flags.get("--scope")
+    cwd = _active_agent_cwd(ctx)
+    try:
+        out, err_text, _ = plug.run_sync(
+            plug.plugin_enable(name, scope=scope, cwd=cwd),  # type: ignore[arg-type]
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _plugin_error_response(exc)
+    body = (out or err_text).strip() or f"Enabled {name}."
+    return CommandResult(handled=True, response=body)
+
+
+def _plugin_disable_handler(
+    ctx: CommandContext, tail: list[str],
+) -> CommandResult:
+    from pip_agent import plugins as plug
+
+    positionals, flags, err = _parse_plugin_flags(tail)
+    if err:
+        return CommandResult(handled=True, response=f"{err}\n{_PLUGIN_USAGE}")
+    if len(positionals) != 1:
+        return CommandResult(
+            handled=True,
+            response="Usage: /plugin disable <name> [--scope SCOPE]",
+        )
+    name = positionals[0]
+    scope = flags.get("--scope")
+    cwd = _active_agent_cwd(ctx)
+    try:
+        out, err_text, _ = plug.run_sync(
+            plug.plugin_disable(name, scope=scope, cwd=cwd),  # type: ignore[arg-type]
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _plugin_error_response(exc)
+    body = (out or err_text).strip() or f"Disabled {name}."
+    return CommandResult(handled=True, response=body)
+
+
+def _plugin_marketplace_handler(
+    ctx: CommandContext, tail: list[str],
+) -> CommandResult:
+    from pip_agent import plugins as plug
+
+    if not tail:
+        return CommandResult(
+            handled=True,
+            response="Usage: /plugin marketplace {list|add|remove|update} ...",
+        )
+    sub = tail[0].lower()
+    rest = tail[1:]
+    cwd = _active_agent_cwd(ctx)
+
+    try:
+        if sub == "list":
+            items = plug.run_sync(plug.marketplace_list(cwd=cwd))
+            return CommandResult(
+                handled=True,
+                response=_format_marketplace_list(items),
+            )
+
+        if sub == "add":
+            positionals, flags, err = _parse_plugin_flags(rest)
+            if err:
+                return CommandResult(handled=True, response=f"{err}\n{_PLUGIN_USAGE}")
+            if len(positionals) != 1:
+                return CommandResult(
+                    handled=True,
+                    response=(
+                        "Usage: /plugin marketplace add <gh-repo|url|path> "
+                        "[--scope SCOPE]"
+                    ),
+                )
+            source = positionals[0]
+            scope = flags.get("--scope", "user")
+            out, err_text, _ = plug.run_sync(
+                plug.marketplace_add(source, scope=scope, cwd=cwd),  # type: ignore[arg-type]
+            )
+            body = (out or err_text).strip() or (
+                f"Added marketplace {source} (scope={scope})."
+            )
+            return CommandResult(handled=True, response=body)
+
+        if sub == "remove":
+            if len(rest) != 1:
+                return CommandResult(
+                    handled=True,
+                    response="Usage: /plugin marketplace remove <name>",
+                )
+            out, err_text, _ = plug.run_sync(
+                plug.marketplace_remove(rest[0], cwd=cwd),
+            )
+            body = (out or err_text).strip() or f"Removed marketplace {rest[0]}."
+            return CommandResult(handled=True, response=body)
+
+        if sub == "update":
+            name = rest[0] if rest else None
+            out, err_text, _ = plug.run_sync(
+                plug.marketplace_update(name, cwd=cwd),
+            )
+            body = (out or err_text).strip() or "Marketplace metadata refreshed."
+            return CommandResult(handled=True, response=body)
+
+    except Exception as exc:  # noqa: BLE001
+        return _plugin_error_response(exc)
+
+    return CommandResult(
+        handled=True,
+        response=(
+            f"Unknown /plugin marketplace subcommand '{sub}'.\n{_PLUGIN_USAGE}"
+        ),
+    )
+
+
+def _cmd_plugin(ctx: CommandContext, args: str) -> CommandResult:
+    """Dispatcher for the ``/plugin`` family.
+
+    Flat dispatch on the first token (mirrors ``/subagent``):
+    ``list / search / install / uninstall / enable / disable /
+    marketplace / help``. Marketplace operations are themselves a
+    second-level dispatch (``/plugin marketplace list`` / ``add`` /
+    ``remove`` / ``update``).
+
+    Available on every channel — same trust model as ``/cron``: users
+    own the plugin sources they trust.
+    """
+    try:
+        tokens = shlex.split(args) if args.strip() else []
+    except ValueError as exc:
+        return CommandResult(handled=True, response=f"Parse error: {exc}")
+
+    if not tokens or tokens[0].lower() == "help":
+        return CommandResult(handled=True, response=_PLUGIN_USAGE)
+
+    sub = tokens[0].lower()
+    tail = tokens[1:]
+    handler = _PLUGIN_SUBCOMMANDS.get(sub)
+    if handler is None:
+        from difflib import get_close_matches
+
+        hint = get_close_matches(sub, _PLUGIN_SUBCOMMANDS.keys(), n=1, cutoff=0.6)
+        suffix = f" Did you mean `/plugin {hint[0]}`?" if hint else ""
+        return CommandResult(
+            handled=True,
+            response=(
+                f"Unknown /plugin subcommand '{sub}'.{suffix}\n{_PLUGIN_USAGE}"
+            ),
+        )
+    return handler(ctx, tail)
+
+
+_PLUGIN_SUBCOMMANDS: dict[str, Any] = {
+    "list": _plugin_list_handler,
+    "search": _plugin_search_handler,
+    "install": _plugin_install_handler,
+    "uninstall": _plugin_uninstall_handler,
+    "enable": _plugin_enable_handler,
+    "disable": _plugin_disable_handler,
+    "marketplace": _plugin_marketplace_handler,
+}
+
+
+# ---------------------------------------------------------------------------
 # Registration tables
 # ---------------------------------------------------------------------------
 
@@ -1738,6 +2243,7 @@ _HANDLERS: dict[
     "/bind": _cmd_bind,
     "/unbind": _cmd_unbind,
     "/wechat": _cmd_wechat,
+    "/plugin": _cmd_plugin,
     "/exit": _cmd_exit,
 }
 

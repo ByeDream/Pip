@@ -187,6 +187,7 @@ ACL: every command is open to every sender on every channel with one exception �
 | `/axioms` | Current judgment principles (`axioms.md`). |
 | `/recall <query>` | Search stored memories. |
 | `/cron` | List scheduled cron jobs. |
+| `/plugin` | Manage Claude Code plugins / marketplaces. See *Plugins and Marketplaces* below. |
 | `/bind <id>` | Route this chat to sub-agent `<id>`. Works from any agent. `/bind pip-boy` is rejected with a redirect to `/unbind` — "on pip-boy" has exactly one canonical representation (no binding row). |
 | `/unbind` | Clear this chat's binding so routing falls back to pip-boy. No-op when already on pip-boy. |
 | `/subagent` | **pip-boy only, CLI-only.** List known sub-agents (alias for `/subagent list`). |
@@ -238,6 +239,70 @@ Unknown slash commands (and unknown `/subagent` subcommands) fail fast with an `
 
 See [`docs/identity-model.md`](docs/identity-model.md) for the full three-tier identity model.
 
+## Plugins and Marketplaces
+
+Pip-Boy reuses Claude Code's native plugin system rather than re-implementing one. The Claude Agent SDK ships a full `claude` CLI inside its wheel, which owns the on-disk plugin state under `~/.claude/` (and per-project `.claude/`). Pip-Boy adds a thin chat surface on top so plugins can be discovered, installed, and used from inside a conversation.
+
+### Why it just works
+
+The agent runner loads all three Claude Code settings tiers (`setting_sources=["user", "project", "local"]`), so any plugin installed at any scope is automatically picked up by the next agent turn — no restart, no config merge code on Pip-Boy's side. Each `query()` spawns a fresh `claude.exe`, which reads the latest `settings.json` on the way in.
+
+### Default marketplace bootstrap
+
+A fresh Pip-Boy install ships with `BOOTSTRAP_MARKETPLACES=anthropics/claude-plugins-official` in `.env`, so the first cold-start auto-registers Anthropic's curated catalogue (~60 plugins covering web search, browser automation, IDE language servers, cloud SDKs, etc.). The bootstrap is idempotent — subsequent boots cost one `marketplace list --json` subprocess (~2 s) and short-circuit. Failures (offline, proxy down) are logged at WARNING but never block startup. Set the env var to empty to opt out and match Claude Code's own zero-marketplace default.
+
+### Install scopes
+
+| Scope | File | Visibility |
+|---|---|---|
+| `user` (default) | `~/.claude/settings.json` | Global; every agent and every cwd. |
+| `project` | `<agent-cwd>/.claude/settings.json` | This agent only; gitable. |
+| `local` | `<agent-cwd>/.claude/settings.local.json` | This agent only; gitignored. |
+
+For sub-agents, "this agent's cwd" is the sub-agent's directory under the workspace root — so a per-`project` plugin install only affects that one sub-agent.
+
+### Slash commands (host-driven)
+
+```
+/plugin list [--available]
+/plugin search <query>
+/plugin install <spec> [--scope user|project|local]
+/plugin uninstall <name> [--scope user|project|local]
+/plugin enable <name>  [--scope user|project|local]
+/plugin disable <name> [--scope user|project|local]
+/plugin marketplace list
+/plugin marketplace add <gh-repo|url|path> [--scope user|project|local]
+/plugin marketplace remove <name>
+/plugin marketplace update [name]
+/plugin help
+```
+
+`<spec>` is `<name>` or `<name>@<marketplace>` (use the latter to disambiguate when the same name appears in multiple sources). With the default `BOOTSTRAP_MARKETPLACES`, `anthropics/claude-plugins-official` is already registered on first boot, so the typical flow collapses to:
+
+```
+/plugin search <query>
+/plugin install <name>
+```
+
+If you cleared the bootstrap env var (or want to add a third-party catalogue), `marketplace add` accepts `owner/repo`, an HTTPS git URL, or a local path:
+
+```
+/plugin marketplace add anthropics/claude-plugins-official
+/plugin list --available
+```
+
+### Agent-driven (MCP tools)
+
+The agent has self-service surface for additive operations only:
+
+- `plugin_list(available=false|true)`
+- `plugin_search(query)`
+- `plugin_install(spec, scope=...)`
+- `plugin_marketplace_list()`
+- `plugin_marketplace_add(source, scope=...)`
+
+Destructive operations (`uninstall`, `disable`, `marketplace remove`) are intentionally **not** exposed as tools — those decisions stay with the human via `/plugin`.
+
 ## Architecture, in one diagram
 
 ```
@@ -271,6 +336,7 @@ See [`docs/identity-model.md`](docs/identity-model.md) for the full three-tier i
                 │   — spawns claude.exe —     │ ─ memory tools
                 │   — streams messages —      │ ─ cron tools
                 │   — PreCompact hook → L1 ─┐ │ ─ send_file
+                │   — settings: user+proj+loc│ ─ plugin tools
                 └─────────────────────────────┘
                               │
                               ▼ reply
