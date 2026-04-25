@@ -93,6 +93,22 @@ def _build_env() -> dict[str, str]:
     return env
 
 
+# Built-in Claude Code tools we deliberately shadow with our own
+# ``mcp__pip__*`` implementation. Listed here so the SDK strips them
+# from the model's option set — without that, the agent sees two
+# tools doing nearly the same thing and picks arbitrarily, splitting
+# trace logs and confusing failure modes.
+#
+# Currently shadowed:
+#   * ``WebFetch`` → ``mcp__pip__web_fetch`` (see :mod:`pip_agent.web`)
+#
+# ``WebSearch`` is intentionally NOT in this list — we don't ship a
+# replacement, so the model is free to use it where available and
+# fall back to plugin-provided alternatives (``mcp__plugin_exa_*`` etc.)
+# elsewhere.
+_BUILTIN_DISALLOWED_TOOLS: tuple[str, ...] = ("WebFetch",)
+
+
 class _StderrBuffer:
     """Bounded line-buffer for ``claude.exe`` stderr capture.
 
@@ -269,6 +285,7 @@ async def run_query(
                 # the SDK skips missing sources.
                 setting_sources=["user", "project", "local"],
                 env=_build_env(),
+                disallowed_tools=list(_BUILTIN_DISALLOWED_TOOLS),
                 mcp_servers={"pip": mcp_server},
                 hooks=hooks,
                 # Capture subprocess stderr so a non-zero exit (gateway

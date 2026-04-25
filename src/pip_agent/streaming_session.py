@@ -40,10 +40,11 @@ from pathlib import Path
 from typing import Any
 
 from pip_agent.agent_runner import (
+    _BUILTIN_DISALLOWED_TOOLS,
     QueryResult,
-    _StderrBuffer,
     _build_env,
     _enrich_with_stderr,
+    _StderrBuffer,
 )
 from pip_agent.hooks import build_hooks
 from pip_agent.mcp_tools import McpContext, build_mcp_server
@@ -158,6 +159,7 @@ class StreamingSession:
                 permission_mode="bypassPermissions",
                 setting_sources=["project", "user"],
                 env=_build_env(),
+                disallowed_tools=list(_BUILTIN_DISALLOWED_TOOLS),
                 mcp_servers={"pip": mcp_server},
                 hooks=hooks,
                 # See :class:`pip_agent.agent_runner._StderrBuffer` —

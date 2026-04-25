@@ -175,6 +175,37 @@ class TestBlockListPromptWrapped:
         # silently break every ``mcp__pip__*`` tool.
         assert "pip" in fake.captured_options.mcp_servers
 
+    def test_webfetch_is_disallowed_so_pip_web_fetch_owns_namespace(
+        self, tmp_path,
+    ):
+        """Built-in ``WebFetch`` must be removed from the model's option
+        set so the agent uses ``mcp__pip__web_fetch`` (canonical
+        implementation in :mod:`pip_agent.web`) instead of the bundled
+        beta-gated server-side tool.
+
+        ``WebSearch`` is *not* shadowed (we don't ship a replacement
+        and want the model free to use the built-in or a plugin) —
+        this test pins both halves of that contract so a future
+        refactor can't quietly add or drop names from the list.
+        """
+        fake = _FakeQuery()
+        ctx = McpContext(workdir=tmp_path)
+        with patch.object(agent_runner, "query", fake):
+            _run(agent_runner.run_query(
+                prompt="ping",
+                mcp_ctx=ctx,
+                stream_text=False,
+            ))
+        disallowed = list(
+            getattr(fake.captured_options, "disallowed_tools", []) or [],
+        )
+        assert "WebFetch" in disallowed
+        assert "WebSearch" not in disallowed
+        # And the module-level constant matches what got wired through
+        # — the seam other call sites import.
+        assert "WebFetch" in agent_runner._BUILTIN_DISALLOWED_TOOLS
+        assert "WebSearch" not in agent_runner._BUILTIN_DISALLOWED_TOOLS
+
     def test_empty_block_list_still_wraps(self, tmp_path):
         # An empty list would be nonsense input but shouldn't crash —
         # verify the wrapper still yields a well-shaped envelope with

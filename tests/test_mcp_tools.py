@@ -28,6 +28,7 @@ from pip_agent.mcp_tools import (
     _cron_tools,
     _memory_tools,
     _plugin_tools,
+    _web_tools,
     build_mcp_server,
 )
 from pip_agent.memory import MemoryStore
@@ -664,16 +665,20 @@ class TestBuildMcpServer:
         mem_names = {t.name for t in _memory_tools(ctx)}
         cron_names = {t.name for t in _cron_tools(ctx)}
         plugin_names = {t.name for t in _plugin_tools(ctx)}
+        web_names = {t.name for t in _web_tools(ctx)}
         # Channel tools depend on having a channel on ctx for the
         # send_file handler to do anything useful, but they're still
         # registered here — that's precisely the regression we care
         # about (channel tools silently missing from the registry).
-        expected = mem_names | cron_names | plugin_names | {"send_file"}
+        expected = (
+            mem_names | cron_names | plugin_names | web_names | {"send_file"}
+        )
         assert "memory_search" in expected
         assert "cron_list" in expected
         assert "send_file" in expected
         assert "plugin_list" in expected
         assert "plugin_install" in expected
+        assert "web_fetch" in expected
 
 
 # ---------------------------------------------------------------------------
@@ -854,3 +859,129 @@ class TestPluginTools:
         result = _run(tool.handler({"spec": "x"}))
         assert result.get("is_error") is True
         assert "marketplace not registered" in _text_of(result)
+
+
+# ---------------------------------------------------------------------------
+# Web tools — thin MCP wrapper around ``pip_agent.web.fetch_url``.
+# ``test_web.py`` covers the fetcher itself; here we only check the
+# argument validation, the success / failure formatting, and the
+# tool's input schema (which is the SDK's contract with the model).
+# ---------------------------------------------------------------------------
+
+
+class TestWebTools:
+    def _patch_fetch(self, monkeypatch, result: dict) -> dict:
+        captured: dict = {}
+
+        async def fake_fetch(url: str, *, max_chars: int = 50_000, **_kw):
+            captured["url"] = url
+            captured["max_chars"] = max_chars
+            return result
+
+        monkeypatch.setattr("pip_agent.web.fetch_url", fake_fetch)
+        return captured
+
+    def test_missing_url_is_error(self):
+        tool = _tool(_web_tools(McpContext()), "web_fetch")
+        result = _run(tool.handler({}))
+        assert result.get("is_error") is True
+        assert "url" in _text_of(result).lower()
+
+    def test_blank_url_is_error(self):
+        tool = _tool(_web_tools(McpContext()), "web_fetch")
+        result = _run(tool.handler({"url": "   "}))
+        assert result.get("is_error") is True
+
+    def test_non_integer_max_chars_is_error(self):
+        tool = _tool(_web_tools(McpContext()), "web_fetch")
+        result = _run(tool.handler({
+            "url": "https://example.com/", "max_chars": "lots",
+        }))
+        assert result.get("is_error") is True
+        assert "integer" in _text_of(result)
+
+    def test_non_positive_max_chars_is_error(self):
+        tool = _tool(_web_tools(McpContext()), "web_fetch")
+        result = _run(tool.handler({
+            "url": "https://example.com/", "max_chars": 0,
+        }))
+        assert result.get("is_error") is True
+
+    def test_success_response_includes_header_and_body(self, monkeypatch):
+        captured = self._patch_fetch(monkeypatch, {
+            "ok": True,
+            "url": "https://example.com/page",
+            "status": 200,
+            "content_type": "text/html",
+            "content": "## Hello\n\nWorld",
+            "truncated": False,
+        })
+        tool = _tool(_web_tools(McpContext()), "web_fetch")
+        result = _run(tool.handler({"url": "https://example.com/page"}))
+
+        assert result.get("is_error") is not True
+        body = _text_of(result)
+        # Header surfaces the resolved URL / status / content-type so
+        # the model can reason about redirects and JSON-vs-HTML.
+        assert "URL: https://example.com/page" in body
+        assert "Status: 200" in body
+        assert "Content-Type: text/html" in body
+        assert "## Hello" in body
+        assert "World" in body
+        # Default ``max_chars`` propagates through to the fetcher.
+        assert captured["max_chars"] == 50_000
+
+    def test_truncation_marker_is_surfaced(self, monkeypatch):
+        self._patch_fetch(monkeypatch, {
+            "ok": True,
+            "url": "https://example.com/long",
+            "status": 200,
+            "content_type": "text/plain",
+            "content": "x" * 50,
+            "truncated": True,
+        })
+        tool = _tool(_web_tools(McpContext()), "web_fetch")
+        result = _run(tool.handler({
+            "url": "https://example.com/long", "max_chars": 50,
+        }))
+        body = _text_of(result)
+        assert "truncated to 50 chars" in body
+
+    def test_failure_dict_becomes_is_error_with_status_hint(
+        self, monkeypatch,
+    ):
+        self._patch_fetch(monkeypatch, {
+            "ok": False,
+            "error": "HTTP 503",
+            "url": "https://example.com/down",
+            "status": 503,
+        })
+        tool = _tool(_web_tools(McpContext()), "web_fetch")
+        result = _run(tool.handler({"url": "https://example.com/down"}))
+
+        assert result.get("is_error") is True
+        body = _text_of(result)
+        assert "web_fetch failed" in body
+        assert "status=503" in body
+        assert "HTTP 503" in body
+
+    def test_max_chars_is_forwarded(self, monkeypatch):
+        captured = self._patch_fetch(monkeypatch, {
+            "ok": True,
+            "url": "u", "status": 200, "content_type": "text/plain",
+            "content": "ok", "truncated": False,
+        })
+        tool = _tool(_web_tools(McpContext()), "web_fetch")
+        _run(tool.handler({
+            "url": "https://example.com/", "max_chars": 1000,
+        }))
+        assert captured["max_chars"] == 1000
+
+    def test_input_schema_is_well_formed(self):
+        tool = _tool(_web_tools(McpContext()), "web_fetch")
+        schema = tool.input_schema
+        assert schema["type"] == "object"
+        assert "url" in schema["properties"]
+        assert schema["properties"]["url"]["type"] == "string"
+        assert schema["required"] == ["url"]
+        assert schema["properties"]["max_chars"]["type"] == "integer"

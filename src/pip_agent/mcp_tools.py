@@ -1,8 +1,10 @@
 """In-process MCP server exposing Pip-Boy's unique capabilities to the SDK.
 
-Only tools that Claude Code does NOT provide natively are exposed here.
-Everything else (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch,
-Task, TodoWrite, Skill, …) is delegated to Claude Code's built-ins.
+Most tools the agent uses (Bash, Read, Write, Edit, Glob, Grep, WebSearch,
+Task, TodoWrite, Skill, …) are delegated to Claude Code's built-ins.
+This server adds capabilities Claude Code does NOT ship — plus a couple
+that we deliberately shadow so behaviour stays consistent across direct
+and proxied upstream endpoints.
 
 Tools currently exposed:
 
@@ -14,6 +16,8 @@ Tools currently exposed:
   ``plugin_marketplace_add``, ``plugin_marketplace_list``
   (read + additive only — destructive ops live on the host
   ``/plugin`` slash command)
+* Web: ``web_fetch`` (canonical implementation; Claude Code's
+  built-in ``WebFetch`` is disabled so the namespace is single-source)
 """
 
 from __future__ import annotations
@@ -76,6 +80,7 @@ def build_mcp_server(ctx: McpContext) -> McpSdkServerConfig:
         + _cron_tools(ctx)
         + _channel_tools(ctx)
         + _plugin_tools(ctx)
+        + _web_tools(ctx)
     )
     # PROFILE — wrap every tool handler so each invocation shows up
     # as its own ``mcp.<name>`` span. Single-site interception means one
@@ -944,5 +949,90 @@ def _plugin_tools(ctx: McpContext) -> list[SdkMcpTool]:
             ),
             input_schema={"type": "object", "properties": {}},
             handler=plugin_marketplace_list_tool,
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Web tools — canonical ``web_fetch`` (shadows Claude Code's built-in)
+# ---------------------------------------------------------------------------
+
+
+def _web_tools(ctx: McpContext) -> list[SdkMcpTool]:
+    """Expose ``web_fetch`` backed by :mod:`pip_agent.web`.
+
+    ``ctx`` is unused today — kept in the signature for parity with the
+    other tool groups so future fetches can be scoped to e.g.
+    ``ctx.workdir`` for cache files without touching the call site.
+    """
+    del ctx  # unused
+
+    async def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
+        from pip_agent.web import fetch_url
+
+        url = (args.get("url") or "").strip()
+        if not url:
+            return _error("'url' is required.")
+        try:
+            max_chars = int(args.get("max_chars", 50_000))
+        except (TypeError, ValueError):
+            return _error("'max_chars' must be an integer.")
+        if max_chars <= 0:
+            return _error("'max_chars' must be > 0.")
+
+        result = await fetch_url(url, max_chars=max_chars)
+        if not result.get("ok"):
+            status = result.get("status")
+            status_part = f" (status={status})" if status is not None else ""
+            return _error(
+                f"web_fetch failed for {result.get('url', url)}"
+                f"{status_part}: {result.get('error', 'unknown error')}"
+            )
+
+        header_lines = [
+            f"URL: {result['url']}",
+            f"Status: {result['status']}",
+            f"Content-Type: {result.get('content_type') or '?'}",
+        ]
+        if result.get("truncated"):
+            header_lines.append(
+                f"(content truncated to {max_chars} chars — request a "
+                "larger max_chars or a more specific URL if you need more)"
+            )
+        body = "\n".join(header_lines) + "\n\n" + (result.get("content") or "")
+        return _text(body)
+
+    return [
+        SdkMcpTool(
+            name="web_fetch",
+            description=(
+                "Fetch a URL and return its main text content. HTML pages "
+                "are reduced to article-body markdown; JSON / plain-text / "
+                "XML come back verbatim. Follows redirects, 30 s timeout, "
+                "5 MB response cap. Returns an error string on non-2xx, "
+                "timeout, oversized payload, or transport failure."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": (
+                            "Absolute http(s) URL to fetch."
+                        ),
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": (
+                            "Maximum characters of content to return. "
+                            "Default 50000. The full response is always "
+                            "downloaded; this only trims the returned "
+                            "extract."
+                        ),
+                    },
+                },
+                "required": ["url"],
+            },
+            handler=web_fetch,
         ),
     ]
