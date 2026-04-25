@@ -1,7 +1,7 @@
 ---
 id: pip-boy
 name: Pip-Boy
-model: claude-opus-4-6
+model: t0
 dm_scope: per-guild
 ---
 # Identity

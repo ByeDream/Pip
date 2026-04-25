@@ -38,7 +38,6 @@ log = logging.getLogger(__name__)
 # Defaults
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "claude-opus-4-6"
 DEFAULT_DM_SCOPE = "per-guild"
 DEFAULT_AGENT_ID = "pip-boy"
 
@@ -97,7 +96,10 @@ def is_valid_agent_id(value: str) -> bool:
 class AgentConfig:
     """Persona + routing metadata for one agent.
 
-    Token limits, compaction thresholds, and fallback-model chains are all
+    The ``model`` field stores a tier name (``t0`` / ``t1`` / ``t2``), not
+    a concrete model identifier. Resolution to a real name happens via
+    :mod:`pip_agent.models` against the ``MODEL_T*`` env vars. Token
+    limits, compaction thresholds, and provider-side fallbacks are
     delegated to Claude Code; Pip-Boy only stores persona-level knobs.
     """
 
@@ -108,8 +110,14 @@ class AgentConfig:
     dm_scope: str = ""
 
     @property
-    def effective_model(self) -> str:
-        return self.model or DEFAULT_MODEL
+    def tier(self) -> str:
+        """Resolved tier name — ``model`` field or :data:`DEFAULT_TIER`."""
+        from pip_agent.models import DEFAULT_TIER, VALID_TIERS
+
+        candidate = (self.model or "").strip().lower()
+        if candidate in VALID_TIERS:
+            return candidate
+        return DEFAULT_TIER
 
     @property
     def effective_dm_scope(self) -> str:
@@ -121,9 +129,16 @@ class AgentConfig:
         return self.name or self.id
 
     def system_prompt(self, workdir: str = "") -> str:
+        from pip_agent.models import primary_model
+
         body = self.system_body or ""
         body = body.replace("{workdir}", workdir)
-        body = body.replace("{model_name}", self.effective_model)
+        # ``{model_name}`` resolves to the concrete head of this tier's
+        # chain so the agent can introduce itself with the actual name
+        # of the model it is currently running on. Empty when the env
+        # is unconfigured — better a blank substitution than the literal
+        # template token leaking into the prompt.
+        body = body.replace("{model_name}", primary_model(self.tier))  # type: ignore[arg-type]
         body = body.replace("{agent_name}", self.display_name)
         return body
 
@@ -215,6 +230,8 @@ def agent_config_from_file(path: Path, *, default_id: str = "") -> AgentConfig:
     id, ``ValueError`` is raised — we'd rather fail loudly than
     invent one.
     """
+    from pip_agent.models import VALID_TIERS
+
     text = path.read_text(encoding="utf-8")
     meta, body = _parse_frontmatter(text)
     raw_id = meta.get("id") or default_id
@@ -223,11 +240,21 @@ def agent_config_from_file(path: Path, *, default_id: str = "") -> AgentConfig:
             f"persona.md at {path} is missing 'id:' in frontmatter "
             "and no default_id was supplied",
         )
+
+    raw_model = (str(meta.get("model") or "")).strip().lower()
+    if raw_model and raw_model not in VALID_TIERS:
+        log.warning(
+            "persona.md at %s has invalid model=%r (must be t0/t1/t2); "
+            "falling back to default tier",
+            path, raw_model,
+        )
+        raw_model = ""
+
     return AgentConfig(
         id=normalize_agent_id(str(raw_id)),
         name=meta.get("name", ""),
         system_body=body,
-        model=meta.get("model", ""),
+        model=raw_model,
         dm_scope=meta.get("dm_scope", ""),
     )
 
@@ -397,7 +424,7 @@ _BUILTIN_DEFAULT = AgentConfig(
         "You are {agent_name}, a personal assistant agent.\n"
         "Your working directory is {workdir}.\n"
     ),
-    model=DEFAULT_MODEL,
+    model="t0",
     dm_scope=DEFAULT_DM_SCOPE,
 )
 

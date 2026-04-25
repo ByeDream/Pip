@@ -112,7 +112,7 @@ class TestReflectWithLLM:
         jsonl = tmp_path / "sess.jsonl"
         jsonl.write_text('{"role":"user","content":"hi"}\n', encoding="utf-8")
 
-        def fake_reflect(path, *, start_offset, agent_id, model, client):
+        def fake_reflect(path, *, start_offset, agent_id, client):
             assert client is not None
             return 99, [{
                 "ts": 1.0,

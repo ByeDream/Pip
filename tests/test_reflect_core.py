@@ -27,6 +27,17 @@ from pip_agent.memory.reflect import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _stub_t1_model(monkeypatch):
+    """Pin ``MODEL_T1`` so ``with_model_fallback`` doesn't short-circuit
+    on an empty chain. The fake clients these tests inject ignore the
+    model name; we just need *a* candidate to keep the fallback wrapper
+    happy."""
+    from pip_agent import config
+
+    monkeypatch.setattr(config.settings, "model_t1", "fake-t1")
+
+
 def _write_transcript(path: Path, lines: list[str]) -> None:
     """Write ``lines`` as a Claude-Code-style JSONL transcript."""
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

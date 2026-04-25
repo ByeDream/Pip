@@ -118,7 +118,7 @@ async def run_query(
     prompt: str | list[dict[str, Any]],
     *,
     mcp_ctx: McpContext,
-    model: str = "",
+    model_chain: list[str] | None = None,
     session_id: str | None = None,
     system_prompt_append: str = "",
     cwd: str | Path | None = None,
@@ -137,8 +137,13 @@ async def run_query(
         for the block shape.
     mcp_ctx:
         Pre-configured MCP context with all host-side services.
-    model:
-        Model identifier (e.g. ``claude-sonnet-4-6``). ``""`` lets CC pick.
+    model_chain:
+        Ordered list of concrete model names to try. The first candidate
+        is used unless it fails with a model-invalid error (see
+        :func:`pip_agent.models.is_model_invalid_error`), in which case
+        we restart the SDK subprocess with the next candidate. ``None``
+        or empty list defers entirely to the SDK / CC defaults — only
+        appropriate for callers that have no tier mapping (none today).
     session_id:
         SDK session ID to resume. ``None`` starts a new session.
     system_prompt_append:
@@ -164,34 +169,111 @@ async def run_query(
     cannot tell the difference between "agent is thinking" and "agent
     crashed").
     """
+    from pip_agent.models import is_model_invalid_error
+
     # PROFILE
     from pip_agent import _profile
 
-    async with _profile.span("runner.sdk_setup"):
-        mcp_server = build_mcp_server(mcp_ctx)
-        effective_cwd = str(cwd) if cwd else str(mcp_ctx.workdir)
+    # ``[""]`` means "no tier-resolved candidate, let the SDK pick its
+    # own default". Keeping at least one element through the loop means
+    # the no-chain branch and the chain branch share the same body.
+    candidates: list[str] = list(model_chain) if model_chain else [""]
 
-        hooks = build_hooks(memory_store=mcp_ctx.memory_store)
+    last_error: str | None = None
+    for attempt_idx, candidate_model in enumerate(candidates):
+        async with _profile.span("runner.sdk_setup"):
+            mcp_server = build_mcp_server(mcp_ctx)
+            effective_cwd = str(cwd) if cwd else str(mcp_ctx.workdir)
 
-        options = ClaudeAgentOptions(
-            model=model or None,
-            cwd=effective_cwd,
-            resume=session_id,
-            system_prompt=(
-                {
-                    "type": "preset",
-                    "preset": "claude_code",
-                    "append": system_prompt_append,
-                }
-                if system_prompt_append
-                else None
-            ),
-            permission_mode="bypassPermissions",
-            setting_sources=["project", "user"],
-            env=_build_env(),
-            mcp_servers={"pip": mcp_server},
-            hooks=hooks,
+            hooks = build_hooks(memory_store=mcp_ctx.memory_store)
+
+            options = ClaudeAgentOptions(
+                model=candidate_model or None,
+                cwd=effective_cwd,
+                resume=session_id,
+                system_prompt=(
+                    {
+                        "type": "preset",
+                        "preset": "claude_code",
+                        "append": system_prompt_append,
+                    }
+                    if system_prompt_append
+                    else None
+                ),
+                permission_mode="bypassPermissions",
+                setting_sources=["project", "user"],
+                env=_build_env(),
+                mcp_servers={"pip": mcp_server},
+                hooks=hooks,
+            )
+
+        result = await _run_one_attempt(
+            options=options,
+            prompt=prompt,
+            session_id=session_id,
+            stream_text=stream_text,
         )
+
+        # Treat a model-invalid failure as a signal to fall back to the
+        # next tier candidate; everything else (auth, network, quota)
+        # surfaces unchanged because re-trying with a different model
+        # would not help.
+        if (
+            result.error
+            and len(candidates) > 1
+            and attempt_idx < len(candidates) - 1
+            and _looks_model_invalid(result.error, is_model_invalid_error)
+        ):
+            log.warning(
+                "runner: candidate %d/%d (%s) rejected as invalid model; "
+                "retrying with next tier candidate (err=%s)",
+                attempt_idx + 1, len(candidates), candidate_model,
+                result.error[:160],
+            )
+            _profile.event(
+                "runner.model_fallback",
+                idx=attempt_idx + 1,
+                total=len(candidates),
+                model=candidate_model,
+                err=result.error[:200],
+            )
+            last_error = result.error
+            continue
+
+        return result
+
+    fallback = QueryResult()
+    fallback.error = last_error or "all model candidates rejected"
+    return fallback
+
+
+def _looks_model_invalid(
+    err_text: str,
+    matcher,
+) -> bool:
+    """Apply :func:`is_model_invalid_error` to a stringified SDK error.
+
+    The SDK exception wraps the gateway error message but the structured
+    type info is usually flattened into the message string by the time it
+    reaches us; matching on the text is the most reliable signal.
+    """
+    return matcher(RuntimeError(err_text))
+
+
+async def _run_one_attempt(
+    *,
+    options: "ClaudeAgentOptions",
+    prompt: str | list[dict[str, Any]],
+    session_id: str | None,
+    stream_text: bool,
+) -> QueryResult:
+    """Execute a single SDK ``query`` pass with the prepared options.
+
+    Extracted from :func:`run_query` so the tier-fallback loop can rebuild
+    options per candidate without duplicating the streaming / result
+    handling. Behaviour below is the previously-inlined body.
+    """
+    from pip_agent import _profile
 
     result = QueryResult()
     # Track whether we have an unterminated streaming line so we can close

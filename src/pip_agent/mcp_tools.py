@@ -53,7 +53,6 @@ class McpContext:
 
     memory_store: MemoryStore | None = None
     workdir: Path = field(default_factory=Path.cwd)
-    model: str = ""
     session_id: str = ""
     scheduler: HostScheduler | None = None
     channel: Channel | None = None
@@ -227,7 +226,6 @@ def _memory_tools(ctx: McpContext) -> list[SdkMcpTool]:
                 session_id=ctx.session_id,
                 transcript_path=path,
                 client=client,
-                model=ctx.model,
             )
         except Exception as exc:  # noqa: BLE001
             return _error(f"Reflection failed: {exc}")

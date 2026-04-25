@@ -124,37 +124,26 @@ class TestResolveCredential:
 
 
 # ---------------------------------------------------------------------------
-# default_direct_sdk_model — single knob for reflect / consolidate / axioms
+# Tiered model resolution — reflect / consolidate / axioms each pin to a tier
 # ---------------------------------------------------------------------------
 
 
-class TestDefaultDirectSdkModel:
-    """Direct-SDK calls (reflect, consolidate, axioms) must default to the
-    same model as the default agent. Any stage that hardcodes its own
-    shorthand breaks users whose proxy only whitelists the agent's model.
+class TestTieredDirectSdkResolution:
+    """Direct-SDK call sites (reflect, consolidate, axioms) resolve their
+    model via :mod:`pip_agent.models` against the ``MODEL_T*`` settings.
+
+    Each task is pinned to a fixed tier in code (``TASK_TIER`` in
+    ``models.py``); these tests verify that the head of the resolved
+    chain is what reaches the SDK ``messages.create`` call. If the tier
+    table or ``MODEL_T*`` wiring drifts, these will be the first to fail.
     """
 
-    def test_matches_routing_default_model(self):
-        from pip_agent import routing
-        from pip_agent.anthropic_client import default_direct_sdk_model
-
-        assert default_direct_sdk_model() == routing.DEFAULT_MODEL
-
-    def test_reflect_uses_it_as_fallback(self, monkeypatch, tmp_path):
-        """``reflect_from_jsonl`` without an explicit ``model=`` must fall
-        back through ``default_direct_sdk_model()``, never a stage-local
-        constant.
-
-        ``reflect.py`` binds the helper at import time via ``from ... import``,
-        so we patch the name in the reflect module's namespace — which is
-        exactly what a stray refactor that re-introduces a local default
-        would end up doing wrong too.
-        """
+    def test_reflect_uses_t1_head_of_chain(self, monkeypatch, tmp_path):
+        from pip_agent import config
         from pip_agent.memory import reflect
 
-        monkeypatch.setattr(
-            reflect, "default_direct_sdk_model", lambda: "sentinel-model",
-        )
+        monkeypatch.setattr(config.settings, "model_t1", "sentinel-t1")
+        monkeypatch.setattr(config.settings, "model_t2", "sentinel-t2")
 
         captured = {}
 
@@ -176,21 +165,14 @@ class TestDefaultDirectSdkModel:
 
         reflect.reflect_from_jsonl(jsonl, agent_id="pip-boy", client=FakeLLM())
 
-        assert captured.get("model") == "sentinel-model"
+        assert captured.get("model") == "sentinel-t1"
 
-    def test_consolidate_uses_it_as_fallback(self, monkeypatch):
-        """Same invariant for ``consolidate`` — it must also resolve the
-        default model via the shared helper.
-        """
+    def test_consolidate_uses_t1_head_of_chain(self, monkeypatch):
+        from pip_agent import config
         from pip_agent.memory import consolidate
 
-        # consolidate imports the helper inside the function body, so we
-        # patch the source module instead of the caller's namespace.
-        from pip_agent import anthropic_client
-
-        monkeypatch.setattr(
-            anthropic_client, "default_direct_sdk_model", lambda: "sentinel-model",
-        )
+        monkeypatch.setattr(config.settings, "model_t1", "sentinel-t1")
+        monkeypatch.setattr(config.settings, "model_t2", "sentinel-t2")
 
         captured = {}
 
@@ -211,7 +193,7 @@ class TestDefaultDirectSdkModel:
             1,
         )
 
-        assert captured.get("model") == "sentinel-model"
+        assert captured.get("model") == "sentinel-t1"
 
 
 # ---------------------------------------------------------------------------

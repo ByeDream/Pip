@@ -682,6 +682,10 @@ class _PreparedTurn:
     the pre-processing phase without re-plumbing 7 positional arguments
     through every helper. Intentionally kept private — callers outside
     ``agent_host`` have no business assembling one.
+
+    ``model_chain`` is the ordered list of concrete model names to try
+    for this turn — resolved from a tier (``t0``/``t1``/``t2``) at
+    prepare-time so dispatch never needs to re-run :mod:`pip_agent.models`.
     """
 
     eff: Any  # resolve_effective_config return (AgentConfig-shaped)
@@ -692,6 +696,7 @@ class _PreparedTurn:
     prompt: Any  # str | list (multimodal content)
     system_prompt: str
     paths: AgentPaths
+    model_chain: list[str]
 
 
 class AgentHost:
@@ -1001,7 +1006,7 @@ class AgentHost:
             return await run_query(
                 prompt=prepared.prompt,
                 mcp_ctx=mcp_ctx,
-                model=prepared.eff.effective_model,
+                model_chain=prepared.model_chain,
                 session_id=current_session_id,
                 system_prompt_append=prepared.system_prompt,
                 cwd=prepared.paths.cwd,
@@ -1168,7 +1173,7 @@ class AgentHost:
             session = StreamingSession(
                 session_key=session_key,
                 mcp_ctx=mcp_ctx,
-                model=prepared.eff.effective_model,
+                model_chain=prepared.model_chain,
                 cwd=prepared.paths.cwd,
                 system_prompt_append=prepared.system_prompt,
                 resume_session_id=effective_resume,
@@ -1438,7 +1443,6 @@ class AgentHost:
     def _build_mcp_ctx(
         self,
         svc: _PerAgent,
-        model: str,
         sender_id: str,
         channel: Channel | None = None,
         peer_id: str = "",
@@ -1459,7 +1463,6 @@ class AgentHost:
         return McpContext(
             memory_store=svc.memory_store,
             workdir=svc.paths.cwd,
-            model=model,
             session_id=session_id,
             sender_id=sender_id,
             channel=channel,
@@ -1671,11 +1674,27 @@ class AgentHost:
                     _profile.event("host.send_typing", channel="wechat")
                     ch.send_typing(inbound.peer_id)
 
+            # Tier resolution: scheduler-injected senders (heartbeat /
+            # cron) are pinned to the cheapest tier in code so they
+            # cannot accidentally burn the strongest model on
+            # background pings. Everything else uses the tier the
+            # persona / binding picked.
+            from pip_agent.models import resolve_chain
+
+            if inbound.sender_id == _HEARTBEAT_SENDER:
+                tier = "t2"
+            elif inbound.sender_id == _CRON_SENDER:
+                tier = "t2"
+            else:
+                tier = eff.tier
+            model_chain = resolve_chain(tier)  # type: ignore[arg-type]
+
             return _PreparedTurn(
                 eff=eff, svc=svc, sk=sk, ch=ch,
                 reply_peer=reply_peer, prompt=prompt,
                 system_prompt=system_prompt,
                 paths=svc.paths,
+                model_chain=model_chain,
             )
 
     async def _execute_turn(
@@ -1833,14 +1852,14 @@ class AgentHost:
                 ctx_session_id = current_session or ""
 
                 mcp_ctx = self._build_mcp_ctx(
-                    svc, eff.effective_model, inbound.sender_id,
+                    svc, inbound.sender_id,
                     channel=ch, peer_id=reply_peer,
                     session_id=ctx_session_id,
                     account_id=inbound.account_id,
                 )
                 _profile.event(  # PROFILE
                     "host.mcp_ctx_built",
-                    model=eff.effective_model,
+                    model_chain=",".join(prepared.model_chain),
                     resume=bool(session_for_turn),
                 )
 
@@ -1884,7 +1903,7 @@ class AgentHost:
                         # well (see ``__init__`` comment block).
                         async with self._one_shot_semaphore, _profile.span(
                             "host.run_query",
-                            model=eff.effective_model,
+                            model_chain=",".join(prepared.model_chain),
                             resume=bool(session_for_turn),
                             prompt_kind=(
                                 "str" if isinstance(prepared.prompt, str) else "blocks"
@@ -1893,7 +1912,7 @@ class AgentHost:
                             result = await run_query(
                                 prompt=prepared.prompt,
                                 mcp_ctx=mcp_ctx,
-                                model=eff.effective_model,
+                                model_chain=prepared.model_chain,
                                 session_id=session_for_turn,
                                 system_prompt_append=prepared.system_prompt,
                                 cwd=prepared.paths.cwd,

@@ -86,14 +86,18 @@ class StreamingSession:
         *,
         session_key: str,
         mcp_ctx: McpContext,
-        model: str,
+        model_chain: list[str],
         cwd: Path | str,
         system_prompt_append: str,
         resume_session_id: str | None = None,
     ) -> None:
         self.session_key = session_key
         self._mcp_ctx = mcp_ctx
-        self._model = model
+        # Ordered tier candidates. ``connect()`` walks them in order and
+        # pins ``self._model`` to the first that connects. Empty list
+        # means "let CC pick its default".
+        self._model_chain: list[str] = list(model_chain) if model_chain else [""]
+        self._model: str = ""
         self._cwd = str(cwd)
         self._system_prompt_append = system_prompt_append
         self._resume_session_id = resume_session_id
@@ -109,52 +113,103 @@ class StreamingSession:
         self._closed = False
 
     async def connect(self) -> None:
-        """Spawn the CC subprocess and run the control-protocol handshake."""
+        """Spawn the CC subprocess and run the control-protocol handshake.
+
+        Walks ``model_chain`` in order: a model-invalid error on connect
+        (e.g. the chain head returns ``404 model_not_found`` from the
+        proxy) closes the doomed client and retries with the next
+        candidate. Anything else (auth, network, payload) re-raises
+        immediately because no model substitution would help.
+        """
         from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
         from pip_agent import _profile
+        from pip_agent.models import is_model_invalid_error
 
-        mcp_server = build_mcp_server(self._mcp_ctx)
-        hooks = build_hooks(memory_store=self._mcp_ctx.memory_store)
+        last_exc: BaseException | None = None
+        for idx, candidate in enumerate(self._model_chain):
+            mcp_server = build_mcp_server(self._mcp_ctx)
+            hooks = build_hooks(memory_store=self._mcp_ctx.memory_store)
 
-        options = ClaudeAgentOptions(
-            model=self._model or None,
-            cwd=self._cwd,
-            resume=self._resume_session_id,
-            system_prompt=(
-                {
-                    "type": "preset",
-                    "preset": "claude_code",
-                    "append": self._system_prompt_append,
-                }
-                if self._system_prompt_append
-                else None
-            ),
-            permission_mode="bypassPermissions",
-            setting_sources=["project", "user"],
-            env=_build_env(),
-            mcp_servers={"pip": mcp_server},
-            hooks=hooks,
-        )
+            options = ClaudeAgentOptions(
+                model=candidate or None,
+                cwd=self._cwd,
+                resume=self._resume_session_id,
+                system_prompt=(
+                    {
+                        "type": "preset",
+                        "preset": "claude_code",
+                        "append": self._system_prompt_append,
+                    }
+                    if self._system_prompt_append
+                    else None
+                ),
+                permission_mode="bypassPermissions",
+                setting_sources=["project", "user"],
+                env=_build_env(),
+                mcp_servers={"pip": mcp_server},
+                hooks=hooks,
+            )
 
-        self._client = ClaudeSDKClient(options=options)
-        async with _profile.span(
-            "stream.connect",
-            session_key=self.session_key,
-            resume=bool(self._resume_session_id),
-        ):
-            # ``connect(None)`` opens with an empty user-message stream,
-            # so the subprocess is live and waiting for our first
-            # ``client.query(...)`` call. This is the call that pays the
-            # one-time 400 ms tax the old per-turn path was eating every
-            # turn.
-            await self._client.connect()
-        self._connected = True
-        _profile.event(
-            "stream.opened",
-            session_key=self.session_key,
-            resume=bool(self._resume_session_id),
-        )
+            client = ClaudeSDKClient(options=options)
+            try:
+                async with _profile.span(
+                    "stream.connect",
+                    session_key=self.session_key,
+                    resume=bool(self._resume_session_id),
+                    candidate_idx=idx + 1,
+                    candidates=len(self._model_chain),
+                ):
+                    # ``connect(None)`` opens with an empty user-message
+                    # stream, so the subprocess is live and waiting for
+                    # our first ``client.query(...)`` call. This is the
+                    # call that pays the one-time 400 ms tax the old
+                    # per-turn path was eating every turn.
+                    await client.connect()
+            except BaseException as exc:  # noqa: BLE001
+                last_exc = exc
+                # Best-effort cleanup of the half-built client; we don't
+                # want a doomed subprocess lingering while we try the
+                # next candidate.
+                try:
+                    await client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                if (
+                    len(self._model_chain) > 1
+                    and idx < len(self._model_chain) - 1
+                    and is_model_invalid_error(exc)
+                ):
+                    log.warning(
+                        "stream %s: candidate %d/%d (%s) rejected as "
+                        "invalid model; falling back to next tier (%s)",
+                        self.session_key, idx + 1, len(self._model_chain),
+                        candidate, exc,
+                    )
+                    _profile.event(
+                        "stream.model_fallback",
+                        session_key=self.session_key,
+                        idx=idx + 1,
+                        total=len(self._model_chain),
+                        model=candidate,
+                        err=str(exc)[:200],
+                    )
+                    continue
+                raise
+
+            self._client = client
+            self._model = candidate
+            self._connected = True
+            _profile.event(
+                "stream.opened",
+                session_key=self.session_key,
+                resume=bool(self._resume_session_id),
+                model=candidate,
+            )
+            return
+
+        assert last_exc is not None
+        raise last_exc
 
     async def close(self, reason: str = "idle") -> None:
         """Disconnect the underlying client, idempotent.

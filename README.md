@@ -115,6 +115,7 @@ On first launch Pip-Boy scaffolds `.pip/` with defaults, including `.env` from t
 | `ANTHROPIC_AUTH_TOKEN` | Conditional | — | Proxy-style bearer token. Takes precedence over `ANTHROPIC_API_KEY`. |
 | `ANTHROPIC_BASE_URL` | No | — | Custom API endpoint. Promotes any credential to bearer mode for proxy gateways. |
 | `WECOM_BOT_ID` / `WECOM_BOT_SECRET` | No | — | WeCom enterprise bot credentials. |
+| `MODEL_T0` / `MODEL_T1` / `MODEL_T2` | Yes | — | The three model tiers, ordered strongest → cheapest. Concrete model names live here only; every call site picks a tier and resolves through the table. Background tasks are pinned to fixed tiers in code. On a model-invalid error the chain steps DOWN to the next tier; never up. |
 | `VERBOSE` | No | `false` | Open the internal log firehose: root at `INFO`, `pip_agent.*` at `DEBUG`. Streaming agent output and `[tool: ...]` traces always print regardless. |
 
 At least one of `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` must be set, or Claude Code will fall back to its own auth (`claude login`).
@@ -157,7 +158,7 @@ Each `persona.md` carries YAML frontmatter:
 ```yaml
 ---
 name: Pip-Boy
-model: claude-opus-4-6
+model: t0
 dm_scope: main
 ---
 
@@ -165,7 +166,7 @@ dm_scope: main
 You are Pip-Boy, …
 ```
 
-Only `model` and `dm_scope` are effective Pip-side overrides; other fields (token limits, compaction thresholds, fallback-model chains) are **owned by Claude Code**, not Pip-Boy. To change them, use Claude Code's own config.
+`model` is a **tier name** (`t0` / `t1` / `t2`), not a concrete model identifier. Concrete names live in `.env` (`MODEL_T0` / `MODEL_T1` / `MODEL_T2`) and are resolved at call time. Background tasks (heartbeat, cron, reflect, dream consolidation, axiom distillation) are pinned to fixed tiers in code and ignore the persona setting. On a model-invalid error the runtime steps DOWN the chain (`t0` → `t1` → `t2`) — never up. Other fields like token limits and compaction thresholds are **owned by Claude Code**, not Pip-Boy. To change them, use Claude Code's own config.
 
 Claude Code's `.claude/` configuration is inherited automatically via the Agent SDK's native parent-directory walk-up — Pip itself does no merging. See [`docs/identity-model.md`](docs/identity-model.md) for the full three-tier model, sub-agent lifecycle, and `.claude/` override semantics.
 

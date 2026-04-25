@@ -626,11 +626,11 @@ class TestSubagentCommand:
     def test_create_honours_explicit_flags(self, tmp_path: Path):
         """``--id`` / ``--name`` / ``--model`` / ``--dm_scope`` all
         take precedence over the defaults derived from the positional
-        label."""
+        label. ``--model`` accepts a tier name (t0/t1/t2)."""
         ctx = _build_ctx(
             _cli_inbound(
                 '/subagent create stella --id main-helper '
-                '--name "Stella Chen" --model claude-sonnet-4-5 '
+                '--name "Stella Chen" --model t1 '
                 '--dm_scope main',
             ),
             tmp_path,
@@ -642,7 +642,7 @@ class TestSubagentCommand:
         assert cfg is not None
         assert cfg.id == "main-helper"
         assert cfg.name == "Stella Chen"
-        assert cfg.model == "claude-sonnet-4-5"
+        assert cfg.model == "t1"
         assert cfg.dm_scope == "main"
 
         # YAML frontmatter was persisted verbatim — editing it by hand
@@ -650,31 +650,34 @@ class TestSubagentCommand:
         paths = ctx.registry.paths_for("main-helper")
         persona = (paths.pip_dir / "persona.md").read_text(encoding="utf-8")
         assert "name: Stella Chen" in persona
-        assert "model: claude-sonnet-4-5" in persona
+        assert "model: t1" in persona
         assert "dm_scope: main" in persona
 
-    def test_create_inherits_root_model_when_flag_missing(
+    def test_create_defaults_to_tier_t0_when_flag_missing(
         self, tmp_path: Path,
     ):
-        """Default for ``--model`` is the root agent's model, not the
-        ambient ``DEFAULT_MODEL`` constant — so renaming pip-boy's
-        model propagates to freshly-created sub-agents."""
-        workspace = tmp_path / "workspace"
-        (workspace / ".pip").mkdir(parents=True, exist_ok=True)
-        # Force pip-boy's persisted model to something distinct before
-        # ``_build_ctx`` loads the registry from disk.
-        (workspace / ".pip" / "persona.md").write_text(
-            "---\nname: Pip-Boy\nmodel: claude-haiku-4-0\n---\n"
-            "# Identity\n\nYou are {agent_name}, a personal assistant.\n",
-            encoding="utf-8",
-        )
+        """Without ``--model``, sub-agents default to the strongest
+        tier (``t0``). Concrete model names are resolved at call time
+        from ``MODEL_T*`` env vars and never persisted in persona."""
         ctx = _build_ctx(_cli_inbound("/subagent create helper"), tmp_path)
         result = dispatch_command(ctx)
         assert result.handled, result.response
 
         cfg = ctx.registry.get_agent("helper")
         assert cfg is not None
-        assert cfg.model == "claude-haiku-4-0"
+        assert cfg.model == "t0"
+
+    def test_create_rejects_invalid_tier(self, tmp_path: Path):
+        ctx = _build_ctx(
+            _cli_inbound("/subagent create helper --model claude-opus-4-6"),
+            tmp_path,
+        )
+        result = dispatch_command(ctx)
+        assert result.handled
+        body = (result.response or "").lower()
+        assert "model" in body
+        assert "t0" in body or "tier" in body
+        assert ctx.registry.get_agent("helper") is None
 
     def test_create_rejects_invalid_dm_scope(self, tmp_path: Path):
         ctx = _build_ctx(

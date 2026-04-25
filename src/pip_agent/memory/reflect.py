@@ -24,8 +24,9 @@ from pathlib import Path
 
 import anthropic
 
-from pip_agent.anthropic_client import build_anthropic_client, default_direct_sdk_model
+from pip_agent.anthropic_client import build_anthropic_client
 from pip_agent.memory.transcript_source import load_formatted
+from pip_agent.models import with_model_fallback
 from pip_agent.types import Observation
 
 log = logging.getLogger(__name__)
@@ -82,10 +83,11 @@ _REFLECT_SYSTEM_CACHE: str | None = None
 # push us past the 200K context window.
 _MAX_PROMPT_CHARS = 60000
 
-# No module-level DEFAULT_REFLECT_MODEL — the shared rule in
-# ``anthropic_client.default_direct_sdk_model()`` governs. Forking a model
-# constant here caused a regression where ``claude-sonnet-4-5`` was sent to
-# proxies that only whitelisted the agent's own configured model.
+# Tier ``t1`` is hard-coded for reflect (see ``pip_agent.models.TASK_TIER``):
+# observation extraction is async / non-interactive, so we pick a mid-cost
+# model and degrade through :func:`with_model_fallback` if the head of the
+# chain is unavailable. Do NOT introduce a stage-local model constant — every
+# Pip-side model selection MUST flow through the tier registry.
 
 
 def _get_reflect_system() -> str:
@@ -116,7 +118,6 @@ def reflect_from_jsonl(
     *,
     start_offset: int = 0,
     agent_id: str,
-    model: str = "",
     client: anthropic.Anthropic | None = None,
 ) -> tuple[int, list[Observation]]:
     """Run L1 reflection over new lines in ``transcript_path``.
@@ -159,9 +160,6 @@ def reflect_from_jsonl(
     if llm is None:
         return start_offset, []
 
-    if not model:
-        model = default_direct_sdk_model()
-
     current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     prompt = (
         f"Current time: {current_time}\n\n"
@@ -170,13 +168,16 @@ def reflect_from_jsonl(
         "Extract observations now."
     )
 
-    try:
-        response = llm.messages.create(
-            model=model,
+    def _call(model_name: str):
+        return llm.messages.create(
+            model=model_name,
             max_tokens=1024,
             system=_get_reflect_system(),
             messages=[{"role": "user", "content": prompt}],
         )
+
+    try:
+        response = with_model_fallback("t1", _call, label="reflect")
     except Exception as exc:  # noqa: BLE001
         log.warning("reflect LLM call failed: %s", exc)
         return start_offset, []
@@ -308,7 +309,6 @@ def reflect_and_persist(
     session_id: str,
     transcript_path: Path | str,
     client: anthropic.Anthropic | None = None,
-    model: str = "",
 ) -> tuple[int, int, int]:
     """Reflect a session's delta, persist observations, advance the cursor.
 
@@ -343,7 +343,6 @@ def reflect_and_persist(
         Path(transcript_path),
         start_offset=start_offset,
         agent_id=memory_store.agent_id,
-        model=model,
         client=client,
     )
 

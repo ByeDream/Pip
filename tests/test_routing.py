@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from pip_agent.models import DEFAULT_TIER
 from pip_agent.routing import (
     DEFAULT_AGENT_ID,
     DEFAULT_DM_SCOPE,
-    DEFAULT_MODEL,
     AgentConfig,
     AgentRegistry,
     Binding,
@@ -49,13 +49,21 @@ class TestNormalizeAgentId:
 class TestAgentConfig:
     def test_defaults(self):
         cfg = AgentConfig(id="test")
-        assert cfg.effective_model == DEFAULT_MODEL
+        assert cfg.tier == DEFAULT_TIER
         assert cfg.effective_dm_scope == DEFAULT_DM_SCOPE
 
     def test_overridden(self):
-        cfg = AgentConfig(id="custom", model="gpt-4o", dm_scope="main")
-        assert cfg.effective_model == "gpt-4o"
+        cfg = AgentConfig(id="custom", model="t1", dm_scope="main")
+        assert cfg.tier == "t1"
         assert cfg.effective_dm_scope == "main"
+
+    def test_invalid_model_falls_back_to_default_tier(self):
+        # Persona files predating the tier registry, or hand-edited to
+        # stale model names, must not crash the loader. The unknown
+        # value silently degrades to the default tier; a warning is
+        # logged elsewhere for operator visibility.
+        cfg = AgentConfig(id="legacy", model="claude-opus-4-6")
+        assert cfg.tier == DEFAULT_TIER
 
     def test_system_prompt(self):
         cfg = AgentConfig(id="bot", name="TestBot", system_body="Working at {workdir}.")
@@ -67,19 +75,23 @@ class TestAgentConfig:
         prompt = cfg.system_prompt()
         assert prompt == ""
 
-    def test_system_prompt_substitutes_agent_name(self):
+    def test_system_prompt_substitutes_agent_name(self, monkeypatch):
         # ``{agent_name}`` is the source of truth for how the model
         # introduces itself — it's sourced from YAML ``name:`` with a
         # fallback to id so frontmatter edits take effect without a
-        # body rewrite.
+        # body rewrite. ``{model_name}`` resolves through the tier
+        # registry to the head of the candidate chain.
+        from pip_agent import config
+
+        monkeypatch.setattr(config.settings, "model_t0", "claude-test-strong")
         cfg = AgentConfig(
             id="helper", name="Stella",
             system_body="You are {agent_name}, an assistant running {model_name}.",
-            model="claude-opus-4-6",
+            model="t0",
         )
         prompt = cfg.system_prompt()
         assert "You are Stella" in prompt
-        assert "claude-opus-4-6" in prompt
+        assert "claude-test-strong" in prompt
 
     def test_system_prompt_agent_name_fallback_to_id(self):
         cfg = AgentConfig(id="helper", system_body="You are {agent_name}.")
@@ -97,7 +109,7 @@ class TestAgentConfigFromFile:
             "---\n"
             "id: test-bot\n"
             "name: TestBot\n"
-            "model: gpt-4\n"
+            "model: t1\n"
             "dm_scope: main\n"
             "---\n"
             "Be concise.\n",
@@ -106,7 +118,7 @@ class TestAgentConfigFromFile:
         cfg = agent_config_from_file(md)
         assert cfg.id == "test-bot"
         assert cfg.name == "TestBot"
-        assert cfg.model == "gpt-4"
+        assert cfg.model == "t1"
         assert cfg.dm_scope == "main"
         assert cfg.system_body == "Be concise."
 
@@ -136,7 +148,7 @@ class TestAgentConfigFromFile:
             "---\n"
             "id: legacy\n"
             "name: Legacy\n"
-            "model: gpt-4\n"
+            "model: t2\n"
             "max_tokens: 2048\n"
             "compact_threshold: 10000\n"
             "compact_micro_age: 2\n"
@@ -146,8 +158,21 @@ class TestAgentConfigFromFile:
         )
         cfg = agent_config_from_file(md)
         assert cfg.name == "Legacy"
-        assert cfg.model == "gpt-4"
+        assert cfg.model == "t2"
         assert not hasattr(cfg, "max_tokens")
+
+    def test_invalid_tier_value_normalises_to_empty(self, tmp_path):
+        # Hand-edited persona.md with a non-tier model field doesn't
+        # break the load — the value is dropped (falls back to default
+        # tier at runtime via :attr:`AgentConfig.tier`).
+        md = tmp_path / "stale.md"
+        md.write_text(
+            "---\nid: stale\nmodel: claude-opus-4-6\n---\nBody.\n",
+            encoding="utf-8",
+        )
+        cfg = agent_config_from_file(md)
+        assert cfg.model == ""
+        assert cfg.tier == DEFAULT_TIER
 
 
 class TestBinding:

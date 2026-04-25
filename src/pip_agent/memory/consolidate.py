@@ -16,6 +16,7 @@ from pathlib import Path
 
 import anthropic
 
+from pip_agent.models import with_model_fallback
 from pip_agent.types import Memory, Observation
 
 log = logging.getLogger(__name__)
@@ -126,14 +127,13 @@ def consolidate(
     observations: list[Observation],
     memories: list[Memory],
     cycle_count: int,
-    *,
-    model: str = "",
 ) -> list[Memory]:
-    """L2: merge observations into memories. Returns updated memory list."""
-    from pip_agent.anthropic_client import default_direct_sdk_model
-    if not model:
-        model = default_direct_sdk_model()
+    """L2: merge observations into memories. Returns updated memory list.
 
+    Tier ``t1`` — consolidation is async / non-interactive and benefits
+    from a mid-cost model. Falls back down the chain on model-invalid
+    failures via :func:`pip_agent.models.with_model_fallback`.
+    """
     if not observations and not memories:
         return []
 
@@ -155,13 +155,16 @@ def consolidate(
         "Produce the updated memory list now."
     )
 
-    try:
-        response = client.messages.create(
-            model=model,
+    def _call(model_name: str):
+        return client.messages.create(
+            model=model_name,
             max_tokens=4096,
             system=_get_consolidate_system(),
             messages=[{"role": "user", "content": prompt}],
         )
+
+    try:
+        response = with_model_fallback("t1", _call, label="consolidate")
     except Exception as exc:
         log.warning("consolidate LLM call failed: %s", exc)
         return memories
@@ -206,17 +209,15 @@ def consolidate(
 def distill_axioms(
     client: anthropic.Anthropic,
     memories: list[Memory],
-    *,
-    model: str = "",
 ) -> str:
     """L3: distill high-stability memories into judgment principles.
 
-    Returns markdown text for axioms.md, or empty string if nothing qualifies.
+    Returns markdown text for axioms.md, or empty string if nothing
+    qualifies. Tier ``t0`` — axioms are the highest-leverage long-term
+    output of the memory pipeline, so we spend the strongest model on
+    them and let :func:`pip_agent.models.with_model_fallback` degrade if
+    the head of the chain is unavailable.
     """
-    from pip_agent.anthropic_client import default_direct_sdk_model
-    if not model:
-        model = default_direct_sdk_model()
-
     candidates = [
         m for m in memories
         if m.get("count", 0) >= PROMOTE_COUNT
@@ -234,13 +235,16 @@ def distill_axioms(
         "Distill these into judgment principles now."
     )
 
-    try:
-        response = client.messages.create(
-            model=model,
+    def _call(model_name: str):
+        return client.messages.create(
+            model=model_name,
             max_tokens=2048,
             system=_get_axiom_system(),
             messages=[{"role": "user", "content": prompt}],
         )
+
+    try:
+        response = with_model_fallback("t0", _call, label="axioms")
     except Exception as exc:
         log.warning("distill_axioms LLM call failed: %s", exc)
         return ""

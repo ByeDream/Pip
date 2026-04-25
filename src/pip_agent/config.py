@@ -34,6 +34,17 @@ class Settings(BaseSettings):
     anthropic_auth_token: str = Field(default="")
     anthropic_base_url: str = Field(default="")
 
+    # Three model tiers, ordered strongest to cheapest. Pip-Boy never uses
+    # a concrete model name at a call site — every site picks a tier
+    # (t0/t1/t2) and resolves through :mod:`pip_agent.models`. Async /
+    # background tasks (heartbeat, cron, reflect, dream) are pinned to
+    # fixed tiers in code; persona-driven turns pick their tier from
+    # ``persona.md``. Failures degrade DOWN the chain (t0 -> t1 -> t2);
+    # never up.
+    model_t0: str = Field(default="")
+    model_t1: str = Field(default="")
+    model_t2: str = Field(default="")
+
     # Controls *only* the logging threshold — see
     # ``pip_agent.__main__._configure_logging``. Streaming agent replies
     # and ``[tool: ...]`` traces are part of the interactive CLI contract

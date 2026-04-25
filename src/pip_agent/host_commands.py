@@ -351,7 +351,9 @@ CLI-only commands (unavailable on remote channels):
                                 safe for a directory name.
       [--name NAME]             Default: same as id. Human-facing display
                                 name; can be mixed-case, spaces, CJK.
-      [--model MODEL]           Default: pip-boy's model.
+      [--model {t0|t1|t2}]      Default: t0. Picks a model tier;
+                                concrete model names live in MODEL_T*
+                                env vars and are resolved at call time.
       [--dm_scope SCOPE]        Default: per-guild.
                                 Valid: main | per-guild | per-guild-peer.
   /subagent archive <id>        pip-boy only: move <id>/.pip/ to
@@ -425,9 +427,14 @@ def _cmd_status(ctx: CommandContext, _args: str) -> CommandResult:
         dm_scope=effective.effective_dm_scope,
     )
 
+    from pip_agent.models import primary_model
+
+    tier = effective.tier
+    resolved = primary_model(tier)  # type: ignore[arg-type]
+    model_display = f"{tier} ({resolved})" if resolved else f"{tier} (no model configured)"
     lines = [
         f"Agent: {agent.name or agent.id} ({agent.id})",
-        f"Model: {effective.effective_model}",
+        f"Model: {model_display}",
         f"Scope: {effective.effective_dm_scope}",
         f"Session: {sk}",
         f"Channel: {inbound.channel}",
@@ -759,13 +766,14 @@ _VALID_DM_SCOPES = {"main", "per-guild", "per-guild-peer"}
 
 _CREATE_USAGE = (
     "Usage: /subagent create <label> [--id ID] [--name NAME] "
-    "[--model MODEL] [--dm_scope SCOPE]\n"
+    "[--model {t0|t1|t2}] [--dm_scope SCOPE]\n"
     "The positional <label> is the directory name under the workspace "
     "root. --id is the agent's identity key (registry + session + bind "
     "target); it defaults to <label> when omitted, so the two stay in "
     "sync for the simple case. Provide --id to decouple them.\n"
-    "Defaults: --name <id>, --model <root agent's model>, "
-    "--dm_scope per-guild.\n"
+    "Defaults: --name <id>, --model t0, --dm_scope per-guild.\n"
+    "--model picks a tier (t0 strongest, t2 cheapest); concrete model "
+    "names live in MODEL_T0/MODEL_T1/MODEL_T2 in .env.\n"
     "Valid scopes: main | per-guild | per-guild-peer."
 )
 
@@ -875,8 +883,21 @@ def _agent_create(ctx: CommandContext, tail: list[str]) -> CommandResult:
 
     display_name = opts.get("--name") or agent_id
 
-    root_cfg = ctx.registry.default_agent()
-    model = opts.get("--model") or (root_cfg.model or "")
+    # ``model`` is a tier name (t0/t1/t2) — concrete model identifiers
+    # live in MODEL_T* in .env. Default to t0 so a fresh sub-agent runs
+    # on the strongest tier unless the operator explicitly downshifts.
+    from pip_agent.models import DEFAULT_TIER, VALID_TIERS
+
+    raw_model = (opts.get("--model") or "").strip().lower()
+    if raw_model and raw_model not in VALID_TIERS:
+        return CommandResult(
+            handled=True,
+            response=(
+                f"Invalid --model '{raw_model}'. "
+                f"Valid: {', '.join(sorted(VALID_TIERS))}."
+            ),
+        )
+    model = raw_model or DEFAULT_TIER
 
     dm_scope = opts.get("--dm_scope") or "per-guild"
     if dm_scope not in _VALID_DM_SCOPES:
