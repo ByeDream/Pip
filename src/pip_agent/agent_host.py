@@ -2694,6 +2694,23 @@ def run_host(*, force_no_tui: bool = False) -> None:
     _profile.cold_start("run_host_entered")
 
     ensure_workspace(WORKDIR)
+    # File log is installed AFTER scaffold so ``.pip/`` is guaranteed
+    # to exist, but BEFORE anything else that might emit records we
+    # want captured (settings check, plugin bootstrap, registry/binding
+    # load, scheduler start). Rotation happens on the way in — the
+    # previous run's log becomes ``pip-boy.1.log`` and anything older
+    # than ``pip-boy.2.log`` is dropped.
+    from pip_agent.logging_setup import install_file_logging
+
+    try:
+        file_log_handler = install_file_logging(WORKDIR)
+    except OSError:
+        log.exception(
+            "Could not install file log under %s/.pip/log/; "
+            "continuing without persistent log capture.",
+            WORKDIR,
+        )
+        file_log_handler = None
     settings.check_required()
     _bootstrap_plugin_marketplaces()
 
@@ -3179,6 +3196,15 @@ def run_host(*, force_no_tui: bool = False) -> None:
         if tui_log_handler is not None:
             try:
                 logging.getLogger().removeHandler(tui_log_handler)
+            except Exception:  # noqa: BLE001
+                pass
+        # Flush + close the file handler so the final shutdown message
+        # actually lands on disk. Next ``run_host`` installs its own.
+        if file_log_handler is not None:
+            try:
+                file_log_handler.flush()
+                logging.getLogger().removeHandler(file_log_handler)
+                file_log_handler.close()
             except Exception:  # noqa: BLE001
                 pass
         from pip_agent.host_io import uninstall_pump

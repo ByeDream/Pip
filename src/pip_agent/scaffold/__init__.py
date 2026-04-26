@@ -297,6 +297,10 @@ def _ensure_dirs(workdir: Path) -> None:
         # operator's sandbox (edit / add / delete freely — scaffold
         # respects deletions via ``installed_once`` in the manifest).
         ".pip/themes",
+        # Per-run log files live here (``pip-boy.log`` + rotated
+        # backups ``pip-boy.1.log`` / ``pip-boy.2.log``). See
+        # :mod:`pip_agent.logging_setup`.
+        ".pip/log",
     ]
     for rel in dirs:
         d = workdir / rel
