@@ -602,6 +602,37 @@ async def _run_one_attempt(
             err=result.error[:200],
             stderr_chars=len(captured),
         )
+    except Exception as exc:
+        # Catch-all for non-ClaudeSDKError exceptions escaping the SDK
+        # iterator. Notably covers the bare ``Exception`` raised by
+        # ``Query.receive_messages`` (``_internal/query.py``) when the
+        # background reader posts a ``{"type": "error"}`` envelope after
+        # subprocess exit-code != 0: the type info and full stack are
+        # lost by the time they reach ``agent_host``'s outer catch, so
+        # surface them here before re-raising.
+        if streaming_line_open:
+            print(flush=True)
+        captured = stderr_buf.text() if stderr_buf is not None else ""
+        log.exception(
+            "runner: non-SDK exception escaping attempt "
+            "(type=%s, stderr_chars=%d): %r",
+            type(exc).__name__,
+            len(captured),
+            exc,
+        )
+        if captured:
+            log.warning(
+                "runner: claude.exe stderr at non-SDK exception (%d chars): %s",
+                len(captured),
+                captured[:2000],
+            )
+        _profile.event(  # PROFILE
+            "runner.non_sdk_error",
+            exc_type=type(exc).__name__,
+            err=str(exc)[:200],
+            stderr_chars=len(captured),
+        )
+        raise
     finally:
         # Dump captured stderr whenever the subprocess wrote anything,
         # regardless of how we're exiting. The ``except ClaudeSDKError``

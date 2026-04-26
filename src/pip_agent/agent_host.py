@@ -2049,7 +2049,12 @@ class AgentHost:
                                 on_stream_event=stream_event_cb,
                             )
                 except Exception as exc:
-                    log.error("SDK query failed for %s: %s", sk, exc)
+                    log.exception(
+                        "SDK query failed for %s (type=%s): %s",
+                        sk,
+                        type(exc).__name__,
+                        exc,
+                    )
                     tracked.failure(f"SDK query failed: {exc}")
                     # Close the in-flight reply bubble with an inline
                     # error notice so the user isn't left staring at a
