@@ -602,6 +602,26 @@ async def _run_one_attempt(
             err=result.error[:200],
             stderr_chars=len(captured),
         )
+    finally:
+        # Dump captured stderr whenever the subprocess wrote anything,
+        # regardless of how we're exiting. The ``except ClaudeSDKError``
+        # branch above enriches the error message, but other exception
+        # paths escape it — e.g. the SDK's background message-reader
+        # task faulting after ``ResultMessage`` has already been
+        # processed (observed as "Fatal error in message reader:
+        # Command failed with exit code 1" logged by the SDK itself,
+        # then a bare ``ProcessError`` re-raised from a teardown path
+        # that sidesteps our ``async for``). The ``if captured:`` guard
+        # keeps this silent on the happy path because ``claude.exe``
+        # does not write to stderr on clean runs.
+        if stderr_buf is not None:
+            captured = stderr_buf.text()
+            if captured:
+                log.warning(
+                    "runner: claude.exe stderr (%d chars): %s",
+                    len(captured),
+                    captured[:2000],
+                )
 
     return result
 
