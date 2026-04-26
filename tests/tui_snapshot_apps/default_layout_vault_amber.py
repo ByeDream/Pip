@@ -17,7 +17,6 @@ from pip_agent.tui.app import PipBoyTuiApp
 from pip_agent.tui.loader import load_builtin_theme
 from pip_agent.tui.pump import UiPump
 
-
 _bundle = load_builtin_theme("vault-amber")
 _pump = UiPump()
 app = PipBoyTuiApp(theme=_bundle, pump=_pump)

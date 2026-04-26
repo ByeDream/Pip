@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 __all__ = [
@@ -160,22 +161,20 @@ class ThemeManifest:
 
 @dataclass(frozen=True, slots=True)
 class ThemeBundle:
-    """Loaded theme: manifest + raw TCSS + clamped art + provenance.
+    """Loaded theme: manifest + raw TCSS + clamped art + on-disk path.
 
-    ``source`` carries provenance for ``/theme list`` and the doctor
-    output: ``"builtin:wasteland"`` vs. ``"local:my-theme"``. The
-    loader (Phase B) sets it.
+    ``path`` records the directory the bundle was loaded from so
+    ``/theme list``, ``pip-boy doctor`` and the TUI's live-apply logic
+    can point the operator at the exact place to edit.
     """
 
     manifest: ThemeManifest
     tcss: str
     art: str
-    source: str
-    """Provenance string. Format: ``<origin>:<name>``.
-
-    ``origin`` is one of ``builtin`` or ``local``. The string is
-    user-facing (shows up in ``/theme list``) so authors don't see
-    paths but a consistent, slug-based identifier."""
+    path: Path
+    """Directory the theme was loaded from, e.g.
+    ``<workspace>/.pip/themes/wasteland``. Always an absolute path
+    after :func:`pip_agent.tui.manager.load_theme_bundle` returns."""
 
     art_truncated: bool = False
     """True iff the loader trimmed ``art`` to fit ``ART_MAX_*`` limits.

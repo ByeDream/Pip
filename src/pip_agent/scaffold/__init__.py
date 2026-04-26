@@ -12,6 +12,7 @@ The workspace root itself belongs to the default ``pip-boy`` agent:
         observations/
         incoming/
         credentials/
+        themes/             <- TUI themes; seeded on first boot from wheel
         bindings.json
         agents_registry.json
         sdk_sessions.json
@@ -36,6 +37,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from pip_agent import __version__
+from pip_agent.tui.themes import BUILTIN_THEMES_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,28 @@ def _file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _dir_hash(root: Path) -> str:
+    """Stable combined hash over all files in a theme directory.
+
+    The hash covers ``theme.toml`` / ``theme.tcss`` / ``art.txt`` (when
+    present) so a template update to any of them triggers the
+    "refresh seed" branch. We deliberately ignore sub-directories —
+    themes are flat by contract — and ignore hidden files so a
+    stray ``.DS_Store`` doesn't flip the hash.
+    """
+    h = hashlib.sha256()
+    for entry in sorted(root.iterdir(), key=lambda p: p.name):
+        if not entry.is_file():
+            continue
+        if entry.name.startswith("."):
+            continue
+        h.update(entry.name.encode("utf-8"))
+        h.update(b"\0")
+        h.update(entry.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
 def _load_manifest(workdir: Path) -> dict:
     mp = workdir / ".pip" / _MANIFEST_NAME
     if mp.is_file():
@@ -63,7 +87,7 @@ def _load_manifest(workdir: Path) -> dict:
             return json.loads(mp.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             logger.warning("Corrupt scaffold manifest; rebuilding.")
-    return {"version": "0.0.0", "files": {}}
+    return {"version": "0.0.0", "files": {}, "themes": {}}
 
 
 def _save_manifest(workdir: Path, manifest: dict) -> None:
@@ -142,12 +166,119 @@ def ensure_workspace(workdir: Path, *, default_agent_id: str = "pip-boy") -> Non
                 )
             del files_meta[rel]
 
+    themes_meta = manifest.get("themes")
+    if not isinstance(themes_meta, dict):
+        themes_meta = {}
+    _seed_themes(workdir, themes_meta)
+
     manifest["version"] = __version__
     manifest["files"] = files_meta
+    manifest["themes"] = themes_meta
     _save_manifest(workdir, manifest)
 
     _ensure_gitignore(workdir)
     _check_git(workdir)
+
+
+def _seed_themes(workdir: Path, themes_meta: dict) -> None:
+    """Copy package-seeded themes into ``<workspace>/.pip/themes/``.
+
+    On first boot every seed directory is copied. On subsequent boots:
+
+    * If the target is missing AND the manifest records we installed
+      it before (``installed_once = True``), we respect the operator's
+      deletion — no re-copy.
+    * If the seed's combined hash matches the manifest, nothing to do.
+    * If the seed hash changed AND the current workspace copy matches
+      the previously-installed seed (user hasn't edited), refresh it.
+    * If the seed hash changed AND the user has edited, skip with a
+      WARNING so the operator can diff + merge manually.
+
+    Seeded themes that no longer ship (e.g. renamed upstream) stay in
+    the workspace untouched — we only clean the manifest entry so a
+    future seed with the same slug doesn't surprise the operator.
+    """
+    if not BUILTIN_THEMES_DIR.is_dir():
+        logger.warning(
+            "Seed themes directory missing: %s", BUILTIN_THEMES_DIR,
+        )
+        return
+
+    themes_root = workdir / ".pip" / "themes"
+    themes_root.mkdir(parents=True, exist_ok=True)
+
+    seeds: dict[str, Path] = {}
+    for seed_dir in sorted(BUILTIN_THEMES_DIR.iterdir(), key=lambda p: p.name):
+        if not seed_dir.is_dir():
+            continue
+        if seed_dir.name.startswith("."):
+            continue
+        if seed_dir.name == "__pycache__":
+            continue
+        seeds[seed_dir.name] = seed_dir
+
+    for slug, seed_dir in seeds.items():
+        target = themes_root / slug
+        rel_key = f".pip/themes/{slug}/"
+        seed_hash = _dir_hash(seed_dir)
+
+        prev = themes_meta.get(rel_key)
+
+        if not target.exists():
+            if isinstance(prev, dict) and prev.get("installed_once"):
+                logger.debug(
+                    "Seed theme '%s' was deleted by operator; not re-seeding.",
+                    slug,
+                )
+                continue
+            shutil.copytree(seed_dir, target)
+            themes_meta[rel_key] = {
+                "seed_hash": seed_hash,
+                "installed_once": True,
+                "installed_version": __version__,
+            }
+            logger.info("Seeded theme: %s", target)
+            continue
+
+        if not isinstance(prev, dict):
+            themes_meta[rel_key] = {
+                "seed_hash": _dir_hash(target),
+                "installed_once": True,
+                "installed_version": __version__,
+            }
+            continue
+
+        old_seed_hash = prev.get("seed_hash", "")
+        if old_seed_hash == seed_hash:
+            continue
+
+        current_hash = _dir_hash(target)
+        if current_hash == old_seed_hash:
+            shutil.rmtree(target)
+            shutil.copytree(seed_dir, target)
+            themes_meta[rel_key] = {
+                "seed_hash": seed_hash,
+                "installed_once": True,
+                "installed_version": __version__,
+            }
+            logger.info("Refreshed seed theme: %s", target)
+        else:
+            logger.warning(
+                "Seed theme '%s' updated upstream but workspace copy has "
+                "local edits; leaving alone. Diff against %s and merge "
+                "manually if you want the new default.",
+                slug, seed_dir,
+            )
+
+    tracked_keys = {f".pip/themes/{slug}/" for slug in seeds}
+    for rel_key in list(themes_meta):
+        if rel_key not in tracked_keys:
+            logger.info(
+                "Seed theme '%s' no longer ships; removing manifest entry "
+                "(workspace copy left untouched).",
+                rel_key,
+            )
+            del themes_meta[rel_key]
 
 
 def _ensure_dirs(workdir: Path) -> None:
@@ -161,10 +292,10 @@ def _ensure_dirs(workdir: Path) -> None:
         ".pip/addressbook",
         ".pip/incoming",
         ".pip/credentials",
-        # Local theme drop-in directory. Themes here are picked up by
-        # :class:`pip_agent.tui.ThemeManager` and listed via
-        # ``/theme list``. Phase B keeps this an empty placeholder
-        # plus the README file written by ``_SCAFFOLD_FILES`` above.
+        # TUI theme directory. ``_seed_themes`` copies the wheel's
+        # bundled themes here on first boot; afterwards it's the
+        # operator's sandbox (edit / add / delete freely — scaffold
+        # respects deletions via ``installed_once`` in the manifest).
         ".pip/themes",
     ]
     for rel in dirs:

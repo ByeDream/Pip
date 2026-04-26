@@ -318,21 +318,22 @@ pip-boy doctor     # one-shot env + capability + theme report
 ```
 
 Themes are data-driven: a `theme.toml` manifest, a `theme.tcss` Textual CSS
-file, and an optional `art.txt`. Two themes ship in the wheel
-(`wasteland` and `vault-amber`); local themes drop into
-`<workspace>/.pip/themes/<slug>/` and override built-ins of the same name.
+file, and an optional `art.txt`. Pip-Boy seeds a few example themes
+(`wasteland`, `vault-amber`) into `<workspace>/.pip/themes/` on first
+boot; after that the directory is yours to edit, extend, or prune.
 
 ```text
-/theme list                # installed themes (built-in + local)
-/theme show                # active theme + persisted preference
-/theme set <slug>          # persist <slug> for the next boot
+/theme list                # installed themes (active marked with *)
+/theme set <slug>          # switch NOW + persist the new default
+/theme refresh             # rescan .pip/themes/ after adding / editing a theme
 ```
 
-Selection precedence: `PIP_TUI_THEME` env var → `host_state.json` (set via
-`/theme set`) → package default `wasteland`. Live reload is intentionally
-out of scope in v1; restart pip-boy after `/theme set` to apply. Themes
-own appearance only — widget topology, layout fractions, and pump wiring
-are framework invariants guarded by SVG snapshot tests.
+`/theme set` applies the new bundle to the live TUI in one shot —
+colours, TCSS, and ASCII art all flip, the agent log history is
+preserved, and the selection is written to `<workspace>/.pip/host_state.json`
+so the next boot comes up in the same theme. Themes own appearance
+only — widget topology, layout fractions, and pump wiring are framework
+invariants guarded by SVG snapshot tests.
 
 See [`docs/themes.md`](docs/themes.md) for the full author guide,
 including the locked palette tokens, widget IDs you can style, the

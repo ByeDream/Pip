@@ -15,7 +15,6 @@ import pytest
 
 from pip_agent.host_state import (
     HOST_STATE_FILENAME,
-    TUI_THEME_ENV_VAR,
     HostState,
     load_host_state,
     resolve_active_theme_name,
@@ -121,7 +120,7 @@ def test_resolve_uses_default_when_nothing_set(
 ) -> None:
     state = HostState(workspace_pip_dir=workspace_pip_dir)
     assert (
-        resolve_active_theme_name(state=state, env={}, default="wasteland")
+        resolve_active_theme_name(state=state, default="wasteland")
         == "wasteland"
     )
 
@@ -133,36 +132,13 @@ def test_resolve_prefers_state_over_default(
     state.set_theme("vault-amber")
 
     assert (
-        resolve_active_theme_name(state=state, env={}, default="wasteland")
-        == "vault-amber"
-    )
-
-
-def test_resolve_prefers_env_over_state(workspace_pip_dir: Path) -> None:
-    state = HostState(workspace_pip_dir=workspace_pip_dir)
-    state.set_theme("vault-amber")
-
-    env = {TUI_THEME_ENV_VAR: "wasteland"}
-    assert (
-        resolve_active_theme_name(state=state, env=env, default="other")
-        == "wasteland"
-    )
-
-
-def test_resolve_ignores_blank_env_override(workspace_pip_dir: Path) -> None:
-    state = HostState(workspace_pip_dir=workspace_pip_dir)
-    state.set_theme("vault-amber")
-
-    env = {TUI_THEME_ENV_VAR: "   "}
-    assert (
-        resolve_active_theme_name(state=state, env=env, default="other")
+        resolve_active_theme_name(state=state, default="wasteland")
         == "vault-amber"
     )
 
 
 def test_resolve_works_without_state_object() -> None:
-    env = {TUI_THEME_ENV_VAR: "vault-amber"}
     assert (
-        resolve_active_theme_name(state=None, env=env, default="wasteland")
-        == "vault-amber"
+        resolve_active_theme_name(state=None, default="wasteland")
+        == "wasteland"
     )

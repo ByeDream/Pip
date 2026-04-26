@@ -9,10 +9,9 @@ Exercises:
 
 from __future__ import annotations
 
+from pip_agent.tui.app import PipBoyTuiApp
 from pip_agent.tui.loader import load_builtin_theme
 from pip_agent.tui.pump import UiPump
-from pip_agent.tui.app import PipBoyTuiApp
-
 
 _bundle = load_builtin_theme("wasteland")
 _pump = UiPump()

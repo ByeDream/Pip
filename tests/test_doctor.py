@@ -100,6 +100,19 @@ def workspace(tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.fixture
+def seeded_workspace(workspace: Path) -> Path:
+    """Workspace with the two canonical themes present on disk.
+
+    The real host reaches this state via :func:`ensure_workspace`
+    (scaffold seeding). Tests skip that step and write the bytes
+    directly so they stay independent of the scaffold implementation.
+    """
+    _write_local_theme(workspace, "wasteland")
+    _write_local_theme(workspace, "vault-amber")
+    return workspace
+
+
 # ---------------------------------------------------------------------------
 # Section / shape
 # ---------------------------------------------------------------------------
@@ -171,26 +184,23 @@ class TestCapabilityLadder:
 
 
 class TestThemes:
-    def test_lists_builtin_themes_and_marks_active(
-        self, workspace: Path,
+    def test_lists_themes_and_marks_active(
+        self, seeded_workspace: Path,
     ) -> None:
-        report = render_to_string(workdir=workspace, force_no_tui=True)
+        report = render_to_string(workdir=seeded_workspace, force_no_tui=True)
         assert "wasteland" in report
         assert "vault-amber" in report
         # Active theme (default = wasteland) must be visibly marked.
         assert "wasteland *" in report or "wasteland*" in report
 
-    def test_local_override_appears_with_local_origin(
+    def test_empty_workspace_reports_no_themes(
         self, workspace: Path,
     ) -> None:
-        _write_local_theme(workspace, "wasteland")
         report = render_to_string(workdir=workspace, force_no_tui=True)
-        assert "[local] wasteland" in report
-        # The builtin entry with the same slug must NOT appear once
-        # the local copy has won the precedence chain.
-        assert "[builtin] wasteland" not in report
+        assert "installed (0)" in report
+        assert "(none)" in report
 
-    def test_broken_local_theme_listed_in_issues(
+    def test_broken_theme_listed_in_issues(
         self, workspace: Path,
     ) -> None:
         _write_broken_local_theme(workspace, "broken")

@@ -149,3 +149,71 @@ def test_no_git_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> Non
 
     assert any("Not a git repository" in r.message for r in caplog.records)
     assert (tmp_path / ".pip").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Theme seeding (Change 1): wheel seeds → workspace; deletion is respected.
+# ---------------------------------------------------------------------------
+
+
+def _seeded_theme_slugs() -> set[str]:
+    from pip_agent.tui.themes import BUILTIN_THEMES_DIR
+
+    return {
+        child.name
+        for child in BUILTIN_THEMES_DIR.iterdir()
+        if child.is_dir()
+        and not child.name.startswith(".")
+        and child.name != "__pycache__"
+    }
+
+
+def test_seed_themes_copied_on_first_boot(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    ensure_workspace(tmp_path)
+
+    themes_root = tmp_path / ".pip" / "themes"
+    for slug in _seeded_theme_slugs():
+        assert (themes_root / slug / "theme.toml").is_file(), (
+            f"seed theme '{slug}' not copied to {themes_root}"
+        )
+
+    manifest = json.loads(
+        (tmp_path / ".pip" / _MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    for slug in _seeded_theme_slugs():
+        assert manifest["themes"][f".pip/themes/{slug}/"]["installed_once"] is True
+
+
+def test_deleted_seed_theme_is_not_re_created(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    ensure_workspace(tmp_path)
+
+    slug = next(iter(_seeded_theme_slugs()))
+    theme_dir = tmp_path / ".pip" / "themes" / slug
+    import shutil
+
+    shutil.rmtree(theme_dir)
+
+    # Second boot must respect the deletion.
+    ensure_workspace(tmp_path)
+    assert not theme_dir.exists(), (
+        f"scaffold re-created '{slug}' after operator deleted it"
+    )
+
+
+def test_edited_seed_theme_is_not_overwritten(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    ensure_workspace(tmp_path)
+
+    slug = next(iter(_seeded_theme_slugs()))
+    theme_toml = tmp_path / ".pip" / "themes" / slug / "theme.toml"
+    edited = theme_toml.read_text(encoding="utf-8") + "\n# local tweak\n"
+    theme_toml.write_text(edited, encoding="utf-8")
+
+    # Subsequent boots must leave the edit in place (scaffold can't tell
+    # whether the user prefers their version — only the user can).
+    ensure_workspace(tmp_path)
+    assert theme_toml.read_text(encoding="utf-8") == edited

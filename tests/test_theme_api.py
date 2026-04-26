@@ -6,6 +6,8 @@ silently drifts the surface theme authors program against.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from pip_agent.tui.theme_api import (
@@ -20,7 +22,6 @@ from pip_agent.tui.theme_api import (
     validate_manifest_dict,
     validate_palette_dict,
 )
-
 
 # ---------------------------------------------------------------------------
 # Palette tokens
@@ -181,23 +182,23 @@ class TestClampArt:
 
 
 class TestThemeBundle:
-    def test_bundle_carries_manifest_tcss_art_source(self) -> None:
+    def test_bundle_carries_manifest_tcss_art_path(self) -> None:
         manifest = validate_manifest_dict(_full_manifest_dict())
         bundle = ThemeBundle(
             manifest=manifest,
             tcss="Screen { background: #000; }",
             art="* * *",
-            source="builtin:wasteland",
+            path=Path("/workspace/.pip/themes/wasteland"),
         )
         assert bundle.manifest.name == "wasteland"
         assert "background" in bundle.tcss
-        assert bundle.source == "builtin:wasteland"
+        assert bundle.path == Path("/workspace/.pip/themes/wasteland")
         assert bundle.art_truncated is False
 
     def test_bundle_is_frozen(self) -> None:
         manifest = validate_manifest_dict(_full_manifest_dict())
         bundle = ThemeBundle(
-            manifest=manifest, tcss="", art="", source="builtin:x",
+            manifest=manifest, tcss="", art="", path=Path("/x"),
         )
         with pytest.raises((AttributeError, TypeError)):
             bundle.tcss = "mutated"  # type: ignore[misc]

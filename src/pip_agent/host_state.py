@@ -21,15 +21,14 @@ Schema (v1):
 The schema is intentionally hand-rolled: a single nested string field,
 read at host boot and written by ``/theme set``. No migration logic
 is required; missing keys read as their defaults, and unknown keys
-are preserved on rewrite (forward-compat for Phase C / later versions
-that want to add doctor opt-outs, log-level overrides, etc.).
+are preserved on rewrite (forward-compat for later versions that want
+to add doctor opt-outs, log-level overrides, etc.).
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -40,7 +39,6 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "HOST_STATE_FILENAME",
-    "TUI_THEME_ENV_VAR",
     "HostState",
     "load_host_state",
     "resolve_active_theme_name",
@@ -50,15 +48,8 @@ __all__ = [
 HOST_STATE_FILENAME: str = "host_state.json"
 """Filename relative to ``<workspace>/.pip/``.
 
-Public so ``pip-boy doctor`` (Phase C) can render the resolved path
-even when the file does not exist yet."""
-
-TUI_THEME_ENV_VAR: str = "PIP_TUI_THEME"
-"""Operator override for the active theme slug.
-
-Resolution chain (highest precedence first): env var → host_state →
-default. Env wins so an operator can flip themes for a single boot
-without rewriting state."""
+Public so ``pip-boy doctor`` can render the resolved path even when
+the file does not exist yet."""
 
 
 class HostState:
@@ -158,28 +149,20 @@ def load_host_state(workspace_pip_dir: Path) -> HostState:
 def resolve_active_theme_name(
     *,
     state: HostState | None,
-    env: dict[str, str] | None = None,
     default: str = "wasteland",
 ) -> str:
-    """Apply the precedence chain and return the active theme slug.
+    """Return the active theme slug.
 
-    Precedence (highest first):
-
-    1. ``PIP_TUI_THEME`` environment variable, when non-empty.
-    2. ``state.json -> tui.theme``.
-    3. ``default``.
-
-    The function is pure given its inputs (``env`` defaults to
-    :data:`os.environ`) so unit tests can drive each branch
-    deterministically.
+    Chain: ``state.json -> default``. The operator's only durable
+    lever is ``/theme set`` (which writes through ``state``) — there
+    is no environment variable override. This keeps a single source
+    of truth for what pip-boy renders, so ``/theme set`` can live-
+    apply the switch and persist it in one motion without racing an
+    env-var snapshot taken at boot.
     """
-    if env is None:
-        env = os.environ  # type: ignore[assignment]
-    override = (env.get(TUI_THEME_ENV_VAR) or "").strip()
-    if override:
-        return override
     if state is not None:
         persisted = state.get_theme()
         if persisted:
             return persisted
     return default
+

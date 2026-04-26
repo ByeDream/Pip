@@ -13,7 +13,6 @@ from pip_agent.tui.loader import load_builtin_theme
 from pip_agent.tui.pump import UiPump
 from pip_agent.tui.sinks import AgentEvent
 
-
 HELP_TEXT = """\
 ## Available commands
 

@@ -24,7 +24,6 @@ from pip_agent.tui.loader import load_builtin_theme
 from pip_agent.tui.pump import UiPump
 from pip_agent.tui.sinks import AgentEvent, StatusEvent
 
-
 # ---------------------------------------------------------------------------
 # Theme loading
 # ---------------------------------------------------------------------------
@@ -34,7 +33,7 @@ class TestBuiltinWastelandTheme:
     def test_loads_with_full_palette(self) -> None:
         bundle = load_builtin_theme("wasteland")
         assert bundle.manifest.name == "wasteland"
-        assert bundle.source == "builtin:wasteland"
+        assert bundle.path.name == "wasteland"
         # All palette tokens present (validated by manifest schema).
         assert bundle.manifest.palette.accent
         # TCSS is non-empty.
@@ -218,3 +217,62 @@ async def test_finalize_rewrites_stream_tail_as_markdown() -> None:
         await pilot.pause()
         log = app.query_one("#agent-log", RichLog)
         assert len(log.lines) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Live theme swap (``apply_theme``)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_apply_theme_swaps_css_and_preserves_history() -> None:
+    """``apply_theme`` swaps palette + display name without wiping log."""
+    bundle_a = load_builtin_theme("wasteland")
+    bundle_b = load_builtin_theme("vault-amber")
+    pump = UiPump()
+    app = PipBoyTuiApp(theme=bundle_a, pump=pump)
+
+    async with app.run_test() as pilot:
+        # Seed the agent log with a user line so we can prove the
+        # swap didn't clear it.
+        pump.agent_sink(AgentEvent(kind="user_input", text="hello"))
+        await pilot.pause()
+        agent_log = app.query_one("#agent-log", RichLog)
+        log_lines_before = len(agent_log.lines)
+        assert log_lines_before >= 1
+
+        # The status bar starts with wasteland's display name.
+        status_text_before = str(
+            app.query_one("#status-bar").render()
+        )
+        assert "Wasteland" in status_text_before
+
+        app.apply_theme(bundle_b)
+        await pilot.pause()
+
+        # Agent log survived the swap.
+        agent_log_after = app.query_one("#agent-log", RichLog)
+        assert len(agent_log_after.lines) >= log_lines_before
+
+        # Status bar flipped to vault-amber's display name.
+        status_text_after = str(
+            app.query_one("#status-bar").render()
+        )
+        assert "Vault Amber" in status_text_after
+
+        # Textual theme is the new pipboy-* variant.
+        assert app.theme == "pipboy-vault-amber"
+
+
+@pytest.mark.asyncio
+async def test_apply_theme_is_idempotent() -> None:
+    """Applying the same bundle twice is a no-op (no exception)."""
+    bundle = load_builtin_theme("wasteland")
+    pump = UiPump()
+    app = PipBoyTuiApp(theme=bundle, pump=pump)
+
+    async with app.run_test() as pilot:
+        app.apply_theme(bundle)
+        await pilot.pause()
+        # Still rendering wasteland after an idempotent re-apply.
+        assert app.theme == "pipboy-wasteland"

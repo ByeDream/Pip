@@ -1,28 +1,28 @@
 # Pip-Boy TUI Themes
 
-This guide covers writing a Pip-Boy TUI theme: the schema, the layout
+This guide covers authoring a Pip-Boy TUI theme: the schema, the layout
 contract, the constraints, and how to install one without modifying
 the package.
 
 > **TL;DR** — A theme is three files in a slug-named directory.
 > Drop the directory under `<workspace>/.pip/themes/` and run
-> `/theme list`. No Python, no widget rearrangement, no shell-out
+> `/theme refresh`. No Python, no widget rearrangement, no shell-out
 > hooks; only colours, borders, padding, optional ASCII art, and a
 > handful of widget toggles.
 
-## Where themes come from
+## Where themes live
 
-Themes resolve from two sources, scanned every boot:
+Themes live in **one** directory: `<workspace>/.pip/themes/`. Pip-Boy
+seeds a few example themes there on first boot (e.g. `wasteland/`,
+`vault-amber/`) and from that point on the directory is yours to
+edit, extend, or prune. There is no "built-in vs local" distinction:
+the seeded examples are ordinary theme directories that happen to ship
+with the package, and the scaffold respects deletions — once you
+remove a seeded theme it stays gone across reboots.
 
-| Source | Path | Editable? |
-|---|---|---|
-| Built-in | `pip_agent/tui/themes/<slug>/` (inside the wheel) | No |
-| Local    | `<workspace>/.pip/themes/<slug>/` (your workspace) | Yes |
-
-Local themes override built-ins of the same `slug` (the override is
-logged at boot). `pip-boy doctor` lists everything that was found,
-plus a `Skipped` section for any theme whose manifest failed to
-validate — broken themes never crash the host.
+`pip-boy doctor` lists everything that was found, plus a `Skipped`
+section for any theme whose manifest failed to validate — broken
+themes never crash the host.
 
 ## Anatomy of a theme
 
@@ -144,7 +144,7 @@ file is ignored.
 ## Starter theme: `terminal-green`
 
 Save these three files to `<workspace>/.pip/themes/terminal-green/`
-and they'll show up on the next `pip-boy` boot.
+and run `/theme refresh` — no restart required.
 
 ### `theme.toml`
 
@@ -275,26 +275,28 @@ Screen {
 
 (`art.txt` omitted because the manifest has `show_art = false`.)
 
-## Selecting a theme at runtime
+## Switching themes at runtime
 
-Selection precedence (highest first):
-
-1. `PIP_TUI_THEME=<slug>` environment variable (one-shot override).
-2. `<workspace>/.pip/host_state.json` (set via `/theme set`).
-3. The package default (`wasteland`).
+The persisted selection lives in `<workspace>/.pip/host_state.json`.
+Pip-Boy reads it at boot; when unset it falls back to `wasteland`.
 
 From inside Pip-Boy:
 
 ```text
-/theme list                # all installed themes (with origin tag)
-/theme show                # active + persisted preference
-/theme set <slug>          # persist <slug> for the next boot
+/theme list                # all installed themes (active marked with *)
+/theme set <slug>          # switch NOW + persist the new default
+/theme refresh             # rescan .pip/themes/ (no restart)
 ```
 
-`/theme set` only writes the preference to `host_state.json`; v1
-intentionally does **not** live-reload TCSS (rebuilding live widgets
-mid-session would force the agent log to redraw and fight with
-streaming deltas). Restart pip-boy to apply.
+`/theme set` applies the new bundle to the live TUI in one shot —
+colours, TCSS, ASCII art, and status-bar display name all flip, and
+the `#agent-log` conversation history is preserved. There is no
+environment-variable override and no restart loop.
+
+`/theme refresh` is what you want after dropping a new theme directory
+into `.pip/themes/` or hand-editing a manifest; it prints the diff
+(added / removed / broken) and leaves the active theme alone. Follow
+it up with `/theme set <new-slug>` to actually switch.
 
 ## Validating a theme locally
 
@@ -318,13 +320,12 @@ pump; revisiting them later is fine, but unilateral relaxation is
 how broken themes start crashing host boots.
 
 * **No Python entry point.** Themes are pure data; the loader reads
-  TOML, TCSS, and text. Phase v2 may explore signed Python plugins
-  but only after the data-driven surface is stable.
+  TOML, TCSS, and text. Signed Python plugins may land later but
+  only after the data-driven surface is stable.
 * **No widget rearrangement.** Themes own appearance, not topology.
   Layout decisions belong to `pip_agent/tui/app.py` and are guarded
-  by SVG snapshot tests.
-* **No live reload.** `/theme set` persists the preference; restart
-  to apply. The TUI is a single, mounted app per host process.
+  by SVG snapshot tests. `show_*` toggles can hide panes (via CSS
+  `display`) but cannot move them.
 * **No background work, network, subprocesses, or stdout writes.**
   Themes can't run code, so this is enforced by construction. If a
   theme directory ships a `.py` file, the loader ignores it.
@@ -340,9 +341,8 @@ how broken themes start crashing host boots.
 
 ## Snapshot tests for new themes
 
-If you intend to upstream a built-in theme (or just want regression
-coverage on your local one), drop a driver under
-`tests/tui_snapshot_apps/<slug>.py`:
+If you want regression coverage on a theme (yours or an upstreamed
+one), drop a driver under `tests/tui_snapshot_apps/<slug>.py`:
 
 ```python
 from pip_agent.tui.app import PipBoyTuiApp

@@ -1,9 +1,10 @@
-# Local Themes
+# Pip-Boy TUI Themes
 
-Drop a theme directory under this folder to install it for the current
-workspace without modifying the package. The discovery walker
-(`pip_agent.tui.ThemeManager`) scans this directory at boot and merges
-results with the built-in catalogue:
+This directory is **your themes sandbox**. On first boot pip-boy
+seeds a few example themes here (e.g. `wasteland/`, `vault-amber/`).
+After that it's yours — edit, add, or delete freely. The scaffold
+respects deletions: once you remove a seeded theme it stays gone
+across reboots.
 
 ```
 .pip/themes/<slug>/
@@ -16,18 +17,14 @@ Slug rules: lowercase letters, digits, and dashes; must start with a
 letter; must match the directory name (`name = "<slug>"` in
 `theme.toml`).
 
-Conflicts: a local theme with the same slug as a built-in **overrides**
-the built-in. The override is logged at boot.
+## CLI
 
-Listing & switching from the CLI:
+* `/theme list` — show installed themes; active marked with `*`.
+* `/theme set <slug>` — switch to the theme **immediately** (hot
+  reload — no restart) and persist the choice to
+  `.pip/host_state.json` so next boot comes up in the same theme.
+* `/theme refresh` — re-scan this directory. Use it after dropping
+  a new theme directory in or editing a `theme.toml` manually; the
+  command reports added / removed / broken themes.
 
-* `/theme list` — show all themes (built-in + local) with origin tags.
-* `/theme show` — print the active slug + persisted preference.
-* `/theme set <slug>` — persist the selection to
-  `.pip/host_state.json`. Live reload is out of scope in v1; restart
-  pip-boy to apply.
-
-Environment override: set `PIP_TUI_THEME=<slug>` for a one-shot boot
-to bypass the persisted preference.
-
-Authoring guide: see `docs/themes.md` (added in Phase C).
+Authoring guide: see `docs/themes.md`.

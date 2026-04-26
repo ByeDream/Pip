@@ -23,6 +23,7 @@ widgets.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Awaitable, Callable
 
@@ -130,19 +131,28 @@ class PipBoyTuiApp(App[None]):
 
     @property
     def CSS(self) -> str:  # type: ignore[override]
-        """Inject the active theme's TCSS at App construction time.
+        """The active theme's TCSS + a status-bar palette tail.
 
-        Textual reads ``self.CSS`` once during ``App.__init__``; using
-        a property here is fine because the value is captured into the
-        App's stylesheet on first access. Themes never change at
-        runtime in v1 (design.md §B "live reload v1 不做"), so the
-        property is effectively a read-once constant.
-
-        A short tail overrides ``#status-bar`` colours with the
-        manifest's ``status_bar`` / ``status_bar_text`` tokens so the
-        bar does not inherit generic ``$boost`` / ``$text`` shades.
+        Textual reads ``self.CSS`` once during ``App.__init__`` and
+        captures it into ``self.stylesheet`` under the key
+        ``(inspect.getfile(self.__class__), "PipBoyTuiApp.CSS")``.
+        That's a one-shot read — refreshing the stylesheet later does
+        *not* re-invoke this property. :meth:`apply_theme` handles
+        the live-swap path by writing directly to
+        ``self.stylesheet.add_source`` with the same key.
         """
-        p = self._theme.manifest.palette
+        return self._compose_css(self._theme)
+
+    @staticmethod
+    def _compose_css(bundle: ThemeBundle) -> str:
+        """Concatenate a bundle's TCSS with a status-bar palette tail.
+
+        The tail hard-codes ``#status-bar`` colours from the manifest
+        so the bar doesn't inherit generic ``$boost`` / ``$text`` shades
+        from the Textual theme — those variables track the general
+        palette but the status bar has dedicated tokens.
+        """
+        p = bundle.manifest.palette
         tail = (
             "\n/* Manifest palette: status bar */\n"
             f"#status-bar {{\n"
@@ -150,7 +160,21 @@ class PipBoyTuiApp(App[None]):
             f"    color: {p.status_bar_text};\n"
             f"}}\n"
         )
-        return self._theme.tcss + tail
+        return bundle.tcss + tail
+
+    def _css_source_key(self) -> tuple[str, str]:
+        """Key Textual uses to index ``self.CSS`` inside the stylesheet.
+
+        Mirrors the tuple Textual builds when it first ingests the
+        property (``app.py`` around line 3375). We need the exact same
+        key so :meth:`apply_theme` can overwrite — not duplicate — the
+        stylesheet entry when swapping themes at runtime.
+        """
+        try:
+            app_path = inspect.getfile(self.__class__)
+        except (TypeError, OSError):
+            app_path = ""
+        return (app_path, f"{self.__class__.__name__}.CSS")
 
     # ------------------------------------------------------------------
     # Layout
@@ -347,6 +371,105 @@ class PipBoyTuiApp(App[None]):
         bypasses the pump's thread-safety contract.
         """
         self.call_later(self.exit)
+
+    # ------------------------------------------------------------------
+    # Runtime theme swap
+    # ------------------------------------------------------------------
+
+    def apply_theme(self, bundle: ThemeBundle) -> None:
+        """Swap the active theme without restarting the host.
+
+        Wired to ``/theme set`` via ``call_later(apply_theme, bundle)``
+        so the mutation runs on Textual's own message pump (the
+        slash-command handler lives on the host's asyncio task and
+        cannot poke widget state directly).
+
+        The agent log, app log, and input widget keep their state —
+        only colours, TCSS, ASCII art, and status-bar display_name
+        change. The widget topology is LOCKED, so ``show_*`` toggles
+        flip ``.display`` instead of re-composing the tree; any theme
+        that was rendering with a side pane can therefore hide it,
+        and vice versa, without breaking the snapshot contract.
+        """
+        if (
+            bundle.manifest.name == self._theme.manifest.name
+            and bundle.path == self._theme.path
+        ):
+            return
+
+        self._theme = bundle
+
+        new_textual_theme = textual_theme_from_bundle(bundle)
+        self.register_theme(new_textual_theme)
+
+        key = self._css_source_key()
+        self.stylesheet.add_source(
+            self._compose_css(bundle),
+            read_from=key,
+            is_default_css=False,
+        )
+
+        self.theme = new_textual_theme.name
+
+        self._apply_visibility(bundle)
+        self._apply_art(bundle)
+        self._apply_status_bar_text(bundle)
+
+        self.refresh(layout=True)
+
+    def _apply_visibility(self, bundle: ThemeBundle) -> None:
+        """Honour ``show_app_log`` / ``show_status_bar`` at runtime.
+
+        Widgets were composed once at mount; we toggle ``display``
+        rather than unmounting so a later theme with the pane enabled
+        lights up again without a re-mount. Missing widgets (e.g. a
+        theme that started with ``show_app_log=False`` never rendered
+        ``#app-log``) are simply skipped — Textual raises
+        :class:`NoMatches` and we catch it.
+        """
+        m = bundle.manifest
+        for widget_id, visible in (
+            ("#status-bar", m.show_status_bar),
+            ("#app-log", m.show_app_log),
+        ):
+            try:
+                widget = self.query_one(widget_id)
+            except Exception:
+                continue
+            widget.display = visible
+
+        try:
+            side_pane = self.query_one("#side-pane")
+        except Exception:
+            side_pane = None
+        if side_pane is not None:
+            side_pane.display = bool(m.show_app_log or (m.show_art and bundle.art))
+
+    def _apply_art(self, bundle: ThemeBundle) -> None:
+        """Refresh ``#pipboy-art`` content + visibility for the new bundle."""
+        try:
+            art_widget = self.query_one("#pipboy-art", Static)
+        except Exception:
+            return
+        m = bundle.manifest
+        if m.show_art and bundle.art:
+            art_widget.update(bundle.art)
+            art_widget.display = True
+        else:
+            art_widget.display = False
+
+    def _apply_status_bar_text(self, bundle: ThemeBundle) -> None:
+        """Reset the status bar's default text to the new theme's name.
+
+        Overwritten the moment the next ``StatusMessage`` arrives; the
+        reset matters for the idle gap between the theme swap and the
+        next status event, when stale text would otherwise show.
+        """
+        try:
+            status_bar = self.query_one("#status-bar", Static)
+        except Exception:
+            return
+        status_bar.update(self._status_default_text())
 
     # ------------------------------------------------------------------
     # Actions

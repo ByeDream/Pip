@@ -196,16 +196,15 @@ def _print_themes(out: TextIO, *, workdir: Path) -> None:
         return
 
     bundles = list(snapshot.bundles.values())
-    bundles.sort(key=lambda b: (b.source.split(":", 1)[0], b.manifest.name))
+    bundles.sort(key=lambda b: b.manifest.name)
     out.write(f"  installed ({len(bundles)}):\n")
     if not bundles:
         out.write("    (none)\n")
     for bundle in bundles:
-        origin = bundle.source.split(":", 1)[0]
         marker = " *" if bundle.manifest.name == requested else ""
         truncated = " (art truncated)" if bundle.art_truncated else ""
         out.write(
-            f"    [{origin}] {bundle.manifest.name}{marker} — "
+            f"    {bundle.manifest.name}{marker} — "
             f"{bundle.manifest.display_name} v{bundle.manifest.version}"
             f"{truncated}\n"
         )
@@ -214,9 +213,7 @@ def _print_themes(out: TextIO, *, workdir: Path) -> None:
         out.write(f"  issues ({len(snapshot.issues)}):\n")
         for issue in snapshot.issues:
             head = issue.reason.splitlines()[0] if issue.reason else "(no detail)"
-            out.write(
-                f"    [{issue.origin}] {issue.path.name} — {head}\n"
-            )
+            out.write(f"    {issue.path.name} — {head}\n")
 
 
 def _print_recent_capability_log(out: TextIO, *, workdir: Path) -> None:

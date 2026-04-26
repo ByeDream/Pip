@@ -159,17 +159,30 @@ class CommandContext:
     host_state: "HostState | None" = None
     """Reader/writer for ``<workspace>/.pip/host_state.json``.
 
-    ``None`` outside the live host. ``/theme set`` writes through
-    this; ``/theme show`` reads the persisted slug to surface what
-    will load on next boot vs. what's currently active in memory."""
+    ``None`` outside the live host. ``/theme set`` writes through this
+    so the selection survives restart; the boot path reads it back
+    when resolving the initial theme."""
 
     active_theme_name: str = ""
-    """Slug of the theme actually running in this host process.
+    """Slug of the theme currently running in this host process.
 
-    Resolved at boot from the env var → host_state → default chain
-    and frozen for the run (no live reload in v1). ``/theme show``
-    surfaces it alongside the persisted preference so the operator
-    can tell ``"set but not yet applied"`` from ``"already active"``."""
+    Resolved at boot from the ``host_state`` → default chain; kept in
+    sync by ``set_active_theme`` whenever ``/theme set`` hot-swaps the
+    live TUI."""
+
+    tui_app: "Any | None" = None
+    """Reference to the running ``PipBoyTuiApp`` when TUI is active.
+
+    ``None`` in line mode / unit tests. ``/theme set`` uses this to
+    hot-apply a new theme via ``app.call_later(app.apply_theme, bundle)``
+    — the UI-thread trampoline keeps Textual happy."""
+
+    set_active_theme: "Callable[[str], None] | None" = None
+    """Host callback to update its cached ``active_theme_name``.
+
+    Wired by :class:`AgentHost` so ``/theme set`` can keep the host's
+    own view consistent with whatever it just applied to the TUI. Not
+    wired in line mode (the field is for the CLI's runtime identity)."""
 
 
 @dataclass(slots=True)
@@ -363,26 +376,31 @@ def dispatch_command(ctx: CommandContext) -> CommandResult:
 
 _HELP_COMMON = (
     "## Available commands\n\n"
-    "### SDK and routing\n\n"
-    "- **`/T <text>`** — Forward `<text>` to the SDK as a raw Claude Code "
-    "prompt (e.g. `/T /compact`). Typos like `/T /hlp` stay host-side errors "
-    "(never LLM turns). Some SDK slashes are interactive-only and will not "
-    "work in SDK mode (`/login`, `/clear`). Passthrough slashes are listed "
-    "at the end of `/help` after the first agent turn.\n"
+    "### Session & memory\n\n"
     "- **`/help`** — Show this help.\n"
     "- **`/status`** — Current agent, session, and binding.\n"
     "- **`/memory`** — Memory statistics for the current agent.\n"
     "- **`/axioms`** — Current judgment principles.\n"
     "- **`/recall <query>`** — Search stored memories.\n"
-    "- **`/cron`** — List scheduled cron jobs.\n"
-    "- **`/bind <id>`** — Route this chat to sub-agent `<id>` "
-    "(`/bind pip-boy` redirects to `/unbind`).\n"
-    "- **`/unbind`** — Clear this chat's binding; routing falls back to "
-    "pip-boy (no-op if already on pip-boy).\n\n"
+    "- **`/cron`** — List scheduled cron jobs.\n\n"
+    "### Routing\n\n"
+    "- **`/bind <id>`** — Route this chat to sub-agent `<id>`. In a "
+    "group chat creates a guild-level binding; in a private chat, a "
+    "peer-level binding. Persisted to "
+    "`<workspace>/.pip/bindings.json`. `/bind pip-boy` redirects to "
+    "`/unbind`.\n"
+    "- **`/unbind`** — Clear this chat's binding; routing falls back "
+    "to pip-boy (no-op if already on pip-boy).\n\n"
+    "### SDK passthrough\n\n"
+    "- **`/T <text>`** — Forward `<text>` to the SDK as a raw Claude Code "
+    "prompt (e.g. `/T /compact`). Typos like `/T /hlp` stay host-side errors "
+    "(never LLM turns). Some SDK slashes are interactive-only and will not "
+    "work in SDK mode (`/login`, `/clear`). Passthrough slashes are listed "
+    "at the end of `/help` after the first agent turn.\n\n"
     "### Themes\n\n"
-    "- **`/theme list`** — Installed TUI themes.\n"
-    "- **`/theme show`** — Active + persisted theme slug.\n"
-    "- **`/theme set <name>`** — Persist a theme for the next boot.\n\n"
+    "- **`/theme list`** — Installed TUI themes (active marked with `*`).\n"
+    "- **`/theme set <name>`** — Switch theme immediately and persist.\n"
+    "- **`/theme refresh`** — Rescan `.pip/themes/` for newly added themes.\n\n"
     "### Plugins\n\n"
     "- **`/plugin help`** — Full `/plugin` usage "
     "(install, marketplace, scopes).\n"
@@ -395,13 +413,7 @@ _HELP_COMMON = (
     "- **`/plugin marketplace list`** / "
     "**`/plugin marketplace add <src> [--scope SCOPE]`** — List or "
     "register a marketplace (owner/repo, `https` git URL, or path). "
-    "Other verbs: enable, disable, uninstall, remove, update.\n\n"
-    "## Bindings\n\n"
-    "- **`/bind`** — In a group chat creates a guild-level binding; in a "
-    "private chat, a peer-level binding.\n"
-    "- **Persistence** — Stored under `<workspace>/.pip/bindings.json`.\n"
-    "- **`/unbind`** — Removes this chat's binding; routing falls back to "
-    "pip-boy (no-op if already unbound)."
+    "Other verbs: enable, disable, uninstall, remove, update."
 )
 
 
@@ -426,11 +438,7 @@ _HELP_CLI_EXTRA = (
     "(project files untouched).\n"
     "- **`/subagent reset <id>`** — Rebuild `<id>/.pip/` from minimal "
     "backup; keeps `persona.md` and `HEARTBEAT.md`. Not allowed on the "
-    "pip-boy root agent.\n\n"
-    "### After creation\n\n"
-    "Edit model / `dm_scope` / name in `<workspace>/<id>/.pip/persona.md`, "
-    "description in `<workspace>/.pip/agents_registry.json`, routing in "
-    "`<workspace>/.pip/bindings.json`."
+    "pip-boy root agent."
 )
 
 
@@ -1794,26 +1802,25 @@ def _cmd_wechat(ctx: CommandContext, args: str) -> CommandResult:
 
 
 # ---------------------------------------------------------------------------
-# /theme — TUI theme listing / selection / inspection
+# /theme — TUI theme listing / selection / rescan
 # ---------------------------------------------------------------------------
 #
-# Theme handling lives entirely in :mod:`pip_agent.tui` (data) +
-# :mod:`pip_agent.host_state` (persistence). This dispatcher is a
-# thin keyboard shortcut for the operator: the slash itself doesn't
-# load TCSS or rebuild widgets — Pip-Boy v1 does NOT live-reload, so
-# ``/theme set`` only persists the new slug for the next boot.
-# Surfacing that distinction via ``/theme show`` is the whole point
-# of carrying ``active_theme_name`` on :class:`CommandContext`.
+# Theme handling lives in :mod:`pip_agent.tui` (data + App hot-swap) and
+# :mod:`pip_agent.host_state` (persistence). ``/theme set`` applies the
+# bundle to the live TUI via ``PipBoyTuiApp.apply_theme`` and persists
+# the slug to ``host_state.json`` — no restart required. In line mode
+# (no TUI) ``/theme set`` still persists so the next TUI boot honours
+# it. ``/theme refresh`` re-walks ``<workspace>/.pip/themes/`` so
+# operators can edit or drop in a new theme without bouncing pip-boy.
 
 _THEME_USAGE = (
     "Usage:\n"
     "  /theme list                — show installed themes\n"
-    "  /theme show                — show active theme + persisted preference\n"
-    "  /theme set <name>          — persist <name> for the next boot\n"
+    "  /theme set <name>          — switch theme immediately + persist\n"
+    "  /theme refresh             — rescan .pip/themes/ for new/edited themes\n"
     "\n"
-    "Themes are loaded from the package and from "
-    "<workspace>/.pip/themes/<slug>/ (a copy-paste install). v1 does "
-    "not live-reload; restart pip-boy to apply a `/theme set`."
+    "Themes live at <workspace>/.pip/themes/<slug>/. Pip-Boy seeds a few "
+    "examples on first boot; feel free to edit or delete them."
 )
 
 
@@ -1840,14 +1847,14 @@ def _cmd_theme(ctx: CommandContext, args: str) -> CommandResult:
     tail = tokens[1:]
     if sub == "list":
         return _theme_list(ctx, tail)
-    if sub == "show":
-        return _theme_show(ctx, tail)
     if sub == "set":
         return _theme_set(ctx, tail)
+    if sub == "refresh":
+        return _theme_refresh(ctx, tail)
 
     from difflib import get_close_matches
 
-    hint = get_close_matches(sub, ["list", "show", "set"], n=1, cutoff=0.6)
+    hint = get_close_matches(sub, ["list", "set", "refresh"], n=1, cutoff=0.6)
     suffix = f" Did you mean `/theme {hint[0]}`?" if hint else ""
     return CommandResult(
         handled=True,
@@ -1867,19 +1874,18 @@ def _theme_list(ctx: CommandContext, _tail: list[str]) -> CommandResult:
         return CommandResult(
             handled=True,
             response=(
-                "No themes available. Reinstall the package or drop a "
-                "valid theme directory under <workspace>/.pip/themes/."
+                "No themes available. Drop a valid theme directory under "
+                "<workspace>/.pip/themes/<slug>/ or run `/theme refresh`."
             ),
         )
 
-    bundles.sort(key=lambda b: (b.source.split(":", 1)[0], b.manifest.name))
+    bundles.sort(key=lambda b: b.manifest.name)
     lines = [f"Themes ({len(bundles)}):"]
     for bundle in bundles:
-        origin = bundle.source.split(":", 1)[0]
         marker = " *" if bundle.manifest.name == ctx.active_theme_name else ""
         truncated = " (art truncated)" if bundle.art_truncated else ""
         lines.append(
-            f"  [{origin}] {bundle.manifest.name}{marker}"
+            f"  {bundle.manifest.name}{marker}"
             f" — {bundle.manifest.display_name}"
             f" v{bundle.manifest.version}"
             f"{truncated}"
@@ -1889,37 +1895,9 @@ def _theme_list(ctx: CommandContext, _tail: list[str]) -> CommandResult:
         lines.append(f"Skipped ({len(snapshot.issues)}):")
         for issue in snapshot.issues:
             head = issue.reason.splitlines()[0] if issue.reason else "(no detail)"
-            lines.append(f"  [{issue.origin}] {issue.path.name} — {head}")
+            lines.append(f"  {issue.path.name} — {head}")
     lines.append("")
-    lines.append("* = currently active in this process. Use `/theme set <name>`.")
-    return CommandResult(handled=True, response="\n".join(lines))
-
-
-def _theme_show(ctx: CommandContext, _tail: list[str]) -> CommandResult:
-    mgr = ctx.theme_manager
-    assert mgr is not None
-    persisted: str | None = None
-    if ctx.host_state is not None:
-        persisted = ctx.host_state.get_theme()
-    active = ctx.active_theme_name or "(unknown)"
-    lines = [f"Active theme: {active}"]
-    if persisted:
-        if persisted == ctx.active_theme_name:
-            lines.append(
-                f"Persisted preference: {persisted} (matches active)"
-            )
-        else:
-            lines.append(
-                f"Persisted preference: {persisted} "
-                "(takes effect after restart)"
-            )
-    else:
-        lines.append("Persisted preference: (none — falls back to default)")
-    bundle = mgr.get(ctx.active_theme_name) if ctx.active_theme_name else None
-    if bundle is not None:
-        lines.append(f"Display name: {bundle.manifest.display_name}")
-        lines.append(f"Source: {bundle.source}")
-        lines.append(f"Version: {bundle.manifest.version}")
+    lines.append("* = currently active. Use `/theme set <name>` to switch.")
     return CommandResult(handled=True, response="\n".join(lines))
 
 
@@ -1948,9 +1926,11 @@ def _theme_set(ctx: CommandContext, tail: list[str]) -> CommandResult:
             handled=True,
             response=(
                 f"Unknown theme '{name}'. "
-                f"Known: {known}. Run `/theme list` for full detail."
+                f"Known: {known}. Run `/theme list` for full detail, "
+                f"or `/theme refresh` after dropping in a new one."
             ),
         )
+
     try:
         ctx.host_state.set_theme(bundle.manifest.name)
     except OSError as exc:
@@ -1959,17 +1939,76 @@ def _theme_set(ctx: CommandContext, tail: list[str]) -> CommandResult:
             handled=True, response=f"Failed to write host_state: {exc}",
         )
 
-    lines = [
-        f"Persisted theme '{bundle.manifest.name}' "
-        f"(\"{bundle.manifest.display_name}\")."
-    ]
-    if bundle.manifest.name != ctx.active_theme_name:
-        lines.append(
-            "Currently running '" + (ctx.active_theme_name or "?")
-            + "'; restart pip-boy to apply (live reload is v1 out-of-scope)."
+    applied_live = False
+    if ctx.tui_app is not None:
+        try:
+            ctx.tui_app.call_later(ctx.tui_app.apply_theme, bundle)
+            applied_live = True
+        except Exception as exc:  # noqa: BLE001 — never fail /theme set
+            log.exception("Live theme apply failed; persisted only.")
+            return CommandResult(
+                handled=True,
+                response=(
+                    f"Persisted theme '{bundle.manifest.name}' but live "
+                    f"apply failed: {exc}. Restart to pick up the new theme."
+                ),
+            )
+
+    if ctx.set_active_theme is not None:
+        try:
+            ctx.set_active_theme(bundle.manifest.name)
+        except Exception:  # noqa: BLE001
+            log.exception("set_active_theme callback raised; ignoring.")
+
+    if applied_live:
+        msg = (
+            f"Theme → '{bundle.manifest.name}' "
+            f"(\"{bundle.manifest.display_name}\"). Applied live."
         )
     else:
-        lines.append("Already active in this process.")
+        msg = (
+            f"Persisted theme '{bundle.manifest.name}' "
+            f"(\"{bundle.manifest.display_name}\"). "
+            f"No TUI attached; will apply on next boot."
+        )
+    return CommandResult(handled=True, response=msg)
+
+
+def _theme_refresh(ctx: CommandContext, _tail: list[str]) -> CommandResult:
+    mgr = ctx.theme_manager
+    assert mgr is not None
+    prev_snapshot = mgr.snapshot() or mgr.discover()
+    prev_slugs = set(prev_snapshot.bundles)
+
+    new_snapshot = mgr.discover()
+    new_slugs = set(new_snapshot.bundles)
+
+    added = sorted(new_slugs - prev_slugs)
+    removed = sorted(prev_slugs - new_slugs)
+    broken = new_snapshot.issues
+
+    lines = [
+        f"Rescanned .pip/themes/: +{len(added)} new, -{len(removed)} removed, "
+        f"{len(broken)} broken."
+    ]
+    if added:
+        lines.append("  Added: " + ", ".join(added))
+    if removed:
+        lines.append("  Removed: " + ", ".join(removed))
+        if ctx.active_theme_name and ctx.active_theme_name in removed:
+            lines.append(
+                f"  ! Active theme '{ctx.active_theme_name}' was removed "
+                f"from disk but is still running in memory."
+            )
+    if broken:
+        lines.append(f"  Broken ({len(broken)}):")
+        for issue in broken:
+            head = issue.reason.splitlines()[0] if issue.reason else "(no detail)"
+            lines.append(f"    {issue.path.name} — {head}")
+    if added or removed or broken:
+        lines.append("Run `/theme set <slug>` to switch.")
+    else:
+        lines.append("No changes.")
     return CommandResult(handled=True, response="\n".join(lines))
 
 

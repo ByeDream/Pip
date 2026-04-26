@@ -719,15 +719,17 @@ class AgentHost:
         self._binding_table = binding_table
         self._channel_mgr = channel_mgr
         self._scheduler = scheduler
-        # Theme-related context flows straight through to
+        # Theme-related context flows through to
         # :class:`host_commands.CommandContext`. The host itself
-        # never reads the manager — Phase A's TUI runner already
-        # consumed the bundle by the time we get here, so everything
-        # the host needs after that lives on these three fields and
-        # is exposed only to the slash-command handlers.
+        # carries ``active_theme_name`` as mutable state so
+        # ``/theme set`` can update it after a successful live swap.
+        # ``_tui_app`` is wired after ``_bootstrap_tui`` succeeds;
+        # line-mode / test contexts leave it ``None`` and ``/theme
+        # set`` degrades to persist-only.
         self._theme_manager = theme_manager
         self._host_state = host_state
         self._active_theme_name = active_theme_name
+        self._tui_app: "Any | None" = None
         # ``None`` until something registers WeChat (boot path with
         # existing bindings, or lazy bootstrap from ``/wechat add``).
         # ``_wechat_bootstrap`` is the closure that builds + wires the
@@ -870,6 +872,25 @@ class AgentHost:
             )
             self._agents[agent_id] = _PerAgent(memory_store=ms, paths=paths)
         return self._agents[agent_id]
+
+    def set_tui_app(self, app: "Any | None") -> None:
+        """Wire a live :class:`PipBoyTuiApp` into the host.
+
+        Called by :func:`run_host` after ``_bootstrap_tui`` succeeds,
+        with ``None`` in line mode. ``/theme set`` reads this to decide
+        whether to live-apply the selection or fall back to
+        persist-only.
+        """
+        self._tui_app = app
+
+    def _set_active_theme(self, name: str) -> None:
+        """Record the name of the theme that's now rendering.
+
+        Called by the ``/theme set`` handler after a successful live
+        swap so ``/theme list`` and ``/theme refresh`` show the right
+        marker, and so subsequent command contexts agree with reality.
+        """
+        self._active_theme_name = name
 
     def ensure_wechat_controller(self) -> "WeChatController":
         """Return the live WeChat controller, building one if absent.
@@ -1640,6 +1661,8 @@ class AgentHost:
                         theme_manager=self._theme_manager,
                         host_state=self._host_state,
                         active_theme_name=self._active_theme_name,
+                        tui_app=self._tui_app,
+                        set_active_theme=self._set_active_theme,
                     ),
                 )
             if cmd_result.handled:
@@ -2595,11 +2618,9 @@ def _bootstrap_tui(
 
         pump = UiPump()
         if theme_manager is not None and active_theme_name:
-            # Phase B path: the manager already validated the bundle
-            # and resolved the precedence chain; reuse the bundle so
-            # the slash-command status (``/theme show``) and the
-            # rendered TUI agree on the active slug, including local
-            # overrides of builtins.
+            # The manager already validated the bundle and resolved the
+            # precedence chain; reuse the bundle so ``/theme list`` and
+            # the rendered TUI agree on the active slug.
             bundle = theme_manager.resolve(active_theme_name)
             app = PipBoyTuiApp(
                 theme=bundle, pump=pump, on_user_line=_tui_on_user_line,
@@ -2871,6 +2892,7 @@ def run_host(*, force_no_tui: bool = False) -> None:
         theme_manager=theme_manager,
         active_theme_name=active_theme_name,
     )
+    host.set_tui_app(tui_app)
 
     from pip_agent import __version__
     from pip_agent.host_io import emit_banner

@@ -1,24 +1,21 @@
-"""Theme discovery walker (Phase B).
+"""Theme discovery walker.
 
 ``ThemeManager`` is the single source of truth for which themes are
-available at runtime. It walks two roots in a fixed order:
+available at runtime. It walks one root — ``<workspace>/.pip/themes/``
+— and nothing else.
 
-1. **builtin** — :data:`pip_agent.tui.themes.BUILTIN_THEMES_DIR`. Any
-   theme that ships with the package. Validation failure is a
-   developer bug and surfaces as a hard error during tests; in
-   production we still log + skip so a single corrupt builtin can't
-   wedge the host.
-2. **local** — ``<workspace>/.pip/themes/<name>/``. Operator-installed
-   themes. Validation failure here is *expected* (it's user content),
-   so we log a WARNING and skip. The walker NEVER raises through to
-   the caller for a single broken local theme — that contract is
-   exercised by the Phase B test fixtures.
+Built-in themes are **seeded** into that directory by
+:mod:`pip_agent.scaffold` on first boot; from the manager's point of
+view there is no difference between a seeded example and a user-authored
+theme. This removes the old "built-in vs local" dichotomy: everything
+is workspace content, everything is editable, and operators can delete
+any theme (including the ones pip-boy shipped with) without the
+scaffold re-creating it.
 
-When the two roots define a theme with the same slug, **local wins**.
-This lets an operator override a builtin without modifying the package
-(the same precedence rule scaffold ``.cursor/`` files use). The
-override is logged at INFO so the operator sees a one-shot reminder
-when boot announces the active theme.
+Validation failures are tolerated: the walker logs a WARNING and
+records a :class:`ThemeLoadIssue` so a single broken manifest never
+wedges host boot. ``/theme list`` and ``pip-boy doctor`` surface the
+skipped themes.
 
 The manager is intentionally *not* a singleton. ``run_host`` constructs
 exactly one and threads it through to ``host_commands`` and the TUI
@@ -40,7 +37,6 @@ from pip_agent.tui.theme_api import (
     clamp_art,
     validate_manifest_dict,
 )
-from pip_agent.tui.themes import BUILTIN_THEMES_DIR
 
 log = logging.getLogger(__name__)
 
@@ -56,33 +52,31 @@ __all__ = [
 DEFAULT_THEME_NAME: str = "wasteland"
 """Slug of the theme used when the operator hasn't picked one.
 
-Resolved at the bottom of the precedence ladder:
-``state.json -> env override -> default``. Defined here (not on the
-manager) because the host needs the constant before it constructs the
-manager (e.g. when reporting "theme not found" in ``pip-boy doctor``).
+Resolved at the bottom of the precedence chain (``host_state.json ->
+default``). Defined here — not on the manager — because the host
+needs the constant before it constructs the manager (e.g. when
+reporting "theme not found" in ``pip-boy doctor``).
 """
 
 
-_LOCAL_THEMES_SUBDIR = Path(".pip") / "themes"
-"""Subpath inside the workspace where operators drop their themes.
+_THEMES_SUBDIR = Path(".pip") / "themes"
+"""Subpath inside the workspace where themes live.
 
 A constant rather than a parameter because the path is part of the
 user-facing contract documented in ``docs/themes.md``; tests still
-override the *workspace* root, not this suffix."""
+override the *workspace* root, not this suffix.
+"""
 
 
 @dataclass(frozen=True, slots=True)
 class ThemeLoadIssue:
     """A single broken theme the manager skipped during discovery.
 
-    Surfaced via :attr:`ThemeManager.issues` so ``pip-boy doctor`` and
-    ``/theme list`` can render a one-line "(broken: ...)" hint instead
-    of the broken theme silently disappearing.
+    Surfaced via :attr:`ThemeDiscovery.issues` so ``pip-boy doctor`` and
+    ``/theme list`` / ``/theme refresh`` can render a one-line
+    ``(broken: …)`` hint instead of the broken theme silently
+    disappearing.
     """
-
-    origin: str
-    """``"builtin"`` or ``"local"`` — same vocabulary as
-    :attr:`ThemeBundle.source`."""
 
     path: Path
     """Theme directory the loader rejected (not the manifest path),
@@ -92,21 +86,15 @@ class ThemeLoadIssue:
     """Human-readable explanation; trimmed for log noise."""
 
 
-def load_theme_bundle(theme_dir: Path, *, origin: str) -> ThemeBundle:
+def load_theme_bundle(theme_dir: Path) -> ThemeBundle:
     """Load and validate one theme directory into a :class:`ThemeBundle`.
 
-    ``origin`` is recorded into :attr:`ThemeBundle.source` so the same
-    bundle is self-describing in ``/theme list`` output.
-
     The function performs the *full* schema check (including the
-    "manifest name matches directory name" invariant from the loader
-    contract). Failures raise :class:`ThemeValidationError` (schema)
-    or surface the underlying :class:`OSError` / :class:`tomllib.TOMLDecodeError`.
-    The discovery walker catches these so a single bad theme doesn't
-    take down boot — but a *direct* caller (e.g. the Phase A
-    bootstrap path used by ``runner.build_app``) still gets the raw
-    exception, which is the desired behaviour for builtins where a
-    broken file is a developer bug.
+    "manifest name matches directory name" invariant). Failures raise
+    :class:`ThemeValidationError` (schema), :class:`FileNotFoundError`
+    (missing directory), or the underlying :class:`OSError` /
+    :class:`tomllib.TOMLDecodeError`. The discovery walker catches
+    these so a single bad theme doesn't take down boot.
     """
     if not theme_dir.is_dir():
         raise FileNotFoundError(f"Theme directory not found: {theme_dir}")
@@ -140,15 +128,15 @@ def load_theme_bundle(theme_dir: Path, *, origin: str) -> ThemeBundle:
         art_text, art_truncated = clamp_art(raw_art)
         if art_truncated:
             log.warning(
-                "Theme '%s' (%s) art exceeds %dx%d limit; truncated.",
-                name, origin, 32, 8,
+                "Theme '%s' art exceeds %dx%d limit; truncated.",
+                name, 32, 8,
             )
 
     return ThemeBundle(
         manifest=manifest,
         tcss=tcss,
         art=art_text,
-        source=f"{origin}:{name}",
+        path=theme_dir,
         art_truncated=art_truncated,
     )
 
@@ -162,142 +150,100 @@ class ThemeDiscovery:
     """
 
     bundles: dict[str, ThemeBundle]
-    """Slug → bundle, with local overrides applied."""
+    """Slug → bundle."""
 
     issues: tuple[ThemeLoadIssue, ...]
     """All themes that failed validation, in scan order."""
 
-    builtin_count: int
-    """How many *valid* builtin themes were found. Doctor surfaces
-    this so an operator sees "0 builtins discovered" as a smoke
-    signal that the package install is broken."""
-
-    local_count: int
-    """How many *valid* local themes were found."""
+    count: int
+    """How many *valid* themes were found. ``pip-boy doctor`` surfaces
+    this so ``0 themes discovered`` is a visible smoke signal that the
+    scaffold never ran (or the operator deleted everything)."""
 
 
 class ThemeManager:
-    """Discover + look up themes from builtin and workspace roots.
+    """Discover + look up themes from the workspace themes directory.
 
     The manager is constructed once per host boot; ``discover()`` is
     called eagerly so by the time the TUI builds its App, the active
-    theme is already validated. Subsequent calls re-walk the
-    filesystem — useful for tests, but the host doesn't expose a
-    re-scan command in v1 because live theme reload is out of scope
-    (design.md §"不在 v1 范围").
+    theme is already validated. ``/theme refresh`` calls it again to
+    pick up on-disk edits without a restart.
 
-    ``builtin_root`` is overridable so a unit test can construct an
-    isolated themes tree without monkey-patching the module-level
-    constant. ``workdir`` is similarly overridable; pass ``None`` to
-    skip the local scan entirely (used by the very early ``doctor``
-    bootstrap before ``WORKDIR`` is resolved).
+    ``workdir`` is overridable; pass ``None`` to skip the scan entirely
+    (used by the very early ``doctor`` bootstrap before ``WORKDIR`` is
+    resolved, and by unit tests that want an empty manager).
     """
 
-    def __init__(
-        self,
-        *,
-        builtin_root: Path | None = None,
-        workdir: Path | None = None,
-    ) -> None:
-        self._builtin_root = builtin_root or BUILTIN_THEMES_DIR
+    def __init__(self, *, workdir: Path | None = None) -> None:
         self._workdir = workdir
         self._discovery: ThemeDiscovery | None = None
 
     @property
-    def local_root(self) -> Path | None:
-        """Where local themes live, or ``None`` when no workspace.
+    def themes_root(self) -> Path | None:
+        """Where themes live, or ``None`` when no workspace.
 
         Public so ``pip-boy doctor`` can render the resolved path even
         when the directory doesn't exist yet — that's a hint for the
         operator that they can ``mkdir`` it themselves."""
         if self._workdir is None:
             return None
-        return self._workdir / _LOCAL_THEMES_SUBDIR
+        return self._workdir / _THEMES_SUBDIR
+
+    def snapshot(self) -> ThemeDiscovery | None:
+        """Return the cached discovery result without re-walking.
+
+        Returns ``None`` when :meth:`discover` has never been called.
+        Callers that need a guaranteed-fresh view should call
+        :meth:`discover` instead."""
+        return self._discovery
 
     def discover(self) -> ThemeDiscovery:
-        """Walk both roots, build the bundle map, return a snapshot.
+        """Walk the themes root, build the bundle map, return a snapshot.
 
-        Walk order: builtin first, then local. Local entries replace
-        builtin entries with the same slug (and the override fact is
-        logged at INFO, once per discovery, so the operator sees it).
+        Always re-walks the filesystem — ``/theme refresh`` and
+        ``_theme_list`` both rely on this to pick up operator edits
+        without a host restart. Call :meth:`snapshot` if you only
+        want the cached result from the previous walk.
 
         The walker tolerates these conditions silently:
 
         * The ``.pip/themes/`` directory not existing yet (fresh
-          workspace). Operators ``mkdir`` it on their own time.
-        * Files (vs. directories) inside either root — likely
-          ``README.md`` / ``.gitkeep``. They are skipped.
-        * Hidden directories (``.foo``) — also skipped, so dotfiles
-          like the scaffold's ``.gitkeep`` placeholder don't get
-          interpreted as a malformed theme.
+          workspace). The scaffold creates it on first boot; tests
+          that skip the scaffold simply get an empty catalogue.
+        * Files (vs. directories) inside the root — ``README.md``
+          (written by the scaffold), ``.gitkeep``, etc. Skipped.
+        * Hidden directories (``.foo``) and ``__pycache__``. Skipped.
 
         Validation failures inside ``.pip/themes/`` are caught and
-        recorded as :class:`ThemeLoadIssue`; ``ok=True`` themes still
+        recorded as :class:`ThemeLoadIssue`; valid themes still
         succeed even if a sibling theme is broken.
         """
         bundles: dict[str, ThemeBundle] = {}
         issues: list[ThemeLoadIssue] = []
-        builtin_count = 0
-        local_count = 0
 
-        for entry in self._scan_root(self._builtin_root):
-            try:
-                bundle = load_theme_bundle(entry, origin="builtin")
-            except (
-                ThemeValidationError,
-                OSError,
-                tomllib.TOMLDecodeError,
-            ) as exc:
-                log.warning(
-                    "Skipping broken builtin theme %s: %s",
-                    entry, exc,
-                )
-                issues.append(
-                    ThemeLoadIssue(
-                        origin="builtin",
-                        path=entry,
-                        reason=str(exc),
-                    )
-                )
-                continue
-            bundles[bundle.manifest.name] = bundle
-            builtin_count += 1
-
-        local_root = self.local_root
-        if local_root is not None and local_root.is_dir():
-            for entry in self._scan_root(local_root):
+        root = self.themes_root
+        if root is not None and root.is_dir():
+            for entry in self._scan_root(root):
                 try:
-                    bundle = load_theme_bundle(entry, origin="local")
+                    bundle = load_theme_bundle(entry)
                 except (
                     ThemeValidationError,
                     OSError,
                     tomllib.TOMLDecodeError,
                 ) as exc:
                     log.warning(
-                        "Skipping broken local theme %s: %s",
-                        entry, exc,
+                        "Skipping broken theme %s: %s", entry, exc,
                     )
                     issues.append(
-                        ThemeLoadIssue(
-                            origin="local",
-                            path=entry,
-                            reason=str(exc),
-                        )
+                        ThemeLoadIssue(path=entry, reason=str(exc))
                     )
                     continue
-                if bundle.manifest.name in bundles:
-                    log.info(
-                        "Local theme '%s' overrides builtin of the same name.",
-                        bundle.manifest.name,
-                    )
                 bundles[bundle.manifest.name] = bundle
-                local_count += 1
 
         snapshot = ThemeDiscovery(
             bundles=bundles,
             issues=tuple(issues),
-            builtin_count=builtin_count,
-            local_count=local_count,
+            count=len(bundles),
         )
         self._discovery = snapshot
         return snapshot
@@ -306,8 +252,8 @@ class ThemeManager:
         """Return the bundle named ``name`` or ``None`` when missing.
 
         Lazy: discovers on first access if no snapshot has been built
-        yet, so callers can ``ThemeManager(...).get("foo")`` without
-        a separate ``discover()`` step in shell-style scripts.
+        yet, so callers can ``ThemeManager(...).get("foo")`` without a
+        separate ``discover()`` step in shell-style scripts.
         """
         snapshot = self._discovery or self.discover()
         return snapshot.bundles.get(name)
@@ -316,12 +262,13 @@ class ThemeManager:
         """Resolve the *active* theme bundle for the host.
 
         Falls back through ``requested -> DEFAULT_THEME_NAME`` and
-        emits a one-line WARNING when ``requested`` does not exist
-        (so the operator notices a typo without booting blind into a
-        silently-different theme). The fallback chain stops at the
+        emits a one-line WARNING when ``requested`` does not exist so
+        the operator notices a typo without booting blind into a
+        silently-different theme. The fallback chain stops at the
         default; if the default itself is missing the function raises
-        :class:`LookupError`, which is a hard developer bug because
-        the default ships with the package.
+        :class:`LookupError` — which means the scaffold failed to seed
+        or the operator deleted every theme, and the caller is expected
+        to fall back to whatever it can synthesise.
         """
         snapshot = self._discovery or self.discover()
         if requested:
@@ -335,7 +282,8 @@ class ThemeManager:
         bundle = snapshot.bundles.get(DEFAULT_THEME_NAME)
         if bundle is None:
             raise LookupError(
-                f"Default theme '{DEFAULT_THEME_NAME}' missing — package install is broken."
+                f"Default theme '{DEFAULT_THEME_NAME}' missing — "
+                f"workspace themes directory is empty or corrupt."
             )
         return bundle
 
@@ -344,9 +292,8 @@ class ThemeManager:
         """Return the immediate-child directories of ``root``, sorted.
 
         Sorting keeps discovery deterministic across platforms (the
-        snapshot tests in Phase B.4 depend on it). Hidden directories
-        and non-directories are filtered out — see :meth:`discover`
-        for why.
+        snapshot tests depend on it). Hidden directories and
+        non-directories are filtered — see :meth:`discover` for why.
         """
         if not root.is_dir():
             return []

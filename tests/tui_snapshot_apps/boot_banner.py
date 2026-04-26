@@ -13,7 +13,6 @@ from pip_agent.tui.loader import load_builtin_theme
 from pip_agent.tui.pump import UiPump
 from pip_agent.tui.sinks import AgentEvent, StatusEvent
 
-
 _bundle = load_builtin_theme("wasteland")
 _pump = UiPump()
 app = PipBoyTuiApp(theme=_bundle, pump=_pump)

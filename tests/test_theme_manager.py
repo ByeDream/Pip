@@ -1,21 +1,19 @@
-"""Phase B.1 — ThemeManager.discover dual-path loading.
+"""``ThemeManager.discover`` against the single workspace themes root.
 
-The four canonical fixtures exercised here come straight out of the
-plan ("builtin/local/重名/broken 四种 fixture"):
+The manager now scans exactly one directory (``<workspace>/.pip/themes/``);
+built-in themes are seeded into that directory by the scaffold. These
+tests cover:
 
-* **builtin only** — package ships valid themes, workspace is empty.
-* **local only** — workspace ``.pip/themes`` has an extra theme; the
-  builtin set is intentionally pruned via an isolated builtin root so
-  the assertion is over a small known set rather than everything that
-  later phases keep adding to ``src/pip_agent/tui/themes``.
-* **override** — local theme with the same slug as a builtin replaces
-  the builtin while the override fact is logged at INFO.
-* **broken** — a malformed local theme must NOT crash discovery; it
-  ends up on :attr:`ThemeDiscovery.issues`, sibling themes still load.
-
-The tests construct an *isolated* builtin root for the override and
-broken cases so we don't depend on whichever themes happen to ship at
-the time the test runs.
+* **empty workspace** — no themes, no issues.
+* **populated workspace** — valid themes load, slug → bundle mapping is
+  correct.
+* **broken theme** — a malformed manifest ends up on ``issues`` and
+  siblings still load.
+* **hidden files / non-directories** — README.md, .gitkeep and hidden
+  dirs are ignored.
+* **lookup contract** — ``get`` / ``resolve`` fall back to the default
+  slug with a WARNING on miss, raise ``LookupError`` when even the
+  default is missing (empty workspace).
 """
 
 from __future__ import annotations
@@ -32,7 +30,6 @@ from pip_agent.tui.manager import (
     load_theme_bundle,
 )
 from pip_agent.tui.theme_api import ThemeValidationError
-
 
 # ---------------------------------------------------------------------------
 # Helpers — build minimal-but-valid theme directories on disk.
@@ -102,16 +99,8 @@ def _write_theme(
 
 
 # ---------------------------------------------------------------------------
-# Fixtures — isolated builtin/local roots with known content.
+# Fixtures — populated workspace roots.
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def isolated_builtin(tmp_path: Path) -> Path:
-    root = tmp_path / "builtin_themes"
-    root.mkdir()
-    _write_theme(root, DEFAULT_THEME_NAME, display_name="Wasteland (test)")
-    return root
 
 
 @pytest.fixture
@@ -122,85 +111,69 @@ def workspace(tmp_path: Path) -> Path:
     return ws
 
 
+@pytest.fixture
+def seeded_workspace(workspace: Path) -> Path:
+    """Workspace with one valid theme at ``.pip/themes/<DEFAULT>/``."""
+    _write_theme(
+        workspace / ".pip" / "themes",
+        DEFAULT_THEME_NAME,
+        display_name="Wasteland (test)",
+    )
+    return workspace
+
+
 # ---------------------------------------------------------------------------
-# Builtin-only — local root absent.
+# Empty workspace — no crash, no phantom themes.
 # ---------------------------------------------------------------------------
 
 
-def test_builtin_only_when_local_dir_missing(
-    isolated_builtin: Path, workspace: Path,
-) -> None:
-    mgr = ThemeManager(builtin_root=isolated_builtin, workdir=workspace)
+def test_empty_workspace_discovers_nothing(workspace: Path) -> None:
+    mgr = ThemeManager(workdir=workspace)
     snap = mgr.discover()
 
-    assert set(snap.bundles) == {DEFAULT_THEME_NAME}
-    assert snap.bundles[DEFAULT_THEME_NAME].source == f"builtin:{DEFAULT_THEME_NAME}"
-    assert snap.builtin_count == 1
-    assert snap.local_count == 0
+    assert snap.bundles == {}
+    assert snap.count == 0
     assert snap.issues == ()
 
 
-def test_builtin_only_when_local_dir_empty(
-    isolated_builtin: Path, workspace: Path,
-) -> None:
-    (workspace / ".pip" / "themes").mkdir(parents=True)
-    mgr = ThemeManager(builtin_root=isolated_builtin, workdir=workspace)
+def test_missing_themes_dir_is_fine(workspace: Path) -> None:
+    # .pip exists but .pip/themes does not — fresh scaffold pre-first-boot
+    (workspace / ".pip").mkdir()
+    mgr = ThemeManager(workdir=workspace)
     snap = mgr.discover()
 
-    assert set(snap.bundles) == {DEFAULT_THEME_NAME}
-    assert snap.local_count == 0
+    assert snap.bundles == {}
+    assert snap.count == 0
+
+
+def test_no_workdir_means_empty_snapshot() -> None:
+    mgr = ThemeManager(workdir=None)
+    snap = mgr.discover()
+
+    assert snap.bundles == {}
+    assert snap.count == 0
 
 
 # ---------------------------------------------------------------------------
-# Local-only contributions — local-named-themes show up alongside builtins.
+# Populated workspace — themes show up under workspace paths.
 # ---------------------------------------------------------------------------
 
 
-def test_local_themes_added_alongside_builtins(
-    isolated_builtin: Path, workspace: Path,
-) -> None:
-    local_root = workspace / ".pip" / "themes"
-    local_root.mkdir(parents=True)
-    _write_theme(local_root, "amber-console", display_name="Amber Console")
+def test_themes_load_from_workspace_root(workspace: Path) -> None:
+    themes_root = workspace / ".pip" / "themes"
+    _write_theme(themes_root, DEFAULT_THEME_NAME, display_name="Wasteland")
+    _write_theme(themes_root, "amber-console", display_name="Amber Console")
 
-    mgr = ThemeManager(builtin_root=isolated_builtin, workdir=workspace)
+    mgr = ThemeManager(workdir=workspace)
     snap = mgr.discover()
 
     assert set(snap.bundles) == {DEFAULT_THEME_NAME, "amber-console"}
-    assert snap.bundles["amber-console"].source == "local:amber-console"
-    assert snap.builtin_count == 1
-    assert snap.local_count == 1
+    assert snap.count == 2
     assert snap.issues == ()
 
-
-# ---------------------------------------------------------------------------
-# Override — local replaces builtin when slugs collide.
-# ---------------------------------------------------------------------------
-
-
-def test_local_overrides_builtin_with_same_slug(
-    isolated_builtin: Path,
-    workspace: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    local_root = workspace / ".pip" / "themes"
-    local_root.mkdir(parents=True)
-    _write_theme(
-        local_root, DEFAULT_THEME_NAME, display_name="Wasteland (overridden)",
-    )
-
-    mgr = ThemeManager(builtin_root=isolated_builtin, workdir=workspace)
-    with caplog.at_level(logging.INFO, logger="pip_agent.tui.manager"):
-        snap = mgr.discover()
-
-    bundle = snap.bundles[DEFAULT_THEME_NAME]
-    assert bundle.source == f"local:{DEFAULT_THEME_NAME}", (
-        "local entry must replace builtin entry of the same name"
-    )
-    assert bundle.manifest.display_name == "Wasteland (overridden)"
-    assert any(
-        "overrides builtin" in rec.getMessage() for rec in caplog.records
-    ), "override must log an INFO line so operators see it"
+    amber = snap.bundles["amber-console"]
+    assert amber.path == themes_root / "amber-console"
+    assert amber.manifest.display_name == "Amber Console"
 
 
 # ---------------------------------------------------------------------------
@@ -208,64 +181,52 @@ def test_local_overrides_builtin_with_same_slug(
 # ---------------------------------------------------------------------------
 
 
-def test_broken_local_theme_is_skipped_with_warning(
-    isolated_builtin: Path,
+def test_broken_theme_is_skipped_with_warning(
     workspace: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    local_root = workspace / ".pip" / "themes"
-    local_root.mkdir(parents=True)
-
-    healthy = _write_theme(local_root, "healthy")
-    broken = local_root / "broken"
+    themes_root = workspace / ".pip" / "themes"
+    healthy = _write_theme(themes_root, "healthy")
+    broken = themes_root / "broken"
     broken.mkdir()
     (broken / "theme.toml").write_text("not = valid = toml", encoding="utf-8")
 
-    mgr = ThemeManager(builtin_root=isolated_builtin, workdir=workspace)
+    mgr = ThemeManager(workdir=workspace)
     with caplog.at_level(logging.WARNING, logger="pip_agent.tui.manager"):
         snap = mgr.discover()
 
-    assert "healthy" in snap.bundles, "healthy sibling must still load"
-    assert "broken" not in snap.bundles, "broken theme must be skipped"
+    assert "healthy" in snap.bundles
+    assert "broken" not in snap.bundles
+    assert any(issue.path == broken for issue in snap.issues)
     assert any(
-        issue.path == broken and issue.origin == "local"
-        for issue in snap.issues
-    ), "broken theme must surface as a ThemeLoadIssue"
-    assert any(
-        "Skipping broken local theme" in rec.getMessage()
-        for rec in caplog.records
+        "Skipping broken theme" in rec.getMessage() for rec in caplog.records
     )
-    assert healthy.exists()  # sanity for the helper
+    assert healthy.exists()
 
 
-def test_missing_manifest_is_skipped(
-    isolated_builtin: Path, workspace: Path,
-) -> None:
-    local_root = workspace / ".pip" / "themes"
-    local_root.mkdir(parents=True)
-    no_manifest = local_root / "no-manifest"
+def test_missing_manifest_is_skipped(workspace: Path) -> None:
+    themes_root = workspace / ".pip" / "themes"
+    themes_root.mkdir(parents=True)
+    no_manifest = themes_root / "no-manifest"
     no_manifest.mkdir()
     (no_manifest / "theme.tcss").write_text("Screen {}\n", encoding="utf-8")
 
-    mgr = ThemeManager(builtin_root=isolated_builtin, workdir=workspace)
+    mgr = ThemeManager(workdir=workspace)
     snap = mgr.discover()
 
     assert "no-manifest" not in snap.bundles
     assert any(issue.path == no_manifest for issue in snap.issues)
 
 
-def test_directory_name_must_match_manifest_name(
-    isolated_builtin: Path, workspace: Path,
-) -> None:
-    local_root = workspace / ".pip" / "themes"
-    local_root.mkdir(parents=True)
+def test_directory_name_must_match_manifest_name(workspace: Path) -> None:
+    themes_root = workspace / ".pip" / "themes"
     _write_theme(
-        local_root,
+        themes_root,
         "wrong-dir",
         manifest_name_override="other-name",
     )
 
-    mgr = ThemeManager(builtin_root=isolated_builtin, workdir=workspace)
+    mgr = ThemeManager(workdir=workspace)
     snap = mgr.discover()
 
     assert "wrong-dir" not in snap.bundles
@@ -274,18 +235,17 @@ def test_directory_name_must_match_manifest_name(
 
 
 def test_hidden_and_non_dir_entries_are_ignored(
-    isolated_builtin: Path, workspace: Path,
+    seeded_workspace: Path,
 ) -> None:
-    local_root = workspace / ".pip" / "themes"
-    local_root.mkdir(parents=True)
-    (local_root / "README.md").write_text("placeholder", encoding="utf-8")
-    (local_root / ".gitkeep").write_text("", encoding="utf-8")
-    (local_root / ".hidden").mkdir()
-    (local_root / ".hidden" / "theme.toml").write_text(
+    themes_root = seeded_workspace / ".pip" / "themes"
+    (themes_root / "README.md").write_text("placeholder", encoding="utf-8")
+    (themes_root / ".gitkeep").write_text("", encoding="utf-8")
+    (themes_root / ".hidden").mkdir()
+    (themes_root / ".hidden" / "theme.toml").write_text(
         "garbage", encoding="utf-8",
     )
 
-    mgr = ThemeManager(builtin_root=isolated_builtin, workdir=workspace)
+    mgr = ThemeManager(workdir=seeded_workspace)
     snap = mgr.discover()
 
     assert set(snap.bundles) == {DEFAULT_THEME_NAME}
@@ -293,69 +253,89 @@ def test_hidden_and_non_dir_entries_are_ignored(
 
 
 # ---------------------------------------------------------------------------
-# resolve()/get() lookup contract.
+# snapshot() vs discover() — cache contract.
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_is_none_before_first_discover(workspace: Path) -> None:
+    mgr = ThemeManager(workdir=workspace)
+    assert mgr.snapshot() is None
+
+
+def test_snapshot_returns_last_discovery(seeded_workspace: Path) -> None:
+    mgr = ThemeManager(workdir=seeded_workspace)
+    first = mgr.discover()
+    cached = mgr.snapshot()
+    assert cached is first
+
+
+def test_discover_rewalks_filesystem(workspace: Path) -> None:
+    themes_root = workspace / ".pip" / "themes"
+    _write_theme(themes_root, "first")
+
+    mgr = ThemeManager(workdir=workspace)
+    snap1 = mgr.discover()
+    assert set(snap1.bundles) == {"first"}
+
+    _write_theme(themes_root, "second")
+    snap2 = mgr.discover()
+    assert set(snap2.bundles) == {"first", "second"}
+
+
+# ---------------------------------------------------------------------------
+# resolve() / get() lookup contract.
 # ---------------------------------------------------------------------------
 
 
 def test_resolve_returns_default_when_requested_missing(
-    isolated_builtin: Path,
-    workspace: Path,
+    seeded_workspace: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    mgr = ThemeManager(builtin_root=isolated_builtin, workdir=workspace)
+    mgr = ThemeManager(workdir=seeded_workspace)
     with caplog.at_level(logging.WARNING, logger="pip_agent.tui.manager"):
         bundle = mgr.resolve("does-not-exist")
     assert bundle.manifest.name == DEFAULT_THEME_NAME
-    assert any(
-        "not found" in rec.getMessage() for rec in caplog.records
-    )
+    assert any("not found" in rec.getMessage() for rec in caplog.records)
 
 
-def test_resolve_returns_requested_when_present(
-    isolated_builtin: Path, workspace: Path,
-) -> None:
-    local_root = workspace / ".pip" / "themes"
-    local_root.mkdir(parents=True)
-    _write_theme(local_root, "amber-console")
+def test_resolve_returns_requested_when_present(workspace: Path) -> None:
+    themes_root = workspace / ".pip" / "themes"
+    _write_theme(themes_root, DEFAULT_THEME_NAME)
+    _write_theme(themes_root, "amber-console")
 
-    mgr = ThemeManager(builtin_root=isolated_builtin, workdir=workspace)
+    mgr = ThemeManager(workdir=workspace)
     bundle = mgr.resolve("amber-console")
     assert bundle.manifest.name == "amber-console"
 
 
 def test_resolve_raises_when_default_missing(tmp_path: Path) -> None:
-    empty = tmp_path / "no_builtins"
-    empty.mkdir()
-    mgr = ThemeManager(builtin_root=empty, workdir=None)
+    # Empty workspace — no themes at all, not even the default
+    mgr = ThemeManager(workdir=tmp_path)
     with pytest.raises(LookupError, match="(?i)default theme"):
         mgr.resolve(None)
 
 
-def test_get_lazily_discovers_on_first_call(
-    isolated_builtin: Path, workspace: Path,
-) -> None:
-    mgr = ThemeManager(builtin_root=isolated_builtin, workdir=workspace)
+def test_get_lazily_discovers_on_first_call(seeded_workspace: Path) -> None:
+    mgr = ThemeManager(workdir=seeded_workspace)
     bundle = mgr.get(DEFAULT_THEME_NAME)
     assert bundle is not None
-    assert bundle.source == f"builtin:{DEFAULT_THEME_NAME}"
+    assert bundle.path == (
+        seeded_workspace / ".pip" / "themes" / DEFAULT_THEME_NAME
+    )
 
 
-def test_local_root_path_is_exposed(
-    isolated_builtin: Path, workspace: Path,
-) -> None:
-    mgr = ThemeManager(builtin_root=isolated_builtin, workdir=workspace)
-    assert mgr.local_root == workspace / ".pip" / "themes"
+def test_themes_root_path_is_exposed(workspace: Path) -> None:
+    mgr = ThemeManager(workdir=workspace)
+    assert mgr.themes_root == workspace / ".pip" / "themes"
 
 
-def test_local_root_is_none_when_workdir_unset(
-    isolated_builtin: Path,
-) -> None:
-    mgr = ThemeManager(builtin_root=isolated_builtin, workdir=None)
-    assert mgr.local_root is None
+def test_themes_root_is_none_when_workdir_unset() -> None:
+    mgr = ThemeManager(workdir=None)
+    assert mgr.themes_root is None
 
 
 # ---------------------------------------------------------------------------
-# load_theme_bundle — the underlying loader exposed to ``runner.build_app``.
+# load_theme_bundle — the underlying per-directory loader.
 # ---------------------------------------------------------------------------
 
 
@@ -364,7 +344,7 @@ def test_load_theme_bundle_clamps_oversized_art(tmp_path: Path) -> None:
     art = "\n".join([long_line] * 12)
     theme_dir = _write_theme(tmp_path, "art-test", art=art)
 
-    bundle = load_theme_bundle(theme_dir, origin="builtin")
+    bundle = load_theme_bundle(theme_dir)
 
     assert bundle.art_truncated is True
     rows = bundle.art.splitlines()
@@ -379,4 +359,10 @@ def test_load_theme_bundle_rejects_directory_name_mismatch(
         tmp_path, "dir-name", manifest_name_override="other-name",
     )
     with pytest.raises(ThemeValidationError, match="does not match"):
-        load_theme_bundle(theme_dir, origin="builtin")
+        load_theme_bundle(theme_dir)
+
+
+def test_load_theme_bundle_sets_path_field(tmp_path: Path) -> None:
+    theme_dir = _write_theme(tmp_path, "path-test")
+    bundle = load_theme_bundle(theme_dir)
+    assert bundle.path == theme_dir
